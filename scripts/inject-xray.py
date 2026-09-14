@@ -10,9 +10,9 @@ def inject_xray(xray_dir, chitanda_dir):
     os.makedirs(proxy_dir, exist_ok=True)
     os.makedirs(conf_dir, exist_ok=True)
     
-    # 1. Copy config.pb.go, outbound.go, inbound.go into proxy/chitanda/
+    # 1. Copy the adapter and its regression tests into proxy/chitanda/.
     src_integration = os.path.join(chitanda_dir, "integration", "xray")
-    for fname in ["config.pb.go", "outbound.go", "inbound.go"]:
+    for fname in ["config.pb.go", "outbound.go", "inbound.go", "config_test.go", "pipe_conn_test.go"]:
         src = os.path.join(src_integration, fname)
         dst = os.path.join(proxy_dir, fname)
         shutil.copy2(src, dst)

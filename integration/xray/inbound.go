@@ -82,12 +82,7 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 			return nil, err
 		}
 
-		return &pipeConn{
-			reader:      &buf.BufferedReader{Reader: link.Reader},
-			writer:      buf.NewBufferedWriter(link.Writer),
-			readCloser:  link.Reader,
-			writeCloser: link.Writer,
-		}, nil
+		return newPipeConn(link.Reader, link.Writer), nil
 	}
 
 	srv := server.NewServer(config.Path, []byte(config.Psk), replays, fbHandler, 1024)
@@ -324,9 +319,18 @@ func (h *InboundHandler) Close() error {
 
 type pipeConn struct {
 	reader      *buf.BufferedReader
-	writer      *buf.BufferedWriter
+	writer      buf.Writer
 	readCloser  interface{}
 	writeCloser interface{}
+}
+
+func newPipeConn(reader buf.Reader, writer buf.Writer) *pipeConn {
+	return &pipeConn{
+		reader:      &buf.BufferedReader{Reader: reader},
+		writer:      writer,
+		readCloser:  reader,
+		writeCloser: writer,
+	}
 }
 
 func (c *pipeConn) Read(b []byte) (n int, err error) {
@@ -334,15 +338,21 @@ func (c *pipeConn) Read(b []byte) (n int, err error) {
 }
 
 func (c *pipeConn) Write(b []byte) (n int, err error) {
-	n, err = c.writer.Write(b)
-	if err == nil {
-		_ = c.writer.Flush()
+	if len(b) == 0 {
+		return 0, nil
 	}
-	return n, err
+	// Older Xray BufferedWriter.Write returns ErrBufferFull for inputs larger
+	// than buf.Size (8 KiB), aborting valid RawStream frames of up to 32 KiB.
+	// MergeBytes copies into owned buffers; WriteMultiBuffer transfers their
+	// ownership to the dispatcher, including on error. Do not retain b or
+	// release those buffers here: the caller may immediately reuse b.
+	if err := c.writer.WriteMultiBuffer(buf.MergeBytes(nil, b)); err != nil {
+		return 0, err
+	}
+	return len(b), nil
 }
 
 func (c *pipeConn) Close() error {
-	_ = c.writer.Flush()
 	var err1, err2 error
 	if c.writeCloser != nil {
 		err1 = common.Close(c.writeCloser)
@@ -357,7 +367,6 @@ func (c *pipeConn) Close() error {
 }
 
 func (c *pipeConn) CloseWrite() error {
-	_ = c.writer.Flush()
 	if c.writeCloser != nil {
 		return common.Close(c.writeCloser)
 	}
