@@ -512,43 +512,19 @@ Xray-core において、`chitanda` は **Inbound (サーバーインバウン�
 1. ブラウザで 3X-UI 管理画面にログインします。
 2. 左側メニューの **「Xray 設定」**（または **「パネル設定」**）を開きます。
 3. **「バージョン切り替え / カーネルバージョン」** をクリックします。
-4. バージョン一覧から最新の **`Chitanda Core`** ビルドを選択します。
+4. バージョン一覧から最新の **`v26.3.27`**（または最新タグ）を選択します。
 5. **更新を実行** すると、3X-UI が自動的に対応アーキテクチャのバイナリを取得し、バックグラウンドの Xray プロセスをホットリスタートします。
 
-#### 方法二: SSH ターミナルでの手動一括更新
-標準 3X-UI を使用しており Web 画面にオンラインソースが反映されていない場合は、サーバーのターミナルで以下を実行してカーネルを更新できます：
+#### 方法二: 终端一键更新指令（不用进网页）
+如果在终端操作，不能只执行 `rm`，而是需要一条龙“下载最新 Release $\rightarrow$ 解压覆盖 $\rightarrow$ 重启”：
 
 ```bash
-# 1. サーバーの CPU アーキテクチャを確認 (x86_64 または aarch64)
-ARCH=$(uname -m)
-if [ "$ARCH" = "x86_64" ]; then
-    FILE="Xray-linux-64.zip"
-    BIN_NAME="xray-linux-amd64"
-elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-    FILE="Xray-linux-arm64-v8a.zip"
-    BIN_NAME="xray-linux-arm64"
-else
-    echo "Unsupported architecture: $ARCH" && exit 1
-fi
-
-# 2. Chitanda 最新ビルドの Xray パッケージを取得
-cd /tmp
-curl -fsSL -O "https://github.com/violetaini/chitanda/releases/latest/download/${FILE}"
-
-# 3. x-ui サービスを停止してバイナリを置換
-systemctl stop x-ui
-unzip -o "${FILE}" xray -d /tmp/chitanda_xray_bin/
-cp -f /tmp/chitanda_xray_bin/xray /usr/local/x-ui/bin/${BIN_NAME}
-[ -f /usr/local/x-ui/bin/xray ] && cp -f /tmp/chitanda_xray_bin/xray /usr/local/x-ui/bin/xray
-chmod +x /usr/local/x-ui/bin/*
-
-# 4. 一時ファイルを削除して x-ui を再起動
-rm -rf /tmp/${FILE} /tmp/chitanda_xray_bin
-systemctl restart x-ui
-
-# 5. バージョンを確認
-/usr/local/x-ui/bin/${BIN_NAME} version
+curl -fsSL https://github.com/violetaini/chitanda/releases/download/v26.3.27/Xray-linux-64.zip -o /usr/local/x-ui/bin/Xray.zip && \
+python3 -c "import zipfile, os; zipfile.ZipFile('/usr/local/x-ui/bin/Xray.zip').extract('xray', '/usr/local/x-ui/bin'); os.chmod('/usr/local/x-ui/bin/xray', 0o755); os.replace('/usr/local/x-ui/bin/xray', '/usr/local/x-ui/bin/xray-linux-amd64'); os.remove('/usr/local/x-ui/bin/Xray.zip')" && \
+x-ui restart
 ```
+
+> **注意**：`x-ui restart` 仅为重启面板服务，**不包含**缺失内核自动下载功能。若直接 `rm -f /usr/local/x-ui/bin/xray-linux-amd64` 后重启，面板会因为找不到二进制文件而提示 `未知版本 + error 运行状态`。请务必使用上述一键更新指令。
 
 ---
 

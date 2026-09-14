@@ -109,4 +109,14 @@ Chitanda は、サポートする全 5 種類のキャリアモードに対し�
    - Shadowsocks / Sing-box 標準アーキテクチャに準拠し、双方向アクティビティ監視機構（`activityReader`）を導入。いずれかの方向（クライアントの上り、または Codex/ChatGPT の巨大コンテキストにおける数分間に及ぶ推論 SSE ストリーミングなどの下り）で 1 バイトでもパケット転送が継続している限り、アイドルタイマーを自動的に 300 秒（`DefaultIdleTimeout = 300s`）へリセット。
    - 両方向ともに完全な無通信・無活動状態が 300 秒継続した場合にのみ切断を実行。
    - 宛先レスポンス完了（`downloadDone`）後の 250ms グレースフルドレインと連動させることで、「超長時間のストリーミング推論の安定維持」と「高頻度リクエスト時の FD リーク防止」を高度に両立。
+6. **Xray ネイティブ Plain-UDP Inbound と双方向セッションディスパッチ (Native Plain-UDP Inbound)**:
+   - Xray 統合インバウンドハンドラーにおいて `Network_TCP` に加えて `Network_UDP` を正式バインド。
+   - `PlainUDPCodec` と 2048 ビットスライディングウィンドウによるアンチリプレイ検証をインバウンド側へ完全移植し、Xray の `udp.NewDispatcher` および `buf.NewPacketReader` による双方向セッションルーティングを確立。
+   - 3X-UI で配備された `stream` および `h1` ノードにおいて、単一ポートでの TCP/UDP 同時リッスンと、DNS クエリ・UDP ゲームトラフィックの完全なプロキシ透過を実現。
+7. **大容量 MultiBuffer 転送パイプラインと 8 KiB 溢れ切断の根絶 (Uncapped MultiBuffer Bridge)**:
+   - Xray 内部ディスパッチャーへのブリッジ構造 `pipeConn` において、8 KiB（`buf.Size = 8192`）固定上限を持つレガシーな `buf.BufferedWriter` を完全撤廃。
+   - `buf.MergeBytes` と `WriteMultiBuffer` による動的メモリブロックチェーン化を採用。適応型動的レコード分割（Dynamic Record Sizing）が 32 KiB やそれ以上の大容量フレームへ拡大した際にもバッファ溢れ（`ErrBufferFull`）を起こさず安全に転送。
+   - Web ページ上の大容量静的スクリプト（例: ChatGPT 前端 JS アセット）の読み込み失敗（`net::ERR_CONNECTION_CLOSED`）や、大量データ受信時の意図しない切断を根絶。
+
+---
 

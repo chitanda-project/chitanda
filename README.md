@@ -387,10 +387,30 @@ bash <(curl -fsSL https://raw.githubusercontent.com/violetaini/chitanda/3x-ui/in
 ### 主な機能と特徴
 - **即時利用可能**: 3X-UI パネルのインストールから、最新の `xray-chitanda` カーネルの配備までを自動完了。
 - **全トランスポートモード対応**: インバウンド設定にて `h2`、`stream`、`h3`、`auto`、`h1` をネイティブ選択可能。証明書不要の `stream` モード選択時は TLS 証明書および SNI フォームを自動非表示化。`server_id` ノード識別バインドおよびポートごとの永続化リプレイ防止 DB（`/etc/x-ui/replay_[ポート].db`）に完全連動。
+- **全モード UDP ネイティブ対応**: Xray 原生 Plain-UDP Inbound とアンチリプレイウィンドウを搭載。単一ポートで TCP/UDP 同時待ち受けをサポートし、DNS クエリや UDP ゲーム通信の完全なプロキシに対応。
+- **大容量・長ストリーム安定性**: 8 KiB 超過時の書き込みバッファ溢れ（`ErrBufferFull`）を根絶。適応型動的分割（1380 B $\to$ 8 KiB $\to$ 32 KiB）がフル稼働し、単一コア最大 2,000 MB/s 超のスループットと長文 AI ストリーミングの継続性を保証。
 - **QR コード表示と一括エクスポート**: インバウンド管理メニューから Chitanda ノードの QR コード確認や一括エクスポート・共有が可能。
 - **Web UI 上でのカーネルオンライン更新**: 3X-UI 管理画面の **Xray 設定 → バージョン切り替え** 機能が本リポジトリの GitHub Releases に連携済み。最新の Chitanda Xray カーネルをオンラインで直接選択・ホットアップデート可能。
 - **モバイルゲーム・高頻度通信のハング防止**: 最新の 250ms ハーフクローズ優雅排空ライフサイクル制御を搭載。『ブルーアーカイブ』等の高頻度通信によるコネクション滞留、FD リーク、ルーターのフリーズ問題を根本から解消（詳細は [docs/CONFIGURATION.md](docs/CONFIGURATION.md#6-高頻度ショートコネクションとモバイルゲーム向け最適化仕様-half-close--ブルーアーカイブ事例) を参照）。
 - **マルチアーキテクチャ対応**: Linux AMD64 (`x86_64`) および ARM64 (`aarch64`) を自動識別・適合。
+
+### 3X-UI Xray カーネルの更新手順 (Updating 3X-UI Xray Kernel)
+
+- **方式 1：Web 面板一键无缝切换（推荐）**
+  1. 登录 3X-UI 面板网页后台；
+  2. 进入 **面板设置 (Settings) $\rightarrow$ Xray 设置 / 版本控制**；
+  3. 版本下拉框已内置对接本仓库，选择最新版本（如 **`v26.3.27`**）点击 **切换版本**，面板全自动下载、解压、覆盖并热重启。
+
+- **方式 2：终端一键更新指令（不用进网页）**
+  如果在终端操作，不能只执行 `rm`，而是需要一条龙“下载最新 Release $\rightarrow$ 解压覆盖 $\rightarrow$ 重启”：
+
+  ```bash
+  curl -fsSL https://github.com/violetaini/chitanda/releases/download/v26.3.27/Xray-linux-64.zip -o /usr/local/x-ui/bin/Xray.zip && \
+  python3 -c "import zipfile, os; zipfile.ZipFile('/usr/local/x-ui/bin/Xray.zip').extract('xray', '/usr/local/x-ui/bin'); os.chmod('/usr/local/x-ui/bin/xray', 0o755); os.replace('/usr/local/x-ui/bin/xray', '/usr/local/x-ui/bin/xray-linux-amd64'); os.remove('/usr/local/x-ui/bin/Xray.zip')" && \
+  x-ui restart
+  ```
+
+  > **注意**：`x-ui restart` 仅为重启面板服务，**不包含**缺失内核自动下载功能。若直接 `rm -f /usr/local/x-ui/bin/xray-linux-amd64` 后重启，面板会因为找不到二进制文件而提示 `未知版本 + error 运行状态`。请务必使用上述一键更新指令。
 
 ---
 
