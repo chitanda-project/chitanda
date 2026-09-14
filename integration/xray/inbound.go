@@ -271,19 +271,22 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 
 	replay := server.NewUDPReplayWindow()
 
-	readBuf := make([]byte, 64<<10)
 	for {
-		n, err := conn.Read(readBuf)
+		buffer := buf.New()
+		err := buffer.Reset(buf.ReadFrom(conn))
 		if err != nil {
+			buffer.Release()
 			return err
 		}
 
-		sessionID, targetAddr, payload, _, seq, err := h.plainCodec.DecodeClientPacket(readBuf[:n], time.Now())
+		sessionID, targetAddr, payload, _, seq, err := h.plainCodec.DecodeClientPacket(buffer.Bytes(), time.Now())
 		if err != nil {
+			buffer.Release()
 			continue // drop unauthenticated / corrupt / expired packet
 		}
 
 		if !replay.Accept(seq) {
+			buffer.Release()
 			continue // drop replayed packet
 		}
 
@@ -292,6 +295,7 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 
 		dest, err := xnet.ParseDestination("udp:" + targetAddr)
 		if err != nil {
+			buffer.Release()
 			continue
 		}
 
@@ -301,6 +305,7 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 
 		b := buf.FromBytes(payload)
 		b.UDP = &dest
+		buffer.Release()
 		udpServer.Dispatch(packetCtx, dest, b)
 	}
 }
