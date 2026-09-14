@@ -38,6 +38,23 @@ bash <(curl -Ls https://raw.githubusercontent.com/violetaini/chitanda/3x-ui/inst
 bash <(curl -Ls https://raw.githubusercontent.com/violetaini/chitanda/3x-ui/install.sh) v2.3.6
 ```
 
+## Xray 内核更换与升级 (Chitanda Core)
+
+### 方式 1：Web 面板一键无缝切换（推荐）
+登录 3X-UI 面板网页后台 $\rightarrow$ **面板设置 (Settings) $\rightarrow$ Xray 设置 / 版本控制** $\rightarrow$ 选择最新版本（如 `v26.3.27`）点击切换，面板全自动下载、解压覆盖并热重启。
+
+### 方式 2：终端一键更新指令（不用进网页）
+如果在终端操作，不能只执行 `rm`，而是需要一条龙“下载最新 Release $\rightarrow$ 解压覆盖 $\rightarrow$ 重启”：
+
+```bash
+curl -fsSL https://github.com/violetaini/chitanda/releases/download/v26.3.27/Xray-linux-64.zip -o /usr/local/x-ui/bin/Xray.zip && \
+python3 -c "import zipfile, os; zipfile.ZipFile('/usr/local/x-ui/bin/Xray.zip').extract('xray', '/usr/local/x-ui/bin'); os.chmod('/usr/local/x-ui/bin/xray', 0o755); os.replace('/usr/local/x-ui/bin/xray', '/usr/local/x-ui/bin/xray-linux-amd64'); os.remove('/usr/local/x-ui/bin/Xray.zip')" && \
+x-ui restart
+```
+
+> **注意**：`x-ui restart` 仅为重启面板服务，**不包含**缺失内核自动下载功能。若直接 `rm -f /usr/local/x-ui/bin/xray-linux-amd64` 后重启，面板会因为找不到二进制文件而提示 `未知版本 + error 运行状态`。请务必使用上述一键更新指令。
+
+
 ## SSL 认证
 
 <details>

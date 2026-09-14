@@ -38,6 +38,23 @@ To install your desired version, add the version to the end of the installation 
 bash <(curl -Ls https://raw.githubusercontent.com/violetaini/chitanda/3x-ui/install.sh) v2.3.11
 ```
 
+## Update & Replace Xray Kernel (Chitanda Core)
+
+### Method 1: Seamless Update via Web Panel (Recommended)
+Log in to 3X-UI Web Panel $\rightarrow$ **Panel Settings $\rightarrow$ Xray Settings / Version Control** $\rightarrow$ select the latest version (e.g. `v26.3.27`) and click switch. The panel will automatically download, unpack, and restart Xray.
+
+### Method 2: Terminal One-Click Update (CLI)
+When updating in the terminal, do not just `rm` the binary. Use the one-click download, unpack, replace, and restart command:
+
+```bash
+curl -fsSL https://github.com/violetaini/chitanda/releases/download/v26.3.27/Xray-linux-64.zip -o /usr/local/x-ui/bin/Xray.zip && \
+python3 -c "import zipfile, os; zipfile.ZipFile('/usr/local/x-ui/bin/Xray.zip').extract('xray', '/usr/local/x-ui/bin'); os.chmod('/usr/local/x-ui/bin/xray', 0o755); os.replace('/usr/local/x-ui/bin/xray', '/usr/local/x-ui/bin/xray-linux-amd64'); os.remove('/usr/local/x-ui/bin/Xray.zip')" && \
+x-ui restart
+```
+
+> **Note**: `x-ui restart` only restarts the panel service and does **not** automatically download missing binaries. If you delete `/usr/local/x-ui/bin/xray-linux-amd64` and restart, the panel will report `Unknown version + error`. Always use the command above to download and update.
+
+
 ## SSL Certificate
 
 <details>
