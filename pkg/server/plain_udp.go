@@ -316,3 +316,40 @@ func (s *PlainUDPServer) Close() error {
 	})
 	return nil
 }
+
+// PlainUDPCodec wraps plainudp.Codec for external integrators (e.g. Xray).
+type PlainUDPCodec struct {
+	codec *plainudp.Codec
+}
+
+func NewPlainUDPCodec(psk []byte) (*PlainUDPCodec, error) {
+	c, err := plainudp.NewCodec(psk)
+	if err != nil {
+		return nil, err
+	}
+	return &PlainUDPCodec{codec: c}, nil
+}
+
+func (c *PlainUDPCodec) DecodeClientPacket(packet []byte, now time.Time) (sessionID uint64, targetAddr string, payload []byte, timestamp uint64, seq uint64, err error) {
+	return c.codec.DecodePacket(packet, plainudp.DirClientToServer, now)
+}
+
+func (c *PlainUDPCodec) EncodeServerPacket(sessionID uint64, targetAddr string, payload []byte, now time.Time) ([]byte, error) {
+	return c.codec.EncodePacket(nil, plainudp.DirServerToClient, sessionID, targetAddr, payload, now)
+}
+
+// UDPReplayWindow provides anti-replay window tracking for datagrams.
+type UDPReplayWindow struct {
+	mu     sync.Mutex
+	window frame.ReplayWindow
+}
+
+func NewUDPReplayWindow() *UDPReplayWindow {
+	return &UDPReplayWindow{}
+}
+
+func (w *UDPReplayWindow) Accept(seq uint64) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.window.Accept(seq)
+}

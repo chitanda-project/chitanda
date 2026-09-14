@@ -18,10 +18,12 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
+	udp_proto "github.com/xtls/xray-core/common/protocol/udp"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	"github.com/xtls/xray-core/transport/internet/udp"
 )
 
 // InboundHandler implements proxy.Inbound for Chitanda protocol in Xray
@@ -29,6 +31,7 @@ type InboundHandler struct {
 	config       *InboundConfig
 	server       *server.Server
 	streamServer *server.StreamServer
+	plainCodec   *server.PlainUDPCodec
 	replays      *auth.ReplayCache
 	dispatcher   routing.Dispatcher
 	ctx          context.Context
@@ -61,8 +64,11 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 		fbHandler = fb
 	}
 
-	dialTargetFn := func(ctx context.Context, address string) (net.Conn, error) {
-		dest, err := xnet.ParseDestination("tcp:" + address)
+	dialTargetFn := func(ctx context.Context, network, address string) (net.Conn, error) {
+		if network == "" {
+			network = "tcp"
+		}
+		dest, err := xnet.ParseDestination(network + ":" + address)
 		if err != nil {
 			return nil, err
 		}
@@ -85,17 +91,30 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 	}
 
 	srv := server.NewServer(config.Path, []byte(config.Psk), replays, fbHandler, 1024)
-	srv.SetDialTargetForTest(dialTargetFn)
+	srv.SetDialTargetForTest(func(ctx context.Context, address string) (net.Conn, error) {
+		return dialTargetFn(ctx, "tcp", address)
+	})
 
 	streamSrv := server.NewStreamServer([]byte(config.Psk), config.ServerId, replays, func(ctx context.Context, network, address string) (net.Conn, error) {
-		return dialTargetFn(ctx, address)
+		return dialTargetFn(ctx, network, address)
 	})
+
+	var plainCodec *server.PlainUDPCodec
+	if len(config.Psk) >= 32 {
+		codec, err := server.NewPlainUDPCodec([]byte(config.Psk))
+		if err != nil {
+			_ = replays.Close()
+			return nil, fmt.Errorf("init plain-udp codec: %w", err)
+		}
+		plainCodec = codec
+	}
 
 	inCtx, inCancel := context.WithCancel(context.Background())
 	h := &InboundHandler{
 		config:       config,
 		server:       srv,
 		streamServer: streamSrv,
+		plainCodec:   plainCodec,
 		replays:      replays,
 		dispatcher:   dispatcher,
 		ctx:          inCtx,
@@ -106,7 +125,7 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 }
 
 func (h *InboundHandler) Network() []xnet.Network {
-	return []xnet.Network{xnet.Network_TCP}
+	return []xnet.Network{xnet.Network_TCP, xnet.Network_UDP}
 }
 
 type bufferedConn struct {
@@ -170,6 +189,9 @@ func (c *closeNotifyConn) Close() error {
 }
 
 func (h *InboundHandler) Process(ctx context.Context, network xnet.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
+	if network == xnet.Network_UDP {
+		return h.handleUDP(ctx, conn, dispatcher)
+	}
 	if network != xnet.Network_TCP {
 		return nil
 	}
@@ -215,6 +237,72 @@ func (h *InboundHandler) Process(ctx context.Context, network xnet.Network, conn
 	}()
 
 	return httpServer.Serve(sl)
+}
+
+func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
+	defer conn.Close()
+	if h.plainCodec == nil {
+		return fmt.Errorf("chitanda plain-udp codec not initialized (psk length < 32)")
+	}
+
+	var targetSessions sync.Map // string(targetAddr) -> uint64(sessionID)
+	var lastSessionID atomic.Uint64
+
+	udpServer := udp.NewDispatcher(dispatcher, func(ctx context.Context, packet *udp_proto.Packet) {
+		payload := packet.Payload
+		if payload == nil {
+			return
+		}
+		defer payload.Release()
+
+		srcAddr := packet.Source.NetAddr()
+		sessionID := lastSessionID.Load()
+		if v, ok := targetSessions.Load(srcAddr); ok {
+			sessionID = v.(uint64)
+		}
+
+		encoded, err := h.plainCodec.EncodeServerPacket(sessionID, srcAddr, payload.Bytes(), time.Now())
+		if err != nil {
+			return
+		}
+		_, _ = conn.Write(encoded)
+	})
+	defer udpServer.RemoveRay()
+
+	replay := server.NewUDPReplayWindow()
+
+	readBuf := make([]byte, 64<<10)
+	for {
+		n, err := conn.Read(readBuf)
+		if err != nil {
+			return err
+		}
+
+		sessionID, targetAddr, payload, _, seq, err := h.plainCodec.DecodeClientPacket(readBuf[:n], time.Now())
+		if err != nil {
+			continue // drop unauthenticated / corrupt / expired packet
+		}
+
+		if !replay.Accept(seq) {
+			continue // drop replayed packet
+		}
+
+		lastSessionID.Store(sessionID)
+		targetSessions.Store(targetAddr, sessionID)
+
+		dest, err := xnet.ParseDestination("udp:" + targetAddr)
+		if err != nil {
+			continue
+		}
+
+		packetCtx := session.ContextWithInbound(ctx, &session.Inbound{
+			Tag: "chitanda-inbound",
+		})
+
+		b := buf.FromBytes(payload)
+		b.UDP = &dest
+		udpServer.Dispatch(packetCtx, dest, b)
+	}
 }
 
 func (h *InboundHandler) Close() error {
