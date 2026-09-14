@@ -271,42 +271,43 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 
 	replay := server.NewUDPReplayWindow()
 
+	reader := buf.NewPacketReader(conn)
 	for {
-		buffer := buf.New()
-		err := buffer.Reset(buf.ReadFrom(conn))
+		mpayload, err := reader.ReadMultiBuffer()
 		if err != nil {
-			buffer.Release()
 			return err
 		}
 
-		sessionID, targetAddr, payload, _, seq, err := h.plainCodec.DecodeClientPacket(buffer.Bytes(), time.Now())
-		if err != nil {
-			buffer.Release()
-			continue // drop unauthenticated / corrupt / expired packet
+		for _, payload := range mpayload {
+			sessionID, targetAddr, rawData, _, seq, err := h.plainCodec.DecodeClientPacket(payload.Bytes(), time.Now())
+			if err != nil {
+				payload.Release()
+				continue // drop unauthenticated / corrupt / expired packet
+			}
+
+			if !replay.Accept(seq) {
+				payload.Release()
+				continue // drop replayed packet
+			}
+
+			lastSessionID.Store(sessionID)
+			targetSessions.Store(targetAddr, sessionID)
+
+			dest, err := xnet.ParseDestination("udp:" + targetAddr)
+			if err != nil {
+				payload.Release()
+				continue
+			}
+
+			packetCtx := session.ContextWithInbound(ctx, &session.Inbound{
+				Tag: "chitanda-inbound",
+			})
+
+			b := buf.FromBytes(rawData)
+			b.UDP = &dest
+			payload.Release()
+			udpServer.Dispatch(packetCtx, dest, b)
 		}
-
-		if !replay.Accept(seq) {
-			buffer.Release()
-			continue // drop replayed packet
-		}
-
-		lastSessionID.Store(sessionID)
-		targetSessions.Store(targetAddr, sessionID)
-
-		dest, err := xnet.ParseDestination("udp:" + targetAddr)
-		if err != nil {
-			buffer.Release()
-			continue
-		}
-
-		packetCtx := session.ContextWithInbound(ctx, &session.Inbound{
-			Tag: "chitanda-inbound",
-		})
-
-		b := buf.FromBytes(payload)
-		b.UDP = &dest
-		buffer.Release()
-		udpServer.Dispatch(packetCtx, dest, b)
 	}
 }
 
