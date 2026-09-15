@@ -57,6 +57,8 @@ func NewChitanda(option ChitandaOption) (*Chitanda, error) {
 	udpEnabled := true
 	if option.UDP != nil {
 		udpEnabled = *option.UDP
+	} else {
+		option.UDP = &udpEnabled
 	}
 
 	serverAddr := net.JoinHostPort(option.Server, strconv.Itoa(option.Port))
@@ -75,7 +77,6 @@ func NewChitanda(option ChitandaOption) (*Chitanda, error) {
 			Interface:   option.Interface,
 			RoutingMark: option.RoutingMark,
 			Prefer:      option.IPVersion,
-			DialerProxy: option.DialerProxy,
 		}),
 		option: &option,
 	}
@@ -152,7 +153,7 @@ func (c *Chitanda) DialContext(ctx context.Context, metadata *C.Metadata) (C.Con
 }
 
 func (c *Chitanda) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
-	if !c.option.UDP {
+	if c.option.UDP != nil && !*c.option.UDP {
 		return nil, errors.New("chitanda: udp is disabled for this node")
 	}
 
@@ -176,7 +177,10 @@ func (c *Chitanda) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 }
 
 func (c *Chitanda) SupportUDP() bool {
-	return c.option.UDP
+	if c.option.UDP != nil {
+		return *c.option.UDP
+	}
+	return true
 }
 
 func (c *Chitanda) MarshalJSON() ([]byte, error) {

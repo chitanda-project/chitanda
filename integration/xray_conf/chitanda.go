@@ -11,8 +11,9 @@ type ChitandaInboundConfig struct {
 	Transport    string `json:"transport"`
 	StrictSNI    string `json:"strict_sni"`
 	Fallback     string `json:"fallback"`
-	ServerID     string `json:"server_id"`
-	ServerId     string `json:"serverId"`
+	ServerID      string `json:"server_id"`
+	ServerId      string `json:"serverId"`
+	ServerHyphen  string `json:"server-id"`
 	ReplayFile    string `json:"replay_file"`
 	CertFile      string `json:"cert_file"`
 	CertFileCamel string `json:"certFile"`
