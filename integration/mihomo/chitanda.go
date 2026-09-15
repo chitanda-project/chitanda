@@ -26,7 +26,7 @@ type ChitandaOption struct {
 	SNI            string `proxy:"sni,omitempty"`
 	ServerID       string `proxy:"server-id,omitempty"`
 	PoolSize       int    `proxy:"pool-size,omitempty"`
-	UDP            bool   `proxy:"udp,omitempty"`
+	UDP            *bool  `proxy:"udp,omitempty"`
 	SkipCertVerify bool   `proxy:"skip-cert-verify,omitempty"`
 }
 
@@ -54,6 +54,11 @@ func NewChitanda(option ChitandaOption) (*Chitanda, error) {
 		option.PoolSize = 4
 	}
 
+	udpEnabled := true
+	if option.UDP != nil {
+		udpEnabled = *option.UDP
+	}
+
 	serverAddr := net.JoinHostPort(option.Server, strconv.Itoa(option.Port))
 	sni := option.SNI
 	if sni == "" && option.Transport != "h1" && option.Transport != "plain-h1" {
@@ -65,11 +70,12 @@ func NewChitanda(option ChitandaOption) (*Chitanda, error) {
 			Name:        option.Name,
 			Addr:        serverAddr,
 			Type:        C.Chitanda,
-			UDP:         option.UDP,
+			UDP:         udpEnabled,
 			TFO:         false,
 			Interface:   option.Interface,
 			RoutingMark: option.RoutingMark,
 			Prefer:      option.IPVersion,
+			DialerProxy: option.DialerProxy,
 		}),
 		option: &option,
 	}

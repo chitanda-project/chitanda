@@ -140,7 +140,7 @@ func (s *StreamServer) Serve(listeners ...net.Listener) error {
 				go func(c net.Conn) {
 					defer s.wg.Done()
 					defer s.activeConns.Add(-1)
-					s.HandleConn(c)
+					s.handleConn(s.ctx, c)
 				}(conn)
 			}
 		}(l)
@@ -159,10 +159,33 @@ func (s *StreamServer) Serve(listeners ...net.Listener) error {
 	return nil
 }
 
-// HandleConn processes an incoming raw TCP connection.
-// If any authentication or framing step fails (e.g. Aodun/scanner sending GET / HTTP/1.1),
-// it immediately terminates the connection without returning any data.
+// HandleConn processes an incoming raw TCP connection using the server's root context.
 func (s *StreamServer) HandleConn(conn net.Conn) {
+	s.HandleConnContext(s.ctx, conn)
+}
+
+// HandleConnContext processes an incoming raw TCP connection with the provided context.
+// It enforces connection limits and bounded concurrent handshakes before processing.
+func (s *StreamServer) HandleConnContext(ctx context.Context, conn net.Conn) {
+	if s.maxConns > 0 && s.activeConns.Load() >= int64(s.maxConns) {
+		_ = conn.Close()
+		return
+	}
+
+	select {
+	case s.handshakeSem <- struct{}{}:
+	default:
+		_ = conn.Close()
+		return
+	}
+
+	s.activeConns.Add(1)
+	defer s.activeConns.Add(-1)
+
+	s.handleConn(ctx, conn)
+}
+
+func (s *StreamServer) handleConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 
 	handshakeReleased := false
@@ -262,7 +285,11 @@ func (s *StreamServer) HandleConn(conn net.Conn) {
 	_ = conn.SetDeadline(time.Time{})
 
 	// 11. Dial upstream target using session-scoped context
-	connCtx, connCancel := context.WithCancel(s.ctx)
+	baseCtx := ctx
+	if baseCtx == nil {
+		baseCtx = s.ctx
+	}
+	connCtx, connCancel := context.WithCancel(baseCtx)
 	defer connCancel()
 
 	upstream, err := s.dialTarget(connCtx, "tcp", targetAddr)
@@ -398,14 +425,25 @@ func relayBidirectional(ctx context.Context, client, target net.Conn) {
 				_ = client.SetReadDeadline(time.Now().Add(DefaultDrainTimeout))
 				drainTimer := time.NewTimer(DefaultDrainTimeout)
 				defer drainTimer.Stop()
-				select {
-				case <-uploadDone:
-					uploadFinished = true
-				case <-drainTimer.C:
-					cancel()
-					return
-				case <-ctx.Done():
-					return
+				for !uploadFinished {
+					select {
+					case <-uploadDone:
+						uploadFinished = true
+					case <-activityCh:
+						if !drainTimer.Stop() {
+							select {
+							case <-drainTimer.C:
+							default:
+							}
+						}
+						_ = client.SetReadDeadline(time.Now().Add(DefaultDrainTimeout))
+						drainTimer.Reset(DefaultDrainTimeout)
+					case <-drainTimer.C:
+						cancel()
+						return
+					case <-ctx.Done():
+						return
+					}
 				}
 			}
 		}

@@ -30,6 +30,8 @@ type InboundConfig struct {
 	Transport     string                 `protobuf:"bytes,5,opt,name=transport,proto3" json:"transport,omitempty"`
 	ServerId      string                 `protobuf:"bytes,6,opt,name=server_id,json=serverId,proto3" json:"server_id,omitempty"`
 	ReplayFile    string                 `protobuf:"bytes,7,opt,name=replay_file,json=replayFile,proto3" json:"replay_file,omitempty"`
+	CertFile      string                 `protobuf:"bytes,8,opt,name=cert_file,json=certFile,proto3" json:"cert_file,omitempty"`
+	KeyFile       string                 `protobuf:"bytes,9,opt,name=key_file,json=keyFile,proto3" json:"key_file,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -109,6 +111,20 @@ func (x *InboundConfig) GetServerId() string {
 func (x *InboundConfig) GetReplayFile() string {
 	if x != nil {
 		return x.ReplayFile
+	}
+	return ""
+}
+
+func (x *InboundConfig) GetCertFile() string {
+	if x != nil {
+		return x.CertFile
+	}
+	return ""
+}
+
+func (x *InboundConfig) GetKeyFile() string {
+	if x != nil {
+		return x.KeyFile
 	}
 	return ""
 }

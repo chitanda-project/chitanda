@@ -26,6 +26,22 @@ type OutboundHandler struct {
 	initMu sync.Mutex
 }
 
+type dialerKey struct{}
+
+func withDialer(ctx context.Context, dialer internet.Dialer) context.Context {
+	if dialer == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, dialerKey{}, dialer)
+}
+
+func getDialer(ctx context.Context) internet.Dialer {
+	if d, ok := ctx.Value(dialerKey{}).(internet.Dialer); ok {
+		return d
+	}
+	return nil
+}
+
 func NewOutboundHandler(ctx context.Context, config *OutboundConfig) (*OutboundHandler, error) {
 	v := core.MustFromContext(ctx)
 	pm := v.GetFeature(policy.ManagerType()).(policy.Manager)
@@ -48,6 +64,17 @@ func NewOutboundHandler(ctx context.Context, config *OutboundConfig) (*OutboundH
 		TCPTransport:       transportMode,
 		TCPPoolSize:        int(poolSize),
 		InsecureSkipVerify: config.AllowInsecure,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if d := getDialer(ctx); d != nil {
+				dest, err := xnet.ParseDestination(network + ":" + addr)
+				if err != nil {
+					return nil, err
+				}
+				return d.Dial(ctx, dest)
+			}
+			var std net.Dialer
+			return std.DialContext(ctx, network, addr)
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("init chitanda client: %w", err)
@@ -61,6 +88,7 @@ func NewOutboundHandler(ctx context.Context, config *OutboundConfig) (*OutboundH
 }
 
 func (h *OutboundHandler) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
+	ctx = withDialer(ctx, dialer)
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 || !outbounds[len(outbounds)-1].Target.IsValid() {
 		return fmt.Errorf("chitanda: target not found in context")
@@ -87,6 +115,7 @@ func (h *OutboundHandler) Process(ctx context.Context, link *transport.Link, dia
 
 		downloadErr := buf.Copy(buf.NewReader(conn), link.Writer)
 		_ = conn.Close()
+		_ = common.Interrupt(link.Reader)
 		<-uploadDone
 		return downloadErr
 	} else if destination.Network == xnet.Network_UDP {
@@ -95,6 +124,9 @@ func (h *OutboundHandler) Process(ctx context.Context, link *transport.Link, dia
 			return fmt.Errorf("chitanda listen udp: %w", err)
 		}
 		defer pconn.Close()
+		defer func() {
+			_ = common.Interrupt(link.Reader)
+		}()
 
 		rAddr, err := net.ResolveUDPAddr("udp", targetAddr)
 		if err != nil {
@@ -110,7 +142,13 @@ func (h *OutboundHandler) Process(ctx context.Context, link *transport.Link, dia
 					return
 				}
 				for _, b := range mb {
-					_, _ = pconn.WriteTo(b.Bytes(), rAddr)
+					destAddr := rAddr
+					if b.UDP != nil && b.UDP.IsValid() {
+						if uAddr, err := net.ResolveUDPAddr("udp", b.UDP.NetAddr()); err == nil {
+							destAddr = uAddr
+						}
+					}
+					_, _ = pconn.WriteTo(b.Bytes(), destAddr)
 					b.Release()
 				}
 			}
@@ -118,11 +156,18 @@ func (h *OutboundHandler) Process(ctx context.Context, link *transport.Link, dia
 
 		recvBuf := make([]byte, 64<<10)
 		for {
-			n, _, err := pconn.ReadFrom(recvBuf)
+			n, fromAddr, err := pconn.ReadFrom(recvBuf)
 			if err != nil {
 				break
 			}
-			mb := buf.MultiBuffer{buf.FromBytes(recvBuf[:n])}
+			mb := buf.MergeBytes(nil, recvBuf[:n])
+			if fromAddr != nil {
+				if dest, err := xnet.ParseDestination("udp:" + fromAddr.String()); err == nil {
+					for _, b := range mb {
+						b.UDP = &dest
+					}
+				}
+			}
 			if err := link.Writer.WriteMultiBuffer(mb); err != nil {
 				break
 			}

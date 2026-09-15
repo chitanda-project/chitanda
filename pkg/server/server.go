@@ -187,15 +187,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !uploadFinished {
 				drainTimer := time.NewTimer(DefaultDrainTimeout)
 				defer drainTimer.Stop()
-				select {
-				case <-uploadDone:
-					uploadFinished = true
-				case <-drainTimer.C:
-					_ = upstream.Close()
-					return
-				case <-r.Context().Done():
-					_ = upstream.Close()
-					return
+				for !uploadFinished {
+					select {
+					case <-uploadDone:
+						uploadFinished = true
+					case <-activityCh:
+						if !drainTimer.Stop() {
+							select {
+							case <-drainTimer.C:
+							default:
+							}
+						}
+						drainTimer.Reset(DefaultDrainTimeout)
+					case <-drainTimer.C:
+						_ = upstream.Close()
+						return
+					case <-r.Context().Done():
+						_ = upstream.Close()
+						return
+					}
 				}
 			}
 		}

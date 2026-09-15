@@ -14,6 +14,8 @@ message InboundConfig {
   string transport = 5;
   string server_id = 6;
   string replay_file = 7;
+  string cert_file = 8;
+  string key_file = 9;
 }
 
 message OutboundConfig {

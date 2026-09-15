@@ -86,6 +86,14 @@ func (m *h3TransportManager) ensureConnection(ctx context.Context, current **h3C
 	if *current != nil && (*current).quic.Context().Err() == nil {
 		return *current, nil
 	}
+	if *current != nil {
+		oldConn := *current
+		_ = oldConn.quic.CloseWithError(0, "replaced")
+		if oldConn.pconn != nil {
+			_ = oldConn.pconn.Close()
+		}
+		*current = nil
+	}
 	udpAddr, err := resolveUDP(ctx, m.server, m.resolveUDP)
 	if err != nil {
 		return nil, err
@@ -171,7 +179,9 @@ func (m *h3TransportManager) dialH3TCPOnce(ctx context.Context, target string) (
 	}
 	stream, err := h3Conn.h3.OpenRequestStream(ctx)
 	if err != nil {
-		m.invalidate(h3Conn)
+		if h3Conn.quic.Context().Err() != nil {
+			m.invalidate(h3Conn)
+		}
 		return nil, err
 	}
 
@@ -189,17 +199,40 @@ func (m *h3TransportManager) dialH3TCPOnce(ctx context.Context, target string) (
 	if err := stream.SendRequestHeader(request); err != nil {
 		stream.CancelRead(0)
 		stream.CancelWrite(0)
-		m.invalidate(h3Conn)
+		if h3Conn.quic.Context().Err() != nil {
+			m.invalidate(h3Conn)
+		}
 		return nil, err
 	}
 
-	response, err := stream.ReadResponse()
-	if err != nil {
+	type respResult struct {
+		resp *http.Response
+		err  error
+	}
+	respCh := make(chan respResult, 1)
+	go func() {
+		r, err := stream.ReadResponse()
+		respCh <- respResult{resp: r, err: err}
+	}()
+
+	var response *http.Response
+	select {
+	case <-ctx.Done():
 		stream.CancelRead(0)
 		stream.CancelWrite(0)
-		m.invalidate(h3Conn)
-		return nil, err
+		return nil, ctx.Err()
+	case res := <-respCh:
+		if res.err != nil {
+			stream.CancelRead(0)
+			stream.CancelWrite(0)
+			if h3Conn.quic.Context().Err() != nil {
+				m.invalidate(h3Conn)
+			}
+			return nil, res.err
+		}
+		response = res.resp
 	}
+
 	if response.StatusCode != http.StatusOK || response.Header.Get(HeaderSessionOK) != "1" {
 		_ = response.Body.Close()
 		stream.CancelRead(0)
@@ -240,7 +273,9 @@ func (m *h3TransportManager) createPacketConnOnce(ctx context.Context) (net.Pack
 
 	stream, err := h3Conn.h3.OpenRequestStream(ctx)
 	if err != nil {
-		m.invalidate(h3Conn)
+		if h3Conn.quic.Context().Err() != nil {
+			m.invalidate(h3Conn)
+		}
 		return nil, err
 	}
 
@@ -259,17 +294,40 @@ func (m *h3TransportManager) createPacketConnOnce(ctx context.Context) (net.Pack
 	if err := stream.SendRequestHeader(request); err != nil {
 		stream.CancelRead(0)
 		stream.CancelWrite(0)
-		m.invalidate(h3Conn)
+		if h3Conn.quic.Context().Err() != nil {
+			m.invalidate(h3Conn)
+		}
 		return nil, err
 	}
 
-	response, err := stream.ReadResponse()
-	if err != nil {
+	type respResult struct {
+		resp *http.Response
+		err  error
+	}
+	respCh := make(chan respResult, 1)
+	go func() {
+		r, err := stream.ReadResponse()
+		respCh <- respResult{resp: r, err: err}
+	}()
+
+	var response *http.Response
+	select {
+	case <-ctx.Done():
 		stream.CancelRead(0)
 		stream.CancelWrite(0)
-		m.invalidate(h3Conn)
-		return nil, err
+		return nil, ctx.Err()
+	case res := <-respCh:
+		if res.err != nil {
+			stream.CancelRead(0)
+			stream.CancelWrite(0)
+			if h3Conn.quic.Context().Err() != nil {
+				m.invalidate(h3Conn)
+			}
+			return nil, res.err
+		}
+		response = res.resp
 	}
+
 	if response.StatusCode != http.StatusOK || response.Header.Get(HeaderSessionOK) != "1" {
 		_ = response.Body.Close()
 		stream.CancelRead(0)
@@ -393,6 +451,7 @@ type quicPacketConn struct {
 	closed        bool
 	readDeadline  time.Time
 	writeDeadline time.Time
+	readCancel    context.CancelFunc
 }
 
 func (c *quicPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
@@ -402,22 +461,36 @@ func (c *quicPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		}
 		c.mu.Lock()
 		readDl := c.readDeadline
-		c.mu.Unlock()
-
-		recvCtx := c.ctx
-		var cancel context.CancelFunc
+		if !readDl.IsZero() && time.Now().After(readDl) {
+			c.mu.Unlock()
+			return 0, nil, context.DeadlineExceeded
+		}
+		recvCtx, cancel := context.WithCancel(c.ctx)
 		if !readDl.IsZero() {
-			if time.Now().After(readDl) {
-				return 0, nil, context.DeadlineExceeded
-			}
 			recvCtx, cancel = context.WithDeadline(c.ctx, readDl)
 		}
+		c.readCancel = cancel
+		c.mu.Unlock()
 
 		rawPacket, err := c.stream.ReceiveDatagram(recvCtx)
-		if cancel != nil {
-			cancel()
-		}
+		cancel()
+
+		c.mu.Lock()
+		c.readCancel = nil
+		currentDl := c.readDeadline
+		c.mu.Unlock()
+
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				if c.ctx.Err() != nil {
+					return 0, nil, c.ctx.Err()
+				}
+				if !currentDl.IsZero() && time.Now().After(currentDl) {
+					return 0, nil, context.DeadlineExceeded
+				}
+				// Deadline updated dynamically, loop and try with new deadline
+				continue
+			}
 			return 0, nil, err
 		}
 
@@ -479,17 +552,20 @@ func (c *quicPacketConn) LocalAddr() net.Addr {
 }
 
 func (c *quicPacketConn) SetDeadline(t time.Time) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.readDeadline = t
-	c.writeDeadline = t
-	return nil
+	_ = c.SetReadDeadline(t)
+	return c.SetWriteDeadline(t)
 }
 
 func (c *quicPacketConn) SetReadDeadline(t time.Time) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.readDeadline = t
+	cancel := c.readCancel
+	c.readCancel = nil
+	c.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
 	return nil
 }
 

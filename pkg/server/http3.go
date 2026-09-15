@@ -30,6 +30,17 @@ const (
 	privateOpenTimeout = 15 * time.Second
 )
 
+func NewHTTP3Server(handler http.Handler, tlsConfig *tls.Config, initialPacketSize uint16) *http3.Server {
+	return &http3.Server{
+		TLSConfig:       tlsConfig,
+		QUICConfig:      quicconfig.Server(initialPacketSize),
+		Handler:         handler,
+		EnableDatagrams: true,
+		MaxHeaderBytes:  16 << 10,
+		IdleTimeout:     3 * time.Minute,
+	}
+}
+
 func newHTTP3Server(address string, handler http.Handler, ticketKeyFile, certFile, keyFile string, initialPacketSize uint16, strictSNI string) (*http3.Server, error) {
 	ticketKey, err := auth.LoadPSK(ticketKeyFile)
 	if err != nil {
@@ -60,15 +71,9 @@ func newHTTP3Server(address string, handler http.Handler, ticketKeyFile, certFil
 		},
 	}
 	tlsConfig.SetSessionTicketKeys([][32]byte{key})
-	return &http3.Server{
-		Addr:            address,
-		TLSConfig:       tlsConfig,
-		QUICConfig:      quicconfig.Server(initialPacketSize),
-		Handler:         handler,
-		EnableDatagrams: true,
-		MaxHeaderBytes:  16 << 10,
-		IdleTimeout:     3 * time.Minute,
-	}, nil
+	server := NewHTTP3Server(handler, tlsConfig, initialPacketSize)
+	server.Addr = address
+	return server, nil
 }
 
 func (s *Server) serveHTTP3(w http.ResponseWriter, r *http.Request) {
@@ -118,9 +123,15 @@ func (s *Server) serveHTTP3TCP(w http.ResponseWriter, r *http.Request, targetAdd
 	}
 
 	// Auth already validated by caller. Dial upstream.
-	upstream, err := target.DialContext(r.Context(), targetAddress)
+	var upstream net.Conn
+	var err error
+	if s.dialTarget != nil {
+		upstream, err = s.dialTarget(r.Context(), targetAddress)
+	} else {
+		upstream, err = target.DialContext(r.Context(), targetAddress)
+	}
 	if err != nil {
-		log.Printf("authenticated HTTP/3 upstream dial failed")
+		log.Printf("authenticated HTTP/3 upstream dial failed: %v", err)
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 		return
 	}
@@ -217,15 +228,25 @@ func (s *Server) serveHTTP3TCP(w http.ResponseWriter, r *http.Request, targetAdd
 			if !uploadFinished {
 				drainTimer := time.NewTimer(DefaultDrainTimeout)
 				defer drainTimer.Stop()
-				select {
-				case <-uploadDone:
-					uploadFinished = true
-				case <-drainTimer.C:
-					_ = upstream.Close()
-					return
-				case <-r.Context().Done():
-					_ = upstream.Close()
-					return
+				for !uploadFinished {
+					select {
+					case <-uploadDone:
+						uploadFinished = true
+					case <-activityCh:
+						if !drainTimer.Stop() {
+							select {
+							case <-drainTimer.C:
+							default:
+							}
+						}
+						drainTimer.Reset(DefaultDrainTimeout)
+					case <-drainTimer.C:
+						_ = upstream.Close()
+						return
+					case <-r.Context().Done():
+						_ = upstream.Close()
+						return
+					}
 				}
 			}
 		}

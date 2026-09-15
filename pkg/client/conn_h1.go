@@ -42,6 +42,19 @@ func (c *Client) dialPlainH1(ctx context.Context, target string) (net.Conn, erro
 		_ = kac.SetKeepAlivePeriod(15 * time.Second)
 	}
 
+	// 1. Map context deadline to connection deadline to prevent indefinite hanging
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = rawConn.SetDeadline(deadline)
+	} else {
+		_ = rawConn.SetDeadline(time.Now().Add(10 * time.Second))
+	}
+
+	// 2. Hook context cancellation to immediately close rawConn if caller aborts
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = rawConn.Close()
+	})
+	defer stopCancel()
+
 
 	now := time.Now()
 	clientHello, clientNonce, ts, err := h1session.CreateClientHello(c.cfg.PSK, now)
@@ -174,6 +187,9 @@ func (c *Client) dialPlainH1(ctx context.Context, target string) (net.Conn, erro
 
 	framedWriter := h1session.NewFramedWriter(cw, encStream)
 	framedReader := h1session.NewFramedReader(cr, decStream)
+
+	// Clear handshake deadline for established full-duplex session
+	_ = rawConn.SetDeadline(time.Time{})
 
 	conn := &plainH1Conn{
 		raw:          rawConn,
