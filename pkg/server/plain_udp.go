@@ -338,6 +338,10 @@ func (c *PlainUDPCodec) EncodeServerPacket(sessionID uint64, targetAddr string, 
 	return c.codec.EncodePacket(nil, plainudp.DirServerToClient, sessionID, targetAddr, payload, now)
 }
 
+func (c *PlainUDPCodec) EncodeClientPacket(sessionID uint64, targetAddr string, payload []byte, now time.Time) ([]byte, error) {
+	return c.codec.EncodePacket(nil, plainudp.DirClientToServer, sessionID, targetAddr, payload, now)
+}
+
 // UDPReplayWindow provides anti-replay window tracking for datagrams.
 type UDPReplayWindow struct {
 	mu     sync.Mutex

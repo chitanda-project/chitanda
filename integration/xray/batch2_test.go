@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/violetaini/chitanda/internal/frame"
+	"github.com/violetaini/chitanda/pkg/server"
 	"github.com/xtls/xray-core/transport/pipe"
 )
 
@@ -16,12 +16,12 @@ func TestUDPReplayAcrossAssociations(t *testing.T) {
 	var udpReplays sync.Map
 
 	acceptPacket := func(sessionID uint64, seq uint64) bool {
-		var replay *frame.ReplayWindow
+		var replay *server.UDPReplayWindow
 		if val, ok := udpReplays.Load(sessionID); ok {
-			replay = val.(*frame.ReplayWindow)
+			replay = val.(*server.UDPReplayWindow)
 		} else {
-			actual, _ := udpReplays.LoadOrStore(sessionID, &frame.ReplayWindow{})
-			replay = actual.(*frame.ReplayWindow)
+			actual, _ := udpReplays.LoadOrStore(sessionID, server.NewUDPReplayWindow())
+			replay = actual.(*server.UDPReplayWindow)
 		}
 		return replay.Accept(seq)
 	}

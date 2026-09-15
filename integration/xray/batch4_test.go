@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/violetaini/chitanda/internal/plainudp"
 	"github.com/violetaini/chitanda/pkg/server"
 	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
@@ -203,9 +202,9 @@ func TestH3AndPlainUDPDemuxing(t *testing.T) {
 	}
 	defer h.Close()
 
-	codec, err := plainudp.NewCodec(psk)
+	codec, err := server.NewPlainUDPCodec(psk)
 	if err != nil {
-		t.Fatalf("NewCodec: %v", err)
+		t.Fatalf("NewPlainUDPCodec: %v", err)
 	}
 
 	clientAddr := &net.UDPAddr{IP: net.ParseIP("192.0.2.2"), Port: 12345}
@@ -215,9 +214,9 @@ func TestH3AndPlainUDPDemuxing(t *testing.T) {
 	}
 
 	// Create an authentic Plain-UDP packet
-	plainPkt, err := codec.EncodePacket(nil, plainudp.DirClientToServer, 1001, "8.8.8.8:53", []byte("dns query"), time.Now())
+	plainPkt, err := codec.EncodeClientPacket(1001, "8.8.8.8:53", []byte("dns query"), time.Now())
 	if err != nil {
-		t.Fatalf("EncodePacket: %v", err)
+		t.Fatalf("EncodeClientPacket: %v", err)
 	}
 
 	// Create a QUIC packet
