@@ -11,9 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/violetaini/chitanda/pkg/auth"
 	"github.com/violetaini/chitanda/internal/rawstream"
 	"github.com/violetaini/chitanda/internal/target"
+	"github.com/violetaini/chitanda/pkg/auth"
 )
 
 // StreamServer handles Chitanda RawStream (TCP) and Native PlainUDP connections.
@@ -167,6 +167,12 @@ func (s *StreamServer) HandleConn(conn net.Conn) {
 // HandleConnContext processes an incoming raw TCP connection with the provided context.
 // It enforces connection limits and bounded concurrent handshakes before processing.
 func (s *StreamServer) HandleConnContext(ctx context.Context, conn net.Conn) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(s.ctx, cancel)
+	defer stop()
+	stopConn := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopConn()
 	if s.maxConns > 0 && s.activeConns.Load() >= int64(s.maxConns) {
 		_ = conn.Close()
 		return
@@ -322,7 +328,6 @@ func (s *StreamServer) handleConn(ctx context.Context, conn net.Conn) {
 		_ = kac.SetKeepAlivePeriod(15 * time.Second)
 	}
 
-
 	// 12. Send initial payload to upstream if present
 	if len(initialPayload) > 0 {
 		if _, err := upstream.Write(initialPayload); err != nil {
@@ -394,60 +399,10 @@ func relayBidirectional(ctx context.Context, client, target net.Conn) {
 		downloadDone <- err
 	}()
 
-	idleTimer := time.NewTimer(DefaultIdleTimeout)
-	defer idleTimer.Stop()
-
-	var uploadFinished, downloadFinished bool
-
-	for !uploadFinished || !downloadFinished {
-		select {
-		case <-ctx.Done():
-			return
-		case <-activityCh:
-			if !idleTimer.Stop() {
-				select {
-				case <-idleTimer.C:
-				default:
-				}
-			}
-			idleTimer.Reset(DefaultIdleTimeout)
-		case <-idleTimer.C:
-			cancel()
-			return
-		case <-uploadDone:
-			uploadFinished = true
-		case <-downloadDone:
-			downloadFinished = true
-			if !uploadFinished {
-				// Target finished sending (EOF). Response is complete.
-				// Set a short read deadline on client so client.Read unblocks immediately
-				// if client is idle/holding keepalive open, preventing leaked connections/FDs.
-				_ = client.SetReadDeadline(time.Now().Add(DefaultDrainTimeout))
-				drainTimer := time.NewTimer(DefaultDrainTimeout)
-				defer drainTimer.Stop()
-				for !uploadFinished {
-					select {
-					case <-uploadDone:
-						uploadFinished = true
-					case <-activityCh:
-						if !drainTimer.Stop() {
-							select {
-							case <-drainTimer.C:
-							default:
-							}
-						}
-						_ = client.SetReadDeadline(time.Now().Add(DefaultDrainTimeout))
-						drainTimer.Reset(DefaultDrainTimeout)
-					case <-drainTimer.C:
-						cancel()
-						return
-					case <-ctx.Done():
-						return
-					}
-				}
-			}
-		}
-	}
+	waitRelay(ctx, activityCh, uploadDone, downloadDone, func() {
+		_ = client.Close()
+		_ = target.Close()
+	})
 }
 
 // Close gracefully closes the listener, replay cache, and active PlainUDP server.

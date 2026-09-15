@@ -39,6 +39,7 @@ func newPlainUDPConn(
 	psk []byte,
 	listenPacket func(ctx context.Context, network, addr string) (net.PacketConn, error),
 	resolveUDPFn func(ctx context.Context, network, addr string) (*net.UDPAddr, error),
+	dialPackets ...func(context.Context, *net.UDPAddr) (net.PacketConn, error),
 ) (*plainUDPConn, error) {
 	srvAddr, err := resolveUDP(ctx, server, resolveUDPFn)
 	if err != nil {
@@ -46,7 +47,12 @@ func newPlainUDPConn(
 	}
 
 	var conn net.PacketConn
-	if listenPacket != nil {
+	if len(dialPackets) > 0 && dialPackets[0] != nil {
+		conn, err = dialPackets[0](ctx, srvAddr)
+		if err != nil {
+			return nil, err
+		}
+	} else if listenPacket != nil {
 		pconn, err := listenPacket(ctx, "udp", ":0")
 		if err != nil {
 			return nil, fmt.Errorf("listen custom packet: %w", err)

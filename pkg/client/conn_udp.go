@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -40,6 +41,7 @@ type h3TransportManager struct {
 	activeStreams atomic.Int64
 	listenPacket  func(ctx context.Context, network, addr string) (net.PacketConn, error)
 	resolveUDP    func(ctx context.Context, network, addr string) (*net.UDPAddr, error)
+	dialPacket    func(context.Context, *net.UDPAddr) (net.PacketConn, error)
 
 	// Separate physical connections for TCP and UDP
 	currentTCP *h3Connection
@@ -54,7 +56,12 @@ func newH3TransportManager(
 	insecureSkipVerify bool,
 	listenPacket func(ctx context.Context, network, addr string) (net.PacketConn, error),
 	resolveUDPFn func(ctx context.Context, network, addr string) (*net.UDPAddr, error),
+	dialPackets ...func(context.Context, *net.UDPAddr) (net.PacketConn, error),
 ) *h3TransportManager {
+	var dialPacket func(context.Context, *net.UDPAddr) (net.PacketConn, error)
+	if len(dialPackets) > 0 {
+		dialPacket = dialPackets[0]
+	}
 	tlsConfig := &tls.Config{
 		MinVersion:         tls.VersionTLS13,
 		ServerName:         serverName,
@@ -77,6 +84,7 @@ func newH3TransportManager(
 		sessionCache: sessionCache,
 		listenPacket: listenPacket,
 		resolveUDP:   resolveUDPFn,
+		dialPacket:   dialPacket,
 	}
 }
 
@@ -99,7 +107,9 @@ func (m *h3TransportManager) ensureConnection(ctx context.Context, current **h3C
 		return nil, err
 	}
 	var pconn net.PacketConn
-	if m.listenPacket != nil {
+	if m.dialPacket != nil {
+		pconn, err = m.dialPacket(ctx, udpAddr)
+	} else if m.listenPacket != nil {
 		pconn, err = m.listenPacket(ctx, "udp", ":0")
 	} else {
 		pconn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
@@ -196,6 +206,7 @@ func (m *h3TransportManager) dialH3TCPOnce(ctx context.Context, target string) (
 		stream.CancelWrite(0)
 		return nil, err
 	}
+	request.Header.Set("X-Session-Framing", "1")
 	if err := stream.SendRequestHeader(request); err != nil {
 		stream.CancelRead(0)
 		stream.CancelWrite(0)
@@ -240,7 +251,12 @@ func (m *h3TransportManager) dialH3TCPOnce(ctx context.Context, target string) (
 		return nil, fmt.Errorf("server rejected H3 TCP session with status %d", response.StatusCode)
 	}
 
-	return newRawH3Conn(target, stream, m), nil
+	conn := newRawH3Conn(target, stream, m)
+	if response.Header.Get("X-Session-Framing") == "1" {
+		conn.reader = frame.NewStreamReader(stream)
+		conn.writer = frame.NewStreamWriter(stream)
+	}
+	return conn, nil
 }
 
 func (m *h3TransportManager) createPacketConn(ctx context.Context) (net.PacketConn, error) {
@@ -371,6 +387,8 @@ type rawH3Conn struct {
 	manager *h3TransportManager
 	closed  bool
 	mu      sync.Mutex
+	reader  io.Reader
+	writer  *frame.StreamWriter
 }
 
 func newRawH3Conn(target string, stream *http3.RequestStream, manager *h3TransportManager) *rawH3Conn {
@@ -382,14 +400,23 @@ func newRawH3Conn(target string, stream *http3.RequestStream, manager *h3Transpo
 }
 
 func (c *rawH3Conn) Read(b []byte) (int, error) {
+	if c.reader != nil {
+		return c.reader.Read(b)
+	}
 	return c.stream.Read(b)
 }
 
 func (c *rawH3Conn) Write(b []byte) (int, error) {
+	if c.writer != nil {
+		return c.writer.Write(b)
+	}
 	return c.stream.Write(b)
 }
 
 func (c *rawH3Conn) CloseWrite() error {
+	if c.writer != nil {
+		return c.writer.CloseWrite()
+	}
 	// Close() sends QUIC FIN (graceful half-close).
 	// CancelWrite() would send RESET_STREAM causing peer data loss.
 	return c.stream.Close()
@@ -451,7 +478,8 @@ type quicPacketConn struct {
 	closed        bool
 	readDeadline  time.Time
 	writeDeadline time.Time
-	readCancel    context.CancelFunc
+	readCancels   map[uint64]context.CancelFunc
+	nextReadID    uint64
 }
 
 func (c *quicPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
@@ -465,18 +493,26 @@ func (c *quicPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 			c.mu.Unlock()
 			return 0, nil, context.DeadlineExceeded
 		}
-		recvCtx, cancel := context.WithCancel(c.ctx)
-		if !readDl.IsZero() {
+		var recvCtx context.Context
+		var cancel context.CancelFunc
+		if readDl.IsZero() {
+			recvCtx, cancel = context.WithCancel(c.ctx)
+		} else {
 			recvCtx, cancel = context.WithDeadline(c.ctx, readDl)
 		}
-		c.readCancel = cancel
+		if c.readCancels == nil {
+			c.readCancels = make(map[uint64]context.CancelFunc)
+		}
+		c.nextReadID++
+		readID := c.nextReadID
+		c.readCancels[readID] = cancel
 		c.mu.Unlock()
 
 		rawPacket, err := c.stream.ReceiveDatagram(recvCtx)
 		cancel()
 
 		c.mu.Lock()
-		c.readCancel = nil
+		delete(c.readCancels, readID)
 		currentDl := c.readDeadline
 		c.mu.Unlock()
 
@@ -559,13 +595,10 @@ func (c *quicPacketConn) SetDeadline(t time.Time) error {
 func (c *quicPacketConn) SetReadDeadline(t time.Time) error {
 	c.mu.Lock()
 	c.readDeadline = t
-	cancel := c.readCancel
-	c.readCancel = nil
-	c.mu.Unlock()
-
-	if cancel != nil {
+	for _, cancel := range c.readCancels {
 		cancel()
 	}
+	c.mu.Unlock()
 	return nil
 }
 

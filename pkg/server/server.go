@@ -12,10 +12,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/violetaini/chitanda/pkg/auth"
 	"github.com/violetaini/chitanda/internal/frame"
 	"github.com/violetaini/chitanda/internal/h1session"
 	"github.com/violetaini/chitanda/internal/target"
+	"github.com/violetaini/chitanda/pkg/auth"
 )
 
 var copyBufferPool = sync.Pool{
@@ -43,6 +43,7 @@ type Server struct {
 	fallback        http.Handler
 	udpTargetBuffer int
 	dialTarget      func(ctx context.Context, address string) (net.Conn, error)
+	dialUDP         func(ctx context.Context, address string) (net.Conn, error)
 }
 
 // NewServer creates a new Server instance
@@ -60,6 +61,12 @@ func NewServer(path string, psk []byte, replays *auth.ReplayCache, fallback http
 // SetDialTargetForTest allows overriding upstream dialer in tests (e.g. for loopback echo servers).
 func (s *Server) SetDialTargetForTest(fn func(ctx context.Context, address string) (net.Conn, error)) {
 	s.dialTarget = fn
+}
+
+// SetDialUDP installs a packet-preserving connected UDP dialer for embedding
+// cores. Configure before serving. No direct socket/DNS fallback is used when set.
+func (s *Server) SetDialUDP(fn func(context.Context, string) (net.Conn, error)) {
+	s.dialUDP = fn
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -159,58 +166,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		downloadDone <- err
 	}()
 
-	idleTimer := time.NewTimer(DefaultIdleTimeout)
-	defer idleTimer.Stop()
-
-	var uploadFinished, downloadFinished bool
-
-	for !uploadFinished || !downloadFinished {
-		select {
-		case <-r.Context().Done():
-			_ = upstream.Close()
-			return
-		case <-activityCh:
-			if !idleTimer.Stop() {
-				select {
-				case <-idleTimer.C:
-				default:
-				}
-			}
-			idleTimer.Reset(DefaultIdleTimeout)
-		case <-idleTimer.C:
-			_ = upstream.Close()
-			return
-		case <-uploadDone:
-			uploadFinished = true
-		case <-downloadDone:
-			downloadFinished = true
-			if !uploadFinished {
-				drainTimer := time.NewTimer(DefaultDrainTimeout)
-				defer drainTimer.Stop()
-				for !uploadFinished {
-					select {
-					case <-uploadDone:
-						uploadFinished = true
-					case <-activityCh:
-						if !drainTimer.Stop() {
-							select {
-							case <-drainTimer.C:
-							default:
-							}
-						}
-						drainTimer.Reset(DefaultDrainTimeout)
-					case <-drainTimer.C:
-						_ = upstream.Close()
-						return
-					case <-r.Context().Done():
-						_ = upstream.Close()
-						return
-					}
-				}
-			}
-		}
-	}
-	_ = upstream.Close()
+	waitRelay(r.Context(), activityCh, uploadDone, downloadDone, func() {
+		_ = upstream.Close()
+		rc := http.NewResponseController(w)
+		_ = rc.SetReadDeadline(time.Now())
+		_ = rc.SetWriteDeadline(time.Now())
+		_ = r.Body.Close()
+	})
 }
 
 func (s *Server) authorize(r *http.Request, targetAddress, timestamp, nonce, signature string) error {
@@ -365,49 +327,17 @@ func (s *Server) servePlainH1(w http.ResponseWriter, r *http.Request) {
 		defer copyBufferPool.Put(bufPtr)
 		ar := &activityReader{r: upstream, onActivity: signalActivity}
 		_, err := io.CopyBuffer(framedWriter, ar, *bufPtr)
+		if err == nil {
+			err = framedWriter.WriteEOF()
+		}
 		downloadDone <- err
 	}()
 
-	idleTimer := time.NewTimer(DefaultIdleTimeout)
-	defer idleTimer.Stop()
-
-	var uploadFinished, downloadFinished bool
-
-	for !uploadFinished || !downloadFinished {
-		select {
-		case <-r.Context().Done():
-			_ = upstream.Close()
-			return
-		case <-activityCh:
-			if !idleTimer.Stop() {
-				select {
-				case <-idleTimer.C:
-				default:
-				}
-			}
-			idleTimer.Reset(DefaultIdleTimeout)
-		case <-idleTimer.C:
-			_ = upstream.Close()
-			return
-		case <-uploadDone:
-			uploadFinished = true
-		case <-downloadDone:
-			downloadFinished = true
-			if !uploadFinished {
-				drainTimer := time.NewTimer(DefaultDrainTimeout)
-				defer drainTimer.Stop()
-				select {
-				case <-uploadDone:
-					uploadFinished = true
-				case <-drainTimer.C:
-					_ = upstream.Close()
-					return
-				case <-r.Context().Done():
-					_ = upstream.Close()
-					return
-				}
-			}
-		}
-	}
-	_ = upstream.Close()
+	waitRelay(r.Context(), activityCh, uploadDone, downloadDone, func() {
+		_ = upstream.Close()
+		rc := http.NewResponseController(w)
+		_ = rc.SetReadDeadline(time.Now())
+		_ = rc.SetWriteDeadline(time.Now())
+		_ = r.Body.Close()
+	})
 }

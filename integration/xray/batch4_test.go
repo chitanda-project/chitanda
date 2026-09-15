@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,7 +37,7 @@ func TestH3InboundInitialization(t *testing.T) {
 	psk := "test-psk-must-be-at-least-32-bytes-long!!"
 
 	// 1. H3 transport -> H3 enabled
-	h3Handler, err := NewInboundHandler(ctx, &InboundConfig{
+	h3Handler, err := newTestInboundHandler(t, ctx, &InboundConfig{
 		Psk:       psk,
 		Path:      "/api/sync",
 		Transport: "h3",
@@ -51,7 +52,7 @@ func TestH3InboundInitialization(t *testing.T) {
 	_ = h3Handler.Close()
 
 	// 2. Stream transport -> H3 disabled
-	streamHandler, err := NewInboundHandler(ctx, &InboundConfig{
+	streamHandler, err := newTestInboundHandler(t, ctx, &InboundConfig{
 		Psk:       psk,
 		Path:      "/api/sync",
 		Transport: "stream",
@@ -65,7 +66,7 @@ func TestH3InboundInitialization(t *testing.T) {
 	_ = streamHandler.Close()
 
 	// 3. Auto transport -> H3 enabled
-	autoHandler, err := NewInboundHandler(ctx, &InboundConfig{
+	autoHandler, err := newTestInboundHandler(t, ctx, &InboundConfig{
 		Psk:       psk,
 		Path:      "/api/sync",
 		Transport: "auto",
@@ -80,7 +81,7 @@ func TestH3InboundInitialization(t *testing.T) {
 	_ = autoHandler.Close()
 
 	// 4. H2 transport -> H3 enabled (for H3 UDP)
-	h2Handler, err := NewInboundHandler(ctx, &InboundConfig{
+	h2Handler, err := newTestInboundHandler(t, ctx, &InboundConfig{
 		Psk:       psk,
 		Path:      "/api/sync",
 		Transport: "h2",
@@ -178,11 +179,11 @@ func TestVirtualPacketConn(t *testing.T) {
 
 func TestH3AndPlainUDPDemuxing(t *testing.T) {
 	psk := []byte("test-psk-must-be-at-least-32-bytes-long!!")
-	var plainDispatched bool
+	var plainDispatched atomic.Bool
 	mockDispatcher := &mockTestDispatcher{
 		dispatchFn: func(ctx context.Context, dest xnet.Destination) (*transport.Link, error) {
 			if dest.Network == xnet.Network_UDP && dest.Address.String() == "8.8.8.8" {
-				plainDispatched = true
+				plainDispatched.Store(true)
 			}
 			pReader, pWriter := pipe.New()
 			return &transport.Link{Reader: pReader, Writer: pWriter}, nil
@@ -191,16 +192,20 @@ func TestH3AndPlainUDPDemuxing(t *testing.T) {
 
 	ctx := newTestContextWithDispatcher(t, mockDispatcher)
 
-	h, err := NewInboundHandler(ctx, &InboundConfig{
+	h, err := newTestInboundHandler(t, ctx, &InboundConfig{
 		Psk:       string(psk),
 		Path:      "/api/sync",
-		Transport: "auto",
+		Transport: "stream",
 		StrictSni: "localhost",
 	})
 	if err != nil {
 		t.Fatalf("NewInboundHandler: %v", err)
 	}
 	defer h.Close()
+	// Test the demultiplexer alone. A live HTTP/3 server would race this test's
+	// ReadFrom and consume the same synthetic QUIC packet.
+	h.config.Transport = "auto"
+	h.vconn = newVirtualPacketConn()
 
 	codec, err := server.NewPlainUDPCodec(psk)
 	if err != nil {
@@ -259,7 +264,7 @@ func TestH3AndPlainUDPDemuxing(t *testing.T) {
 	}
 
 	// Verify Plain-UDP packet was dispatched through Xray dispatcher
-	if !plainDispatched {
+	if !plainDispatched.Load() {
 		t.Fatal("expected Plain-UDP packet to be dispatched through dispatcher")
 	}
 
@@ -343,8 +348,8 @@ func (m *mockStatConn) Close() error {
 	return nil
 }
 
-func (m *mockStatConn) RemoteAddr() net.Addr { return m.remoteAddr }
-func (m *mockStatConn) LocalAddr() net.Addr  { return m.localAddr }
+func (m *mockStatConn) RemoteAddr() net.Addr               { return m.remoteAddr }
+func (m *mockStatConn) LocalAddr() net.Addr                { return m.localAddr }
 func (m *mockStatConn) SetDeadline(t time.Time) error      { return nil }
 func (m *mockStatConn) SetReadDeadline(t time.Time) error  { return nil }
 func (m *mockStatConn) SetWriteDeadline(t time.Time) error { return nil }

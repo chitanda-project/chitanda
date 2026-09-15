@@ -55,7 +55,6 @@ func (c *Client) dialPlainH1(ctx context.Context, target string) (net.Conn, erro
 	})
 	defer stopCancel()
 
-
 	now := time.Now()
 	clientHello, clientNonce, ts, err := h1session.CreateClientHello(c.cfg.PSK, now)
 	if err != nil {
@@ -303,6 +302,9 @@ func (c *plainH1Conn) Write(b []byte) (n int, err error) {
 }
 
 func (c *plainH1Conn) CloseWrite() error {
+	if err := c.framedWriter.WriteEOF(); err != nil {
+		return err
+	}
 	return c.chunkWriter.Close()
 }
 
@@ -314,7 +316,6 @@ func (c *plainH1Conn) Close() error {
 	})
 	return nil
 }
-
 
 func (c *plainH1Conn) LocalAddr() net.Addr                { return c.raw.LocalAddr() }
 func (c *plainH1Conn) RemoteAddr() net.Addr               { return c.raw.RemoteAddr() }

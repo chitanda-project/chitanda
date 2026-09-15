@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/violetaini/chitanda/internal/frame"
 	"golang.org/x/net/http2"
 )
 
@@ -141,7 +142,7 @@ func (c *h2TransportClient) dialH2TCP(ctx context.Context, target string) (net.C
 }
 
 func (c *h2TransportClient) dialH2TCPOnce(ctx context.Context, target string) (net.Conn, error) {
-	streamCtx, cancel := context.WithCancel(context.Background())
+	streamCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	stopCancel := context.AfterFunc(ctx, func() {
 		cancel()
 	})
@@ -163,6 +164,7 @@ func (c *h2TransportClient) dialH2TCPOnce(ctx context.Context, target string) (n
 		_ = pipeWriter.Close()
 		return nil, err
 	}
+	request.Header.Set("X-Session-Framing", "1")
 
 	response, err := c.client.Do(request)
 	if err != nil {
@@ -187,7 +189,16 @@ func (c *h2TransportClient) dialH2TCPOnce(ctx context.Context, target string) (n
 	}
 
 	c.activeStreams.Add(1)
-	return newRawH2Conn(target, response.Body, pipeWriter, cancel, c), nil
+	var body io.ReadCloser = response.Body
+	if response.Header.Get("X-Session-Framing") == "1" {
+		body = &framedResponseBody{Reader: frame.NewStreamReader(body), Closer: body}
+	}
+	return newRawH2Conn(target, body, pipeWriter, cancel, c), nil
+}
+
+type framedResponseBody struct {
+	io.Reader
+	io.Closer
 }
 
 func (c *h2TransportClient) close() {

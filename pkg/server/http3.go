@@ -197,61 +197,17 @@ func (s *Server) serveHTTP3TCP(w http.ResponseWriter, r *http.Request, targetAdd
 			ar := &activityReader{r: upstream, onActivity: signalActivity}
 			_, downloadErr = io.CopyBuffer(stream, ar, *bufPtr)
 		}
+		if downloadErr == nil && !useFraming {
+			downloadErr = stream.Close() // FIN downlink without canceling upload.
+		}
 		downloadDone <- downloadErr
 	}()
 
-	idleTimer := time.NewTimer(DefaultIdleTimeout)
-	defer idleTimer.Stop()
-
-	var uploadFinished, downloadFinished bool
-
-	for !uploadFinished || !downloadFinished {
-		select {
-		case <-r.Context().Done():
-			_ = upstream.Close()
-			return
-		case <-activityCh:
-			if !idleTimer.Stop() {
-				select {
-				case <-idleTimer.C:
-				default:
-				}
-			}
-			idleTimer.Reset(DefaultIdleTimeout)
-		case <-idleTimer.C:
-			_ = upstream.Close()
-			return
-		case <-uploadDone:
-			uploadFinished = true
-		case <-downloadDone:
-			downloadFinished = true
-			if !uploadFinished {
-				drainTimer := time.NewTimer(DefaultDrainTimeout)
-				defer drainTimer.Stop()
-				for !uploadFinished {
-					select {
-					case <-uploadDone:
-						uploadFinished = true
-					case <-activityCh:
-						if !drainTimer.Stop() {
-							select {
-							case <-drainTimer.C:
-							default:
-							}
-						}
-						drainTimer.Reset(DefaultDrainTimeout)
-					case <-drainTimer.C:
-						_ = upstream.Close()
-						return
-					case <-r.Context().Done():
-						_ = upstream.Close()
-						return
-					}
-				}
-			}
-		}
-	}
-	_ = upstream.Close()
+	waitRelay(r.Context(), activityCh, uploadDone, downloadDone, func() {
+		_ = upstream.Close()
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+	})
 }
 
 func copyDataFramesToTCP(stream io.Reader, upstream net.Conn) error {
@@ -301,6 +257,7 @@ func (s *Server) serveHTTP3UDP(w http.ResponseWriter, r *http.Request) {
 		_ = stream.Close()
 	}()
 	relay := newUDPRelay(r.Context(), stream, s.udpTargetBuffer)
+	relay.dialUDP = s.dialUDP
 	defer relay.Close()
 	var packetBuffer [udpRelayBatchSize][]byte
 	for {
@@ -350,7 +307,7 @@ type datagramBatchStream interface {
 
 type udpTarget struct {
 	address  string
-	conn     *net.UDPConn
+	conn     net.Conn
 	batch    *ipv4.PacketConn
 	messages [udpRelayBatchSize]ipv4.Message
 }
@@ -368,6 +325,8 @@ type udpRelay struct {
 	decoder      frame.DatagramCache
 	sequence     atomic.Uint64
 	waitGroup    sync.WaitGroup
+	dialUDP      func(context.Context, string) (net.Conn, error)
+	closed       bool
 }
 
 func newUDPRelay(ctx context.Context, stream datagramStream, targetBuffers ...int) *udpRelay {
@@ -441,40 +400,45 @@ func (r *udpRelay) target(address string) (*udpTarget, error) {
 	if targetConn != nil {
 		return targetConn, nil
 	}
-	resolved, err := target.ResolveUDPAddr(r.ctx, address)
-	if err != nil {
-		return nil, err
-	}
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, net.ErrClosed
+	}
 	targetConn = r.targets[address]
 	if targetConn == nil {
 		if len(r.targets) >= 64 {
-			r.mu.Unlock()
 			return nil, errors.New("too many UDP targets")
 		}
-		connection, err := net.DialUDP("udp", nil, resolved)
+		var connection net.Conn
+		var err error
+		if r.dialUDP != nil {
+			connection, err = r.dialUDP(r.ctx, address)
+		} else {
+			var resolved *net.UDPAddr
+			resolved, err = target.ResolveUDPAddr(r.ctx, address)
+			if err == nil {
+				connection, err = net.DialUDP("udp", nil, resolved)
+			}
+		}
 		if err != nil {
-			r.mu.Unlock()
 			return nil, err
 		}
-		if err := connection.SetReadBuffer(r.targetBuffer); err != nil {
-			log.Printf("set UDP target receive buffer: %v", err)
-		}
-		if err := connection.SetWriteBuffer(r.targetBuffer); err != nil {
-			log.Printf("set UDP target send buffer: %v", err)
-		}
 		targetConn = &udpTarget{address: address, conn: connection}
-		if resolved.IP.To4() != nil {
-			targetConn.batch = ipv4.NewPacketConn(connection)
-			for i := range targetConn.messages {
-				targetConn.messages[i].Buffers = make([][]byte, 1)
+		if uc, ok := connection.(*net.UDPConn); ok {
+			_ = uc.SetReadBuffer(r.targetBuffer)
+			_ = uc.SetWriteBuffer(r.targetBuffer)
+			if uc.RemoteAddr().(*net.UDPAddr).IP.To4() != nil {
+				targetConn.batch = ipv4.NewPacketConn(uc)
+				for i := range targetConn.messages {
+					targetConn.messages[i].Buffers = make([][]byte, 1)
+				}
 			}
 		}
 		r.targets[address] = targetConn
 		r.waitGroup.Add(1)
 		go r.receive(targetConn)
 	}
-	r.mu.Unlock()
 	return targetConn, nil
 }
 
@@ -522,14 +486,27 @@ func (r *udpRelay) receiveSingle(targetConn *udpTarget) {
 	datagramBuffer := make([]byte, frame.MaxDatagramSize)
 	oversizeLogged := false
 	for {
-		n, err := targetConn.conn.Read(buffer)
+		var n int
+		var err error
+		address := targetConn.conn.RemoteAddr().String()
+		if reader, ok := targetConn.conn.(interface {
+			ReadFrom([]byte) (int, net.Addr, error)
+		}); ok {
+			var from net.Addr
+			n, from, err = reader.ReadFrom(buffer)
+			if from != nil {
+				address = from.String()
+			}
+		} else {
+			n, err = targetConn.conn.Read(buffer)
+		}
 		if err != nil {
 			return
 		}
 		if n > frame.MaxDatagramPayload {
 			continue
 		}
-		packet, err := frame.EncodeDatagramInto(datagramBuffer, r.sequence.Add(1), targetConn.address, buffer[:n])
+		packet, err := frame.EncodeDatagramInto(datagramBuffer, r.sequence.Add(1), address, buffer[:n])
 		if err != nil {
 			continue
 		}
@@ -563,7 +540,7 @@ func (r *udpRelay) receiveBatch(targetConn *udpTarget) {
 			packet, err := frame.EncodeDatagramInto(
 				datagramBuffers[datagramCount],
 				r.sequence.Add(1),
-				targetConn.address,
+				targetConn.conn.RemoteAddr().String(),
 				messages[i].Buffers[0][:messages[i].N],
 			)
 			if err != nil {
@@ -618,6 +595,7 @@ func (r *udpRelay) sendResponseBatch(datagrams [][]byte, oversizeLogged *bool) e
 
 func (r *udpRelay) Close() {
 	r.mu.Lock()
+	r.closed = true
 	for _, targetConn := range r.targets {
 		_ = targetConn.conn.Close()
 	}

@@ -484,6 +484,7 @@ func TestFramedReader_EOFRepeat(t *testing.T) {
 	msg := []byte("hello world payload")
 	go func() {
 		_, _ = fw.Write(msg)
+		_ = fw.WriteEOF()
 		_ = w.Close()
 	}()
 
@@ -911,8 +912,3 @@ func TestFramedReader_LeftoverDecBufReturnsImmediatelyWithoutBlocking(t *testing
 		t.Fatalf("STALL DETECTED: FramedReader.Read blocked waiting for network instead of returning leftover decBuf!")
 	}
 }
-
-
-
-
-

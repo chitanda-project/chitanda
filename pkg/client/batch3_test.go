@@ -80,9 +80,9 @@ func TestQUICPacketConnSetReadDeadline(t *testing.T) {
 
 	// Test 2: SetReadDeadline wakes up active readCancel callback
 	canceled := make(chan struct{})
-	pconn.readCancel = func() {
+	pconn.readCancels = map[uint64]context.CancelFunc{1: func() {
 		close(canceled)
-	}
+	}}
 	pconn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
 	select {

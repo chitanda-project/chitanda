@@ -1,4 +1,6 @@
 /bin/
+/.tools/
+/.validation/
 /.tmp/
 /secrets/
 /run/

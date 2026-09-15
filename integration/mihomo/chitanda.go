@@ -37,6 +37,12 @@ type Chitanda struct {
 	initMu sync.Mutex
 }
 
+func (c *Chitanda) ProxyInfo() C.ProxyInfo {
+	info := c.Base.ProxyInfo()
+	info.DialerProxy = c.option.DialerProxy
+	return info
+}
+
 func NewChitanda(option ChitandaOption) (*Chitanda, error) {
 	if option.Server == "" || option.Port == 0 {
 		return nil, errors.New("chitanda: server and port are required")

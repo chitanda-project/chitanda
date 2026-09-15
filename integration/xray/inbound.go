@@ -3,14 +3,8 @@ package chitanda
 import (
 	"bufio"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"fmt"
-	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -19,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	quic "github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/violetaini/chitanda/pkg/auth"
 	"github.com/violetaini/chitanda/pkg/server"
@@ -45,7 +40,7 @@ type InboundHandler struct {
 	vconn        *virtualPacketConn
 	plainCodec   *server.PlainUDPCodec
 	replays      *auth.ReplayCache
-	udpReplays   sync.Map // uint64(sessionID) -> *server.UDPReplayWindow
+	udpReplays   udpReplayRegistry
 	dispatcher   routing.Dispatcher
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -93,7 +88,9 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 			}
 			ctx = session.ContextWithInbound(ctx, inbound)
 		} else if inbound.Tag == "" {
-			inbound.Tag = "chitanda-inbound"
+			copyInbound := *inbound
+			copyInbound.Tag = "chitanda-inbound"
+			ctx = session.ContextWithInbound(ctx, &copyInbound)
 		}
 
 		link, err := dispatcher.Dispatch(ctx, dest)
@@ -101,12 +98,18 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 			return nil, err
 		}
 
+		if network == "udp" {
+			return newPacketLinkConn(link.Reader, link.Writer, packetAddress(address)), nil
+		}
 		return newPipeConn(link.Reader, link.Writer), nil
 	}
 
 	srv := server.NewServer(config.Path, []byte(config.Psk), replays, fbHandler, 1024)
 	srv.SetDialTargetForTest(func(ctx context.Context, address string) (net.Conn, error) {
 		return dialTargetFn(ctx, "tcp", address)
+	})
+	srv.SetDialUDP(func(ctx context.Context, address string) (net.Conn, error) {
+		return dialTargetFn(ctx, "udp", address)
 	})
 
 	streamSrv := server.NewStreamServer([]byte(config.Psk), config.ServerId, replays, func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -133,6 +136,9 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 		}
 		vconn = newVirtualPacketConn()
 		h3Server = server.NewHTTP3Server(srv, tlsConfig, 0)
+		h3Server.ConnContext = func(ctx context.Context, conn *quic.Conn) context.Context {
+			return vconn.connectionContext(ctx, conn.RemoteAddr())
+		}
 		go func() {
 			_ = h3Server.Serve(vconn)
 		}()
@@ -151,6 +157,7 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 		ctx:          inCtx,
 		cancel:       inCancel,
 	}
+	go h.udpReplays.run(inCtx)
 
 	return h, nil
 }
@@ -158,6 +165,10 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 func (h *InboundHandler) Network() []xnet.Network {
 	return []xnet.Network{xnet.Network_TCP, xnet.Network_UDP}
 }
+
+// Requested by the injected Xray UDP worker; other inbound protocols keep
+// their upstream buffer size. This includes Plain-UDP encapsulation overhead.
+func (h *InboundHandler) UDPPacketBufferSize() int32 { return 65535 }
 
 type bufferedConn struct {
 	net.Conn
@@ -227,6 +238,10 @@ func (h *InboundHandler) Process(ctx context.Context, network xnet.Network, conn
 		return nil
 	}
 	defer conn.Close()
+	stopCaller := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCaller()
+	stopHandler := context.AfterFunc(h.ctx, func() { _ = conn.Close() })
+	defer stopHandler()
 
 	if h.config.Transport == "stream" {
 		h.streamServer.HandleConnContext(ctx, conn)
@@ -256,7 +271,8 @@ func (h *InboundHandler) Process(ctx context.Context, network xnet.Network, conn
 	// HTTP/1.x
 	sl := &singleListener{conn: bconn, done: make(chan struct{})}
 	httpServer := &http.Server{
-		Handler: h.server,
+		Handler:     h.server,
+		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 
 	go func() {
@@ -274,13 +290,19 @@ func (h *InboundHandler) Process(ctx context.Context, network xnet.Network, conn
 
 func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	defer conn.Close()
+	stopCaller := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCaller()
+	if h.ctx != nil {
+		stopHandler := context.AfterFunc(h.ctx, func() { _ = conn.Close() })
+		defer stopHandler()
+	}
 	if h.plainCodec == nil && h.h3Server == nil {
 		return fmt.Errorf("neither chitanda plain-udp nor h3 initialized")
 	}
 
 	key := conn.RemoteAddr().String()
 	if h.vconn != nil {
-		h.vconn.registerConn(key, conn)
+		h.vconn.registerConn(key, conn, ctx)
 		defer h.vconn.unregisterConn(key, conn)
 	}
 
@@ -311,7 +333,7 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 		defer udpServer.RemoveRay()
 	}
 
-	reader := buf.NewPacketReader(conn)
+	reader := newFullPacketReader(conn)
 	for {
 		mpayload, err := reader.ReadMultiBuffer()
 		if err != nil {
@@ -338,15 +360,7 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 			if h.plainCodec != nil {
 				sessionID, targetAddr, rawData, _, seq, err := h.plainCodec.DecodeClientPacket(data, time.Now())
 				if err == nil {
-					var replay *server.UDPReplayWindow
-					if val, ok := h.udpReplays.Load(sessionID); ok {
-						replay = val.(*server.UDPReplayWindow)
-					} else {
-						actual, _ := h.udpReplays.LoadOrStore(sessionID, server.NewUDPReplayWindow())
-						replay = actual.(*server.UDPReplayWindow)
-					}
-
-					if !replay.Accept(seq) {
+					if !h.udpReplays.accept(sessionID, seq, time.Now()) {
 						payload.Release()
 						continue // drop replayed packet across any connection/association!
 					}
@@ -369,13 +383,15 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 						packetCtx = session.ContextWithInbound(ctx, inbound)
 					} else {
 						if inbound.Tag == "" {
-							inbound.Tag = "chitanda-inbound"
+							copyInbound := *inbound
+							copyInbound.Tag = "chitanda-inbound"
+							packetCtx = session.ContextWithInbound(ctx, &copyInbound)
+						} else {
+							packetCtx = ctx
 						}
-						packetCtx = ctx
 					}
 
-					b := buf.New()
-					_, _ = b.Write(rawData)
+					b := ownedDatagram(rawData)
 					b.UDP = &dest
 					payload.Release()
 					if udpServer != nil {
@@ -495,7 +511,7 @@ func (c *pipeConn) CloseRead() error {
 	return nil
 }
 
-func (c *pipeConn) LocalAddr() net.Addr { return &net.TCPAddr{IP: net.IPv4zero, Port: 0} }
+func (c *pipeConn) LocalAddr() net.Addr  { return &net.TCPAddr{IP: net.IPv4zero, Port: 0} }
 func (c *pipeConn) RemoteAddr() net.Addr { return &net.TCPAddr{IP: net.IPv4zero, Port: 0} }
 
 func (c *pipeConn) SetDeadline(t time.Time) error {
@@ -546,18 +562,12 @@ func isQUICPacket(data []byte) bool {
 }
 
 func buildServerTLSConfig(config *InboundConfig) (*tls.Config, error) {
-	var cert tls.Certificate
-	var err error
-	if config.CertFile != "" && config.KeyFile != "" {
-		cert, err = tls.LoadX509KeyPair(config.CertFile, config.KeyFile)
-		if err != nil {
-			return nil, fmt.Errorf("load x509 keypair: %w", err)
-		}
-	} else {
-		cert, err = generateSelfSignedCert(config.StrictSni)
-		if err != nil {
-			return nil, fmt.Errorf("generate self-signed cert: %w", err)
-		}
+	if config.CertFile == "" || config.KeyFile == "" {
+		return nil, fmt.Errorf("H3 requires cert_file and key_file (or an inherited streamSettings.tlsSettings file pair)")
+	}
+	cert, err := tls.LoadX509KeyPair(config.CertFile, config.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load x509 keypair: %w", err)
 	}
 
 	tlsConfig := &tls.Config{
@@ -565,11 +575,7 @@ func buildServerTLSConfig(config *InboundConfig) (*tls.Config, error) {
 		Certificates: []tls.Certificate{cert},
 		NextProtos:   []string{http3.NextProtoH3},
 	}
-	if len(config.Psk) >= 32 {
-		var key [32]byte
-		copy(key[:], config.Psk[:32])
-		tlsConfig.SetSessionTicketKeys([][32]byte{key})
-	}
+	// Go TLS generates independent server-only ticket keys and rotates them.
 	if config.StrictSni != "" {
 		tlsConfig.GetConfigForClient = func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
 			if !strings.EqualFold(chi.ServerName, config.StrictSni) {
@@ -581,89 +587,72 @@ func buildServerTLSConfig(config *InboundConfig) (*tls.Config, error) {
 	return tlsConfig, nil
 }
 
-func generateSelfSignedCert(serverName string) (tls.Certificate, error) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	template := x509.Certificate{
-		SerialNumber: big.NewInt(time.Now().UnixNano()),
-		Subject: pkix.Name{
-			Organization: []string{"Chitanda Edge Gateway"},
-			CommonName:   serverName,
-		},
-		NotBefore:             time.Now().Add(-1 * time.Hour),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-	}
-	if serverName != "" {
-		if ip := net.ParseIP(serverName); ip != nil {
-			template.IPAddresses = []net.IP{ip}
-		} else {
-			template.DNSNames = []string{serverName, "localhost"}
-		}
-	} else {
-		template.DNSNames = []string{"localhost"}
-	}
-
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	return tls.Certificate{
-		Certificate: [][]byte{derBytes},
-		PrivateKey:  priv,
-	}, nil
-}
-
 type packetItem struct {
 	data []byte
 	addr net.Addr
 }
 
 type virtualPacketConn struct {
-	recvCh      chan *packetItem
-	closeCh     chan struct{}
-	closed      atomic.Bool
-	localAddr   net.Addr
+	recvCh    chan *packetItem
+	closeCh   chan struct{}
+	closed    atomic.Bool
+	localAddr net.Addr
 
-	mu          sync.RWMutex
-	writers     map[string]stat.Connection
+	mu      sync.RWMutex
+	writers map[string]stat.Connection
 
-	readTimer   *time.Timer
-	timerMu     sync.Mutex
-	readExpired atomic.Bool
+	deadlineMu      sync.Mutex
+	readDeadline    time.Time
+	deadlineChanged chan struct{}
+	contexts        map[string]context.Context
 }
 
 func newVirtualPacketConn() *virtualPacketConn {
 	return &virtualPacketConn{
-		recvCh:    make(chan *packetItem, 2048),
-		closeCh:   make(chan struct{}),
-		localAddr: &net.UDPAddr{IP: net.IPv4zero, Port: 0},
-		writers:   make(map[string]stat.Connection),
+		recvCh:          make(chan *packetItem, 2048),
+		closeCh:         make(chan struct{}),
+		localAddr:       &net.UDPAddr{IP: net.IPv4zero, Port: 0},
+		writers:         make(map[string]stat.Connection),
+		contexts:        make(map[string]context.Context),
+		deadlineChanged: make(chan struct{}),
 	}
 }
 
 func (c *virtualPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	if c.closed.Load() {
-		return 0, nil, net.ErrClosed
-	}
-	if c.readExpired.Load() {
-		return 0, nil, os.ErrDeadlineExceeded
-	}
-	select {
-	case pkt, ok := <-c.recvCh:
-		if !ok {
+	for {
+		if c.closed.Load() {
 			return 0, nil, net.ErrClosed
 		}
-		n := copy(p, pkt.data)
-		return n, pkt.addr, nil
-	case <-c.closeCh:
-		return 0, nil, net.ErrClosed
+		c.deadlineMu.Lock()
+		dl, changed := c.readDeadline, c.deadlineChanged
+		c.deadlineMu.Unlock()
+		var timer *time.Timer
+		var timeout <-chan time.Time
+		if !dl.IsZero() {
+			if !time.Now().Before(dl) {
+				return 0, nil, os.ErrDeadlineExceeded
+			}
+			timer = time.NewTimer(time.Until(dl))
+			timeout = timer.C
+		}
+		select {
+		case pkt := <-c.recvCh:
+			if timer != nil {
+				timer.Stop()
+			}
+			return copy(p, pkt.data), pkt.addr, nil
+		case <-c.closeCh:
+			if timer != nil {
+				timer.Stop()
+			}
+			return 0, nil, net.ErrClosed
+		case <-changed:
+			if timer != nil {
+				timer.Stop()
+			}
+		case <-timeout:
+			// Re-check under the next iteration in case the deadline was extended.
+		}
 	}
 }
 
@@ -683,12 +672,6 @@ func (c *virtualPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 func (c *virtualPacketConn) Close() error {
 	if c.closed.CompareAndSwap(false, true) {
 		close(c.closeCh)
-		c.timerMu.Lock()
-		if c.readTimer != nil {
-			c.readTimer.Stop()
-			c.readTimer = nil
-		}
-		c.timerMu.Unlock()
 	}
 	return nil
 }
@@ -703,28 +686,11 @@ func (c *virtualPacketConn) SetDeadline(t time.Time) error {
 }
 
 func (c *virtualPacketConn) SetReadDeadline(t time.Time) error {
-	c.timerMu.Lock()
-	defer c.timerMu.Unlock()
-
-	if c.readTimer != nil {
-		c.readTimer.Stop()
-		c.readTimer = nil
-	}
-	c.readExpired.Store(false)
-
-	if t.IsZero() {
-		return nil
-	}
-
-	d := time.Until(t)
-	if d <= 0 {
-		c.readExpired.Store(true)
-		return nil
-	}
-
-	c.readTimer = time.AfterFunc(d, func() {
-		c.readExpired.Store(true)
-	})
+	c.deadlineMu.Lock()
+	c.readDeadline = t
+	close(c.deadlineChanged)
+	c.deadlineChanged = make(chan struct{})
+	c.deadlineMu.Unlock()
 	return nil
 }
 
@@ -744,9 +710,12 @@ func (c *virtualPacketConn) feed(data []byte, addr net.Addr) {
 	}
 }
 
-func (c *virtualPacketConn) registerConn(key string, conn stat.Connection) {
+func (c *virtualPacketConn) registerConn(key string, conn stat.Connection, contexts ...context.Context) {
 	c.mu.Lock()
 	c.writers[key] = conn
+	if len(contexts) > 0 {
+		c.contexts[key] = context.WithoutCancel(contexts[0])
+	}
 	c.mu.Unlock()
 }
 
@@ -754,8 +723,33 @@ func (c *virtualPacketConn) unregisterConn(key string, conn stat.Connection) {
 	c.mu.Lock()
 	if c.writers[key] == conn {
 		delete(c.writers, key)
+		delete(c.contexts, key)
 	}
 	c.mu.Unlock()
+}
+
+type inboundValueContext struct {
+	context.Context
+	values context.Context
+}
+
+func (c inboundValueContext) Value(key any) any {
+	if v := c.Context.Value(key); v != nil {
+		return v
+	}
+	return c.values.Value(key)
+}
+
+func (c *virtualPacketConn) connectionContext(ctx context.Context, addr net.Addr) context.Context {
+	c.mu.RLock()
+	values := c.contexts[addr.String()]
+	c.mu.RUnlock()
+	if values == nil {
+		return ctx
+	}
+	// Keep QUIC's lifetime but preserve the original Xray inbound tag, user and
+	// routing metadata even when a short-lived UDP association is replaced.
+	return inboundValueContext{Context: ctx, values: values}
 }
 
 func init() {

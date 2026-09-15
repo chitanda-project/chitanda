@@ -62,7 +62,10 @@ type Config struct {
 	ServerID              string // optional target server ID for RawStream cross-node replay protection
 	DialContext           func(ctx context.Context, network, addr string) (net.Conn, error)
 	ListenPacket          func(ctx context.Context, network, addr string) (net.PacketConn, error)
-	ResolveUDP            func(ctx context.Context, network, addr string) (*net.UDPAddr, error)
+	// DialPacket optionally opens a packet socket to the resolved tunnel peer.
+	// Embedding cores can route this through their own UDP dispatcher.
+	DialPacket func(ctx context.Context, remote *net.UDPAddr) (net.PacketConn, error)
+	ResolveUDP func(ctx context.Context, network, addr string) (*net.UDPAddr, error)
 }
 
 // Client is the MyXray core client engine.
@@ -165,7 +168,7 @@ func New(cfg Config) (*Client, error) {
 		}
 		for i := 0; i < h3Count; i++ {
 			h3Managers = append(h3Managers, newH3TransportManager(
-				cfg.Server, cfg.ServerName, rootURL, requestURL, cfg.Path, cfg.PSK, cache, cfg.QUICInitialPacketSize, cfg.InsecureSkipVerify, cfg.ListenPacket, cfg.ResolveUDP,
+				cfg.Server, cfg.ServerName, rootURL, requestURL, cfg.Path, cfg.PSK, cache, cfg.QUICInitialPacketSize, cfg.InsecureSkipVerify, cfg.ListenPacket, cfg.ResolveUDP, cfg.DialPacket,
 			))
 		}
 	}
@@ -298,7 +301,11 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 	c.mu.Unlock()
 
 	if c.cfg.TCPTransport == TCPTransportPlainH1 || c.cfg.TCPTransport == TCPTransportH1 || c.cfg.TCPTransport == TCPTransportStream {
-		return newPlainUDPConn(ctx, c.cfg.Server, c.cfg.PSK, c.cfg.ListenPacket, c.cfg.ResolveUDP)
+		pconn, err := newPlainUDPConn(ctx, c.cfg.Server, c.cfg.PSK, c.cfg.ListenPacket, c.cfg.ResolveUDP, c.cfg.DialPacket)
+		if err != nil {
+			return nil, err
+		}
+		return pconn, nil
 	}
 
 	h3Mgr := c.reserveH3Manager()
@@ -376,8 +383,14 @@ func signRequest(request *http.Request, psk []byte, path, target, mode string) e
 	return nil
 }
 
-// parseUDPAddr parses a target address string into a *net.UDPAddr without invoking Go's default DNS resolver.
-func parseUDPAddr(addrStr string) *net.UDPAddr {
+type domainUDPAddr string
+
+func (domainUDPAddr) Network() string  { return "udp" }
+func (a domainUDPAddr) String() string { return string(a) }
+
+// parseUDPAddr preserves domain metadata without inventing 0.0.0.0 or invoking
+// the host's DNS resolver. Datagram codecs have already validated the address.
+func parseUDPAddr(addrStr string) net.Addr {
 	if ap, err := netip.ParseAddrPort(addrStr); err == nil {
 		return net.UDPAddrFromAddrPort(ap)
 	}
@@ -387,7 +400,7 @@ func parseUDPAddr(addrStr string) *net.UDPAddr {
 			if ip := net.ParseIP(host); ip != nil {
 				return &net.UDPAddr{IP: ip, Port: port}
 			}
-			return &net.UDPAddr{IP: net.IPv4zero, Port: port}
+			return domainUDPAddr(addrStr)
 		}
 	}
 	return &net.UDPAddr{IP: net.IPv4zero, Port: 0}
@@ -424,4 +437,3 @@ func resolveUDP(ctx context.Context, addrStr string, fn func(context.Context, st
 	}
 	return &net.UDPAddr{IP: ips[0], Port: port}, nil
 }
-

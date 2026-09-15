@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -79,16 +80,19 @@ func TestStreamServer_TargetClosesFirst(t *testing.T) {
 	n, err := conn.Read(resp)
 	t.Logf("Read %d bytes: %q, err: %v", n, resp[:n], err)
 
-	// Now: Client does NOT close the connection immediately (just like a browser or game keeping connection open)
-	// Let's check srv.activeConns after 500ms (grace period is 250ms)!
-	time.Sleep(500 * time.Millisecond)
-	active := srv.activeConns.Load()
-	t.Logf("Active conns on server: %d", active)
-
-	if active != 0 {
-		t.Errorf("LEAK DETECTED! Server still has %d active connection(s) when target has already closed!", active)
+	// Target FIN must reach the client promptly without forcibly closing upload.
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := conn.Read(resp); err != io.EOF {
+		t.Fatalf("expected authenticated downlink EOF, got %v", err)
 	}
 	_ = conn.Close()
+	deadline := time.Now().Add(time.Second)
+	for srv.activeConns.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if active := srv.activeConns.Load(); active != 0 {
+		t.Fatalf("%d active connections after client Close", active)
+	}
 }
 
 func TestStreamServer_GameBurstRequests_NoFDLeak(t *testing.T) {
@@ -175,7 +179,7 @@ func TestStreamServer_GameBurstRequests_NoFDLeak(t *testing.T) {
 		}
 	}
 
-	// Wait 600ms for all 250ms grace periods to finish
+	// Allow clients' delayed Close calls and worker cleanup to finish.
 	time.Sleep(600 * time.Millisecond)
 
 	active := srv.activeConns.Load()

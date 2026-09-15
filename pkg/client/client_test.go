@@ -512,4 +512,3 @@ func TestH1ChunkReaderBoundary(t *testing.T) {
 		t.Fatalf("expected to read 16402 bytes, read %d", total)
 	}
 }
-

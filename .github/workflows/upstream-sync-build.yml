@@ -127,7 +127,19 @@ jobs:
         run: |
           cd upstream_src
           go mod tidy
-          go test -race ./proxy/chitanda -count=1 -timeout 120s
+          go test -race ./proxy/chitanda -count=1 -timeout 180s
+          go test -race ./infra/conf -run Chitanda -count=1 -timeout 120s
+
+      - name: Test Chitanda SDK regressions
+        if: steps.upstream_check.outputs.should_build == 'true' && matrix.target == 'xray'
+        run: go test -mod=mod -race ./internal/... ./pkg/... -count=1 -timeout 180s
+
+      - name: Test Mihomo Chitanda adapter regressions
+        if: steps.upstream_check.outputs.should_build == 'true' && matrix.target == 'mihomo'
+        run: |
+          cd upstream_src
+          go mod tidy
+          go test -race ./config -run Chitanda -count=1 -timeout 120s
 
       - name: Build Multi-Architecture Binaries
         if: steps.upstream_check.outputs.should_build == 'true'

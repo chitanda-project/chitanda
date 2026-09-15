@@ -2,6 +2,7 @@ package h1session
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -15,6 +16,7 @@ type FramedWriter struct {
 	mu      sync.Mutex
 	flusher http.Flusher
 	buf     []byte
+	closed  bool
 }
 
 // NewFramedWriter wraps an io.Writer with an AEAD encryption stream.
@@ -31,6 +33,9 @@ func NewFramedWriter(w io.Writer, stream *AEADStream) *FramedWriter {
 func (fw *FramedWriter) Write(p []byte) (n int, err error) {
 	fw.mu.Lock()
 	defer fw.mu.Unlock()
+	if fw.closed {
+		return 0, io.ErrClosedPipe
+	}
 
 	total := len(p)
 	for len(p) > 0 {
@@ -47,7 +52,7 @@ func (fw *FramedWriter) Write(p []byte) (n int, err error) {
 			return n, err
 		}
 
-		if _, err := fw.w.Write(fw.buf); err != nil {
+		if err := fw.flush(); err != nil {
 			return n, err
 		}
 		if fw.flusher != nil {
@@ -58,14 +63,47 @@ func (fw *FramedWriter) Write(p []byte) (n int, err error) {
 	return total, nil
 }
 
+func (fw *FramedWriter) flush() error {
+	n, err := fw.w.Write(fw.buf)
+	if err == nil && n != len(fw.buf) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		fw.closed = true
+	}
+	return err
+}
+
+// WriteEOF authenticates the end of this direction using the next AEAD nonce.
+func (fw *FramedWriter) WriteEOF() error {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if fw.closed {
+		return nil
+	}
+	fw.closed = true
+	var err error
+	fw.buf, err = fw.stream.EncryptChunk(fw.buf[:0], nil)
+	if err == nil {
+		err = fw.flush()
+	}
+	if err == nil && fw.flusher != nil {
+		fw.flusher.Flush()
+	}
+	return err
+}
+
 // FramedReader decrypts incoming length-prefixed AEAD chunks into a plaintext byte stream.
 type FramedReader struct {
-	r      io.Reader
-	stream *AEADStream
-	mu     sync.Mutex
-	hdrBuf [2]byte
-	rawBuf []byte
-	decBuf []byte
+	r          io.Reader
+	stream     *AEADStream
+	mu         sync.Mutex
+	hdrBuf     [2]byte
+	rawBuf     []byte
+	decBuf     []byte
+	headerRead int
+	bodyRead   int
+	terminal   error
 }
 
 // NewFramedReader wraps an io.Reader with an AEAD decryption stream.
@@ -78,6 +116,9 @@ func NewFramedReader(r io.Reader, stream *AEADStream) *FramedReader {
 }
 
 func (fr *FramedReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	fr.mu.Lock()
 	defer fr.mu.Unlock()
 
@@ -86,27 +127,44 @@ func (fr *FramedReader) Read(p []byte) (int, error) {
 		fr.decBuf = fr.decBuf[n:]
 		return n, nil
 	}
+	if fr.terminal != nil {
+		return 0, fr.terminal
+	}
 
 	// Read 2-byte chunk wire length
-	if _, err := io.ReadFull(fr.r, fr.hdrBuf[:]); err != nil {
-		return 0, err
+	if fr.headerRead < len(fr.hdrBuf) {
+		n, err := io.ReadFull(fr.r, fr.hdrBuf[fr.headerRead:])
+		fr.headerRead += n
+		if err != nil {
+			return 0, fr.readError(err)
+		}
 	}
 	wireLen := int(binary.BigEndian.Uint16(fr.hdrBuf[:]))
-	if wireLen == 0 {
-		return 0, io.EOF
+	if wireLen < 16 {
+		fr.terminal = ErrDecryptionFailed
+		return 0, fr.terminal
 	}
 	if wireLen > MaxChunkWireLen {
-		return 0, ErrChunkTooLarge
+		fr.terminal = ErrChunkTooLarge
+		return 0, fr.terminal
 	}
 
 	raw := fr.rawBuf[:wireLen]
-	if _, err := io.ReadFull(fr.r, raw); err != nil {
-		return 0, err
+	nRead, readErr := io.ReadFull(fr.r, raw[fr.bodyRead:])
+	fr.bodyRead += nRead
+	if readErr != nil {
+		return 0, fr.readError(readErr)
 	}
 
 	decrypted, err := fr.stream.DecryptChunk(nil, raw)
 	if err != nil {
+		fr.terminal = err
 		return 0, err
+	}
+	fr.headerRead, fr.bodyRead = 0, 0
+	if len(decrypted) == 0 {
+		fr.terminal = io.EOF
+		return 0, io.EOF
 	}
 
 	n := copy(p, decrypted)
@@ -114,6 +172,17 @@ func (fr *FramedReader) Read(p []byte) (int, error) {
 		fr.decBuf = append(fr.decBuf[:0], decrypted[n:]...)
 	}
 	return n, nil
+}
+
+func (fr *FramedReader) readError(err error) error {
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return err
+	}
+	if errors.Is(err, io.EOF) {
+		err = io.ErrUnexpectedEOF
+	}
+	fr.terminal = err
+	return err
 }
 
 // Conn wraps a net.Conn with bidirectional AEAD framed reading and writing.
@@ -164,6 +233,9 @@ func (c *Conn) Write(p []byte) (int, error) {
 }
 
 func (c *Conn) CloseWrite() error {
+	if err := c.writer.WriteEOF(); err != nil {
+		return err
+	}
 	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
 		return cw.CloseWrite()
 	}
@@ -176,4 +248,3 @@ func (c *Conn) CloseRead() error {
 	}
 	return nil
 }
-

@@ -11,12 +11,12 @@ import (
 )
 
 const (
-	MinRecordPayloadLen = 1380              // MTU-aligned single-packet record for ultra-low TTFB
-	MidRecordPayloadLen = 8192              // Intermediate ramp-up chunk (8 KiB)
-	MaxBatchFlushLen    = 128 * 1024        // 128 KiB batch flush ceiling for maximum bulk throughput
-	Phase1Threshold     = 128 * 1024        // First 128 KiB uses MinRecordPayloadLen with immediate write
-	Phase2Threshold     = 1024 * 1024       // Next 128 KiB to 1 MiB uses MidRecordPayloadLen
-	IdleResetThreshold  = 1 * time.Second   // Idle silence after which record size drops back to Phase 1
+	MinRecordPayloadLen = 1380            // MTU-aligned single-packet record for ultra-low TTFB
+	MidRecordPayloadLen = 8192            // Intermediate ramp-up chunk (8 KiB)
+	MaxBatchFlushLen    = 128 * 1024      // 128 KiB batch flush ceiling for maximum bulk throughput
+	Phase1Threshold     = 128 * 1024      // First 128 KiB uses MinRecordPayloadLen with immediate write
+	Phase2Threshold     = 1024 * 1024     // Next 128 KiB to 1 MiB uses MidRecordPayloadLen
+	IdleResetThreshold  = 1 * time.Second // Idle silence after which record size drops back to Phase 1
 )
 
 // FramedWriter encrypts outgoing byte streams into length-prefixed AEAD chunks.
@@ -87,7 +87,7 @@ func (fw *FramedWriter) Write(p []byte) (n int, err error) {
 
 		// Flush batch if accumulated buffer reaches flushThreshold (or immediate in Phase 1)
 		if flushThreshold == 0 || len(fw.buf) >= flushThreshold {
-			if _, err := fw.w.Write(fw.buf); err != nil {
+			if err := fw.flush(); err != nil {
 				return n, err
 			}
 			n += unflushedPlaintext
@@ -97,7 +97,7 @@ func (fw *FramedWriter) Write(p []byte) (n int, err error) {
 	}
 
 	if len(fw.buf) > 0 {
-		if _, err := fw.w.Write(fw.buf); err != nil {
+		if err := fw.flush(); err != nil {
 			return n, err
 		}
 		n += unflushedPlaintext
@@ -107,7 +107,20 @@ func (fw *FramedWriter) Write(p []byte) (n int, err error) {
 	return n, nil
 }
 
-// WriteEOF sends an in-band 0-length AEAD wire chunk to signal end-of-stream.
+// flush fails closed on partial writes: a consumed nonce must never be retried.
+func (fw *FramedWriter) flush() error {
+	n, err := fw.w.Write(fw.buf)
+	if err == nil && n != len(fw.buf) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		fw.closed = true
+	}
+	return err
+}
+
+// WriteEOF sends an authenticated empty plaintext record with the next nonce.
+// Bare zero lengths and transport EOF are not authenticated stream endings.
 func (fw *FramedWriter) WriteEOF() error {
 	fw.mu.Lock()
 	defer fw.mu.Unlock()
@@ -117,9 +130,12 @@ func (fw *FramedWriter) WriteEOF() error {
 	}
 	fw.closed = true
 
-	var zeroLen [2]byte
-	_, err := fw.w.Write(zeroLen[:])
-	return err
+	var err error
+	fw.buf, err = fw.stream.EncryptChunk(fw.buf[:0], nil)
+	if err != nil {
+		return err
+	}
+	return fw.flush()
 }
 
 // FramedReader decrypts incoming length-prefixed AEAD chunks into a plaintext byte stream.
@@ -134,6 +150,8 @@ type FramedReader struct {
 	decOff     int
 	eofReached bool
 	fatalErr   error
+	headerRead int
+	bodyRead   int
 }
 
 // NewFramedReader wraps an io.Reader with an AEAD decryption stream.
@@ -168,9 +186,7 @@ func (fr *FramedReader) Read(p []byte) (int, error) {
 
 	// 2. Check for sticky EOF or fatal error
 	if fr.fatalErr != nil {
-		err := fr.fatalErr
-		fr.fatalErr = nil
-		return 0, err
+		return 0, fr.fatalErr
 	}
 
 	if fr.eofReached {
@@ -178,25 +194,18 @@ func (fr *FramedReader) Read(p []byte) (int, error) {
 	}
 
 	// 3. Read 2-byte chunk wire length
-	if _, err := io.ReadFull(fr.r, fr.hdrBuf[:]); err != nil {
-		if errors.Is(err, io.EOF) {
-			fr.eofReached = true
-			return 0, io.EOF
-		} else if errors.Is(err, io.ErrUnexpectedEOF) {
-			fr.fatalErr = io.ErrUnexpectedEOF
-			return 0, io.ErrUnexpectedEOF
+	if fr.headerRead < len(fr.hdrBuf) {
+		n, err := io.ReadFull(fr.r, fr.hdrBuf[fr.headerRead:])
+		fr.headerRead += n
+		if err != nil {
+			return 0, fr.readError(err)
 		}
-		if ne, ok := err.(net.Error); ok && ne.Timeout() {
-			return 0, err
-		}
-		fr.fatalErr = err
-		return 0, err
 	}
 
 	wireLen := int(binary.BigEndian.Uint16(fr.hdrBuf[:]))
-	if wireLen == 0 {
-		fr.eofReached = true
-		return 0, io.EOF
+	if wireLen < 16 {
+		fr.fatalErr = ErrDecryptionFailed
+		return 0, fr.fatalErr
 	}
 	if wireLen > MaxChunkWireLen {
 		fr.fatalErr = ErrChunkTooLarge
@@ -210,13 +219,10 @@ func (fr *FramedReader) Read(p []byte) (int, error) {
 	}
 
 	// 4. Read chunk body
-	if _, err := io.ReadFull(fr.r, fr.rawBuf); err != nil {
-		if errors.Is(err, io.EOF) {
-			fr.fatalErr = io.ErrUnexpectedEOF
-			return 0, io.ErrUnexpectedEOF
-		}
-		fr.fatalErr = err
-		return 0, err
+	nRead, readErr := io.ReadFull(fr.r, fr.rawBuf[fr.bodyRead:])
+	fr.bodyRead += nRead
+	if readErr != nil {
+		return 0, fr.readError(readErr)
 	}
 
 	// 5. Decrypt chunk
@@ -226,6 +232,11 @@ func (fr *FramedReader) Read(p []byte) (int, error) {
 		fr.fatalErr = ErrDecryptionFailed
 		return 0, ErrDecryptionFailed
 	}
+	fr.headerRead, fr.bodyRead = 0, 0
+	if len(fr.decBuf) == 0 {
+		fr.eofReached = true
+		return 0, io.EOF
+	}
 
 	// 6. Copy decrypted data to destination buffer
 	fr.decOff = 0
@@ -234,6 +245,16 @@ func (fr *FramedReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+func (fr *FramedReader) readError(err error) error {
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return err // Preserve partial header/body for a later deadline reset.
+	}
+	if errors.Is(err, io.EOF) {
+		err = io.ErrUnexpectedEOF
+	}
+	fr.fatalErr = err
+	return err
+}
 
 type closeWriter interface {
 	CloseWrite() error
@@ -267,7 +288,9 @@ func (c *StreamConn) Write(b []byte) (int, error) {
 }
 
 func (c *StreamConn) CloseWrite() error {
-	_ = c.Writer.WriteEOF()
+	if err := c.Writer.WriteEOF(); err != nil {
+		return err
+	}
 	if cw, ok := c.Conn.(closeWriter); ok {
 		return cw.CloseWrite()
 	}
