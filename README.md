@@ -27,6 +27,7 @@ Chitanda は、セルフホスト（自前運用）サーバー環境向けに�
 - H2/H3 使用协商的 HALF_CLOSE 帧，允许对端结束发送后继续上传；不再使用 250ms 强制截断。
 - Xray 的 H3（含 h2/auto 的 H3 UDP）必须配置 `cert_file` / `key_file`，或继承 `streamSettings.tlsSettings.certificates` 中的文件证书对。`stream` / `h1` 不需要证书。TLS ticket 使用服务端独立密钥，重启后旧 ticket 回退完整握手。
 - TCP/UDP 拨号、H3 UDP 目标转发遵守 Xray 路由；Mihomo 会校验 `dialer-proxy`。完整修复与验收范围见 [接入修复说明](docs/INTEGRATION_FIXES_2026-09-15.md)。
+- CI 后续修复：原生 UDP 工作线程与解析器设置之间增加同步，修复 `TestStreamServer_NativeUDP_Echo` 检出的数据竞争；不改变线上报文格式。
 
 ---
 

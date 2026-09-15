@@ -63,7 +63,7 @@ func Run(config *Config, listenAddr, adminListenAddr, quicListenAddr string) err
 	}
 
 	admin := &http.Server{Addr: adminListenAddr, Handler: healthHandler(), ReadHeaderTimeout: 2 * time.Second}
-	
+
 	var h3Server *http3ServerWrapper
 	if quicListenAddr != "" {
 		if config.TicketKeyFile == "" {
@@ -122,7 +122,7 @@ func Run(config *Config, listenAddr, adminListenAddr, quicListenAddr string) err
 			}
 			plainUDPServer = pServer
 			if config.AllowPrivateTargets {
-				plainUDPServer.SetResolveUDPForTest(func(ctx context.Context, address string) (*net.UDPAddr, error) {
+				plainUDPServer.SetResolveUDP(func(ctx context.Context, address string) (*net.UDPAddr, error) {
 					return net.ResolveUDPAddr("udp", address)
 				})
 			}
@@ -151,7 +151,7 @@ func Run(config *Config, listenAddr, adminListenAddr, quicListenAddr string) err
 					_ = uConn.SetWriteBuffer(8 << 20)
 					_ = streamServer.AttachUDP(uConn)
 					if config.AllowPrivateTargets && streamServer.UDPServer() != nil {
-						streamServer.UDPServer().SetResolveUDPForTest(func(ctx context.Context, address string) (*net.UDPAddr, error) {
+						streamServer.UDPServer().SetResolveUDP(func(ctx context.Context, address string) (*net.UDPAddr, error) {
 							return net.ResolveUDPAddr("udp", address)
 						})
 					}

@@ -37,3 +37,15 @@
 新增回归覆盖：认证 EOF/截断、四种实际载体空闲 6 秒后双向通信及收到 EOF 后暂停 600ms 继续上传、H2/H3 请求取消、H3 并发 deadline、证书序列化与 ticket 隔离、UDP 9KB 数据报边界/所有权/监听器、重放容量/有效期、Xray UDP 拨号拒绝、真实 H3 UDP dispatcher 转发及入站 tag、Mihomo 错误代理链。
 
 main 推送会触发 `Upstream Sync & Automated Release`。按本次交付要求，不等待或监控 Actions 打包完成。
+
+## CI 后续修复：原生 UDP 解析器数据竞争
+
+`c602e78` 的 Linux CI 在 `TestStreamServer_NativeUDP_Echo` 检出真实数据竞争：
+`AttachUDP` 已启动工作线程，随后设置解析器，与 `processTask` 读取解析器之间缺少同步。
+独立服务端启用 `AllowPrivateTargets` 时也存在相同调用顺序，因此并非单纯的测试误报。
+
+- 新增线程安全的 `SetResolveUDP`，保留 `SetResolveUDPForTest` 兼容入口；传入 nil 恢复默认安全解析器。
+- 仅在新目标解析前持读锁取得函数快照，调用 DNS/用户回调前释放锁；已有目标的数据报转发不加此锁。
+- 替换只影响后续解析，不撤销已经建立的目标连接或正在执行的解析，不应当作即时访问策略撤销接口。
+- 新增并发回归在旧代码上复现相同 race；修复后与原生 UDP 回显、自更新解析器回归一起重复 50 次通过。
+- Windows 本地 SDK 全量 race、Xray 接入与配置 race 通过；本地通过不等于 Linux CI 已通过，重新推送后不等待打包完成。

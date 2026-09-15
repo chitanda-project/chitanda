@@ -43,6 +43,7 @@ type PlainUDPServer struct {
 	maxSessions  int64
 	workers      []chan udpTask
 	workerWg     sync.WaitGroup
+	resolveMu    sync.RWMutex
 	resolveUDP   func(ctx context.Context, address string) (*net.UDPAddr, error)
 	closed       atomic.Bool
 	inFlightMem  atomic.Int64
@@ -88,9 +89,21 @@ func NewPlainUDPServer(conn *net.UDPConn, psk []byte) (*PlainUDPServer, error) {
 	}, nil
 }
 
-// SetResolveUDPForTest overrides target resolution in unit tests.
-func (s *PlainUDPServer) SetResolveUDPForTest(fn func(ctx context.Context, address string) (*net.UDPAddr, error)) {
+// SetResolveUDP safely replaces the resolver used for new target connections.
+// Existing target connections and in-progress resolutions are not changed.
+// A nil function restores the default resolver, including its target restrictions.
+func (s *PlainUDPServer) SetResolveUDP(fn func(ctx context.Context, address string) (*net.UDPAddr, error)) {
+	if fn == nil {
+		fn = target.ResolveUDPAddr
+	}
+	s.resolveMu.Lock()
 	s.resolveUDP = fn
+	s.resolveMu.Unlock()
+}
+
+// SetResolveUDPForTest is kept for compatibility with existing SDK callers.
+func (s *PlainUDPServer) SetResolveUDPForTest(fn func(ctx context.Context, address string) (*net.UDPAddr, error)) {
+	s.SetResolveUDP(fn)
 }
 
 // Serve starts the worker pool and the UDP packet read loop.
@@ -215,7 +228,12 @@ func (s *PlainUDPServer) processTask(ctx context.Context, task udpTask) {
 		if session.targetCount.Load() >= 32 {
 			return // Max targets reached for this session
 		}
-		resolved, err := s.resolveUDP(ctx, task.targetAddr)
+		// Snapshot the callback under lock, but never hold it during DNS or
+		// caller code. Cached targets do not enter this path.
+		s.resolveMu.RLock()
+		resolve := s.resolveUDP
+		s.resolveMu.RUnlock()
+		resolved, err := resolve(ctx, task.targetAddr)
 		if err != nil {
 			return
 		}
