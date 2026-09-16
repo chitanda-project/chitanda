@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"x-ui/config"
@@ -344,52 +345,156 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 	fileName := fmt.Sprintf("Xray-%s-%s.zip", osName, arch)
 	rawUrl := fmt.Sprintf("https://github.com/violetaini/chitanda/releases/download/%s/%s", version, fileName)
 
-	urls := []string{
-		"https://github.boki.moe/" + rawUrl,
-		"https://ghfast.top/" + rawUrl,
+	// Check if user set custom mirror in environment
+	customMirror := os.Getenv("XUI_MIRROR")
+	urls := []string{}
+	if customMirror != "" {
+		customMirror = strings.TrimSuffix(customMirror, "/")
+		urls = append(urls, customMirror+"/"+rawUrl)
+	}
+	// Direct GitHub first (fastest for international servers), then reliable mirrors for mainland China
+	urls = append(urls,
 		rawUrl,
+		"https://ghfast.top/"+rawUrl,
+		"https://github.boki.moe/"+rawUrl,
+	)
+
+	downloadChunked := func(targetUrl string, destPath string) error {
+		client := &http.Client{
+			Timeout: 45 * time.Second,
+		}
+
+		headReq, err := http.NewRequest("HEAD", targetUrl, nil)
+		if err == nil {
+			headReq.Header.Set("User-Agent", "Mozilla/5.0 (3x-ui)")
+			headResp, err := client.Do(headReq)
+			if err == nil {
+				headResp.Body.Close()
+				contentLengthStr := headResp.Header.Get("Content-Length")
+				contentLength, err := strconv.ParseInt(contentLengthStr, 10, 64)
+				if err == nil && contentLength > 2*1024*1024 && headResp.Header.Get("Accept-Ranges") == "bytes" {
+					numParts := 4
+					file, err := os.OpenFile(destPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0666)
+					if err == nil {
+						if err := file.Truncate(contentLength); err == nil {
+							partSize := contentLength / int64(numParts)
+							var wg sync.WaitGroup
+							errs := make([]error, numParts)
+
+							for i := 0; i < numParts; i++ {
+								wg.Add(1)
+								go func(part int) {
+									defer wg.Done()
+									start := int64(part) * partSize
+									end := start + partSize - 1
+									if part == numParts-1 {
+										end = contentLength - 1
+									}
+
+									partReq, err := http.NewRequest("GET", targetUrl, nil)
+									if err != nil {
+										errs[part] = err
+										return
+									}
+									partReq.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+									partReq.Header.Set("User-Agent", "Mozilla/5.0 (3x-ui)")
+
+									partResp, err := client.Do(partReq)
+									if err != nil {
+										errs[part] = err
+										return
+									}
+									defer partResp.Body.Close()
+
+									if partResp.StatusCode != http.StatusPartialContent && partResp.StatusCode != http.StatusOK {
+										errs[part] = fmt.Errorf("unexpected status %d", partResp.StatusCode)
+										return
+									}
+
+									buf := make([]byte, 64*1024)
+									offset := start
+									for {
+										n, readErr := partResp.Body.Read(buf)
+										if n > 0 {
+											_, writeErr := file.WriteAt(buf[:n], offset)
+											if writeErr != nil {
+												errs[part] = writeErr
+												return
+											}
+											offset += int64(n)
+										}
+										if readErr == io.EOF {
+											break
+										}
+										if readErr != nil {
+											errs[part] = readErr
+											return
+										}
+									}
+								}(i)
+							}
+
+							wg.Wait()
+							hasErr := false
+							for _, e := range errs {
+								if e != nil {
+									hasErr = true
+									break
+								}
+							}
+							file.Close()
+							if !hasErr {
+								return nil
+							}
+						} else {
+							file.Close()
+						}
+					}
+				}
+			}
+		}
+
+		// Fallback to single stream download
+		getReq, err := http.NewRequest("GET", targetUrl, nil)
+		if err != nil {
+			return err
+		}
+		getReq.Header.Set("User-Agent", "Mozilla/5.0 (3x-ui)")
+		resp, err := client.Do(getReq)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("bad status: %s", resp.Status)
+		}
+
+		os.Remove(destPath)
+		file, err := os.Create(destPath)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		_, err = io.Copy(file, resp.Body)
+		return err
 	}
 
-	client := &http.Client{
-		Timeout: 90 * time.Second,
-	}
-
-	var resp *http.Response
-	var err error
+	var lastErr error
 	for _, u := range urls {
 		logger.Infof("downloading xray from: %s", u)
-		resp, err = client.Get(u)
-		if err == nil && resp.StatusCode == http.StatusOK {
-			break
+		t0 := time.Now()
+		err := downloadChunked(u, fileName)
+		if err == nil {
+			logger.Infof("successfully downloaded xray in %v from: %s", time.Since(t0), u)
+			return fileName, nil
 		}
-		if resp != nil {
-			resp.Body.Close()
-			resp = nil
-		}
-		logger.Warningf("download from %s failed: %v, trying next mirror...", u, err)
+		lastErr = err
+		logger.Warningf("download from %s failed (%v), trying next source...", u, err)
 	}
 
-	if resp == nil {
-		if err != nil {
-			return "", err
-		}
-		return "", fmt.Errorf("failed to download xray: all sources failed")
-	}
-	defer resp.Body.Close()
-
-	os.Remove(fileName)
-	file, err := os.Create(fileName)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-
-	_, err = io.Copy(file, resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	return fileName, nil
+	return "", fmt.Errorf("failed to download xray: all sources failed: %v", lastErr)
 }
 
 func (s *ServerService) UpdateXray(version string) error {
