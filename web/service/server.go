@@ -361,7 +361,7 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 
 	downloadChunked := func(targetUrl string, destPath string) error {
 		client := &http.Client{
-			Timeout: 45 * time.Second,
+			Timeout: 120 * time.Second,
 		}
 
 		headReq, err := http.NewRequest("HEAD", targetUrl, nil)
@@ -369,6 +369,7 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 			headReq.Header.Set("User-Agent", "Mozilla/5.0 (3x-ui)")
 			headResp, err := client.Do(headReq)
 			if err == nil {
+				finalUrl := headResp.Request.URL.String()
 				headResp.Body.Close()
 				contentLengthStr := headResp.Header.Get("Content-Length")
 				contentLength, err := strconv.ParseInt(contentLengthStr, 10, 64)
@@ -377,6 +378,7 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 					file, err := os.OpenFile(destPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0666)
 					if err == nil {
 						if err := file.Truncate(contentLength); err == nil {
+							logger.Infof("starting %d-part concurrent download (size: %d bytes) from: %s", numParts, contentLength, finalUrl)
 							partSize := contentLength / int64(numParts)
 							var wg sync.WaitGroup
 							errs := make([]error, numParts)
@@ -391,7 +393,7 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 										end = contentLength - 1
 									}
 
-									partReq, err := http.NewRequest("GET", targetUrl, nil)
+									partReq, err := http.NewRequest("GET", finalUrl, nil)
 									if err != nil {
 										errs[part] = err
 										return
