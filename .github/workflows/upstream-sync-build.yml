@@ -139,7 +139,7 @@ jobs:
         run: |
           cd upstream_src
           go mod tidy
-          go test -race ./config -run Chitanda -count=1 -timeout 120s
+          go test -race ./config ./adapter/outbound -run 'Chitanda|RegressionMihomo' -count=1 -timeout 120s
 
       - name: Build Multi-Architecture Binaries
         if: steps.upstream_check.outputs.should_build == 'true'
@@ -191,7 +191,7 @@ jobs:
             if [ "$GOOS" == "linux" ] && [ "$GOARCH" == "amd64" ] && [ "${{ matrix.target }}" == "mihomo" ]; then
               echo "===> Running Mihomo smoke test with Chitanda configurations..."
               "../dist/$BIN_NAME" -t -f "$GITHUB_WORKSPACE/examples/mihomo/config.yaml"
-              printf 'mixed-port: 7890\nproxies:\n  - {name: test-minimal, server: 127.0.0.1, port: 443, type: chitanda, psk: test-secret-token}\n' > /tmp/test-minimal.yaml
+              printf 'mixed-port: 7890\nproxies:\n  - {name: test-minimal, server: 127.0.0.1, port: 443, type: chitanda, psk: test-secret-token-at-least-32-bytes}\n' > /tmp/test-minimal.yaml
               "../dist/$BIN_NAME" -t -f /tmp/test-minimal.yaml
               rm -f /tmp/test-minimal.yaml
               echo "===> Mihomo smoke test PASSED successfully!"

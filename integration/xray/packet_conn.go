@@ -1,10 +1,13 @@
 package chitanda
 
 import (
+	"github.com/violetaini/chitanda/pkg/connio"
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 // packetAddress keeps domain destinations intact; resolution belongs to Xray's
@@ -48,10 +51,23 @@ type packetLinkConn struct {
 	pending      buf.MultiBuffer
 	readErr      error
 	remote       net.Addr
+	packetReads  *connio.Reader
 }
 
 func newPacketLinkConn(r buf.Reader, w buf.Writer, remote net.Addr) *packetLinkConn {
-	return &packetLinkConn{pipeConn: newPipeConn(r, w), packetReader: r, remote: remote}
+	c := &packetLinkConn{pipeConn: newPipeConn(r, w), packetReader: r, remote: remote}
+	c.packetReads = connio.NewReader(func() ([]byte, net.Addr, error) {
+		b := make([]byte, 65535)
+		n, a, err := c.readPacket(b)
+		return b[:n], a, err
+	}, func() error { _ = common.Interrupt(r); return common.Close(r) })
+	c.writes = connio.NewWriter(func(b []byte, _ net.Addr) (int, error) {
+		if err := w.WriteMultiBuffer(buf.MultiBuffer{ownedDatagram(b)}); err != nil {
+			return 0, err
+		}
+		return len(b), nil
+	}, func() error { return common.Close(w) }, func() error { _ = common.Interrupt(w); return common.Close(w) })
+	return c
 }
 
 func (c *packetLinkConn) Read(p []byte) (int, error) {
@@ -60,6 +76,10 @@ func (c *packetLinkConn) Read(p []byte) (int, error) {
 }
 
 func (c *packetLinkConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	return c.packetReads.ReadPacket(p)
+}
+
+func (c *packetLinkConn) readPacket(p []byte) (int, net.Addr, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 	for len(c.pending) == 0 {
@@ -86,14 +106,12 @@ func (c *packetLinkConn) Write(p []byte) (int, error) {
 	if len(p) > 65535 {
 		return 0, io.ErrShortBuffer
 	}
-	if err := c.writer.WriteMultiBuffer(buf.MultiBuffer{ownedDatagram(p)}); err != nil {
-		return 0, err
-	}
-	return len(p), nil
+	return c.writes.WritePacket(p, nil)
 }
 
 func (c *packetLinkConn) Close() error {
 	err := c.pipeConn.Close()
+	_ = c.packetReads.Close()
 	c.readMu.Lock()
 	c.pending = buf.ReleaseMulti(c.pending)
 	c.readErr = net.ErrClosed
@@ -101,7 +119,13 @@ func (c *packetLinkConn) Close() error {
 	return err
 }
 
-func (c *packetLinkConn) RemoteAddr() net.Addr { return c.remote }
+func (c *packetLinkConn) RemoteAddr() net.Addr              { return c.remote }
+func (c *packetLinkConn) CloseRead() error                  { return c.packetReads.Close() }
+func (c *packetLinkConn) SetReadDeadline(t time.Time) error { return c.packetReads.SetDeadline(t) }
+func (c *packetLinkConn) SetDeadline(t time.Time) error {
+	_ = c.SetReadDeadline(t)
+	return c.SetWriteDeadline(t)
+}
 
 // connectedPacketConn is only for the outer tunnel's single configured server.
 type connectedPacketConn struct {
@@ -123,5 +147,10 @@ func (c *connectedPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if addr == nil || addr.String() != c.remote.String() {
 		return 0, net.InvalidAddrError("unexpected UDP peer")
 	}
-	return c.Conn.Write(p)
+	return c.packets.Write(p)
 }
+func (c *connectedPacketConn) SetReadDeadline(t time.Time) error { return c.packets.SetReadDeadline(t) }
+func (c *connectedPacketConn) SetWriteDeadline(t time.Time) error {
+	return c.packets.SetWriteDeadline(t)
+}
+func (c *connectedPacketConn) SetDeadline(t time.Time) error { return c.packets.SetDeadline(t) }

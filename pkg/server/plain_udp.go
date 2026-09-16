@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net"
 	"runtime"
 	"sync"
@@ -43,6 +44,12 @@ type PlainUDPServer struct {
 	maxSessions  int64
 	workers      []chan udpTask
 	workerWg     sync.WaitGroup
+	upstreamWg   sync.WaitGroup
+	lifecycleMu  sync.Mutex
+	started      bool
+	done         chan struct{}
+	ctx          context.Context
+	cancel       context.CancelFunc
 	resolveMu    sync.RWMutex
 	resolveUDP   func(ctx context.Context, address string) (*net.UDPAddr, error)
 	closed       atomic.Bool
@@ -79,7 +86,9 @@ func NewPlainUDPServer(conn *net.UDPConn, psk []byte) (*PlainUDPServer, error) {
 		workers[i] = make(chan udpTask, DefaultUDPWorkerQueueSize)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	return &PlainUDPServer{
+		ctx: ctx, cancel: cancel, done: make(chan struct{}),
 		codec:        codec,
 		conn:         conn,
 		workers:      workers,
@@ -108,10 +117,31 @@ func (s *PlainUDPServer) SetResolveUDPForTest(fn func(ctx context.Context, addre
 
 // Serve starts the worker pool and the UDP packet read loop.
 func (s *PlainUDPServer) Serve(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	go s.cleaner(ctx)
+	s.lifecycleMu.Lock()
+	if s.started || s.closed.Load() {
+		s.lifecycleMu.Unlock()
+		return errors.New("plainudp: already started or closed")
+	}
+	s.started = true
+	s.lifecycleMu.Unlock()
+	stopParent := context.AfterFunc(ctx, s.cancel)
+	defer stopParent()
+	ctx = s.ctx
+	stopRead := context.AfterFunc(ctx, func() { _ = s.conn.Close() })
+	defer stopRead()
+	cleanerDone := make(chan struct{})
+	go func() { defer close(cleanerDone); s.cleaner(ctx) }()
+	defer func() {
+		s.closed.Store(true)
+		s.cancel()
+		_ = s.conn.Close()
+		// Workers can create upstream readers; join them before closing targets.
+		s.workerWg.Wait()
+		s.closeSessions()
+		s.upstreamWg.Wait()
+		<-cleanerDone
+		close(s.done)
+	}()
 
 	for i, ch := range s.workers {
 		s.workerWg.Add(1)
@@ -169,7 +199,6 @@ func (s *PlainUDPServer) Serve(ctx context.Context) error {
 		}
 	}
 
-	s.workerWg.Wait()
 	return nil
 }
 
@@ -234,7 +263,7 @@ func (s *PlainUDPServer) processTask(ctx context.Context, task udpTask) {
 		resolve := s.resolveUDP
 		s.resolveMu.RUnlock()
 		resolved, err := resolve(ctx, task.targetAddr)
-		if err != nil {
+		if err != nil || ctx.Err() != nil {
 			return
 		}
 
@@ -252,6 +281,7 @@ func (s *PlainUDPServer) processTask(ctx context.Context, task udpTask) {
 		} else {
 			session.targetCount.Add(1)
 			upstreamConn = upConn
+			s.upstreamWg.Add(1)
 			go s.listenUpstream(ctx, session, task.targetAddr, upstreamConn)
 		}
 	} else {
@@ -262,6 +292,8 @@ func (s *PlainUDPServer) processTask(ctx context.Context, task udpTask) {
 }
 
 func (s *PlainUDPServer) listenUpstream(ctx context.Context, session *plainUDPSession, targetAddr string, upstreamConn *net.UDPConn) {
+	defer s.upstreamWg.Done()
+	defer upstreamConn.Close()
 	buf := make([]byte, 64<<10)
 	for {
 		if s.closed.Load() || ctx.Err() != nil {
@@ -317,12 +349,25 @@ func (s *PlainUDPServer) cleaner(ctx context.Context) {
 }
 
 func (s *PlainUDPServer) Close() error {
-	if !s.closed.CompareAndSwap(false, true) {
-		return nil
+	s.lifecycleMu.Lock()
+	s.closed.Store(true)
+	started := s.started
+	s.lifecycleMu.Unlock()
+	if s.cancel != nil {
+		s.cancel()
 	}
 	if s.conn != nil {
 		_ = s.conn.Close()
 	}
+	if started {
+		<-s.done
+	} else {
+		s.closeSessions()
+	}
+	return nil
+}
+
+func (s *PlainUDPServer) closeSessions() {
 	s.sessions.Range(func(key, value any) bool {
 		session := value.(*plainUDPSession)
 		session.targets.Range(func(tKey, tVal any) bool {
@@ -332,7 +377,6 @@ func (s *PlainUDPServer) Close() error {
 		s.sessions.Delete(key)
 		return true
 	})
-	return nil
 }
 
 // PlainUDPCodec wraps plainudp.Codec for external integrators (e.g. Xray).

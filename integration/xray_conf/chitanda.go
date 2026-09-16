@@ -2,6 +2,7 @@ package conf
 
 import (
 	"fmt"
+	"github.com/violetaini/chitanda/pkg/client"
 	"github.com/xtls/xray-core/proxy/chitanda"
 	"google.golang.org/protobuf/proto"
 	"net"
@@ -59,6 +60,9 @@ func (c *ChitandaInboundConfig) Build() (proto.Message, error) {
 	}
 	if c.Path == "" {
 		c.Path = "/api/v1/sync"
+	}
+	if err := client.ValidatePath(c.Path); err != nil {
+		return nil, err
 	}
 	sid := c.ServerID
 	if sid == "" {
@@ -118,6 +122,9 @@ func (c *ChitandaOutboundConfig) Build() (proto.Message, error) {
 	}
 	if c.Path == "" {
 		c.Path = "/api/v1/sync"
+	}
+	if err := client.ValidateConfig(client.Config{Server: c.Server, ServerName: c.ServerName, PSK: []byte(c.PSK), Path: c.Path, TCPTransport: c.Transport}); err != nil {
+		return nil, err
 	}
 	sid := c.ServerID
 	if sid == "" {

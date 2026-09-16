@@ -15,6 +15,9 @@ def inject_mihomo(mihomo_dir, chitanda_dir):
     dst_adapter = os.path.join(adapter_dir, "chitanda.go")
     shutil.copy2(src_adapter, dst_adapter)
     print(f"  [+] Copied {src_adapter} -> {dst_adapter}")
+    for fname in sorted(os.listdir(os.path.dirname(src_adapter))):
+        if fname.endswith("_test.go"):
+            shutil.copy2(os.path.join(os.path.dirname(src_adapter), fname), os.path.join(adapter_dir, fname))
     src_tests = os.path.join(chitanda_dir, "integration", "mihomo_config")
     if os.path.isdir(src_tests):
         for fname in sorted(os.listdir(src_tests)):

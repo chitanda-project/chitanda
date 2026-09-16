@@ -306,16 +306,18 @@ type datagramBatchStream interface {
 }
 
 type udpTarget struct {
-	address  string
-	conn     net.Conn
-	batch    *ipv4.PacketConn
-	messages [udpRelayBatchSize]ipv4.Message
+	lastActive atomic.Int64
+	address    string
+	conn       net.Conn
+	batch      *ipv4.PacketConn
+	messages   [udpRelayBatchSize]ipv4.Message
 }
 
 const udpRelayBatchSize = 64
 
 type udpRelay struct {
 	ctx          context.Context
+	cancel       context.CancelFunc
 	stream       datagramStream
 	targetBuffer int
 	mu           sync.Mutex
@@ -334,7 +336,8 @@ func newUDPRelay(ctx context.Context, stream datagramStream, targetBuffers ...in
 	if len(targetBuffers) > 0 && targetBuffers[0] > 0 {
 		targetBuffer = targetBuffers[0]
 	}
-	return &udpRelay{ctx: ctx, stream: stream, targetBuffer: targetBuffer, targets: make(map[string]*udpTarget)}
+	ctx, cancel := context.WithCancel(ctx)
+	return &udpRelay{ctx: ctx, cancel: cancel, stream: stream, targetBuffer: targetBuffer, targets: make(map[string]*udpTarget)}
 }
 
 func (r *udpRelay) Forward(packet []byte) error {
@@ -352,6 +355,7 @@ func (r *udpRelay) ForwardBatch(packets [][]byte) error {
 		}
 		if err := currentTarget.writeBatch(payloads[:payloadCount]); err != nil && firstErr == nil {
 			firstErr = err
+			r.removeTarget(currentTarget)
 		}
 		for i := range payloadCount {
 			payloads[i] = nil
@@ -383,6 +387,7 @@ func (r *udpRelay) ForwardBatch(packets [][]byte) error {
 			flush()
 		}
 		currentTarget = targetConn
+		currentTarget.lastActive.Store(time.Now().UnixNano())
 		payloads[payloadCount] = payload
 		payloadCount++
 		if payloadCount == len(payloads) {
@@ -395,6 +400,10 @@ func (r *udpRelay) ForwardBatch(packets [][]byte) error {
 
 func (r *udpRelay) target(address string) (*udpTarget, error) {
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, net.ErrClosed
+	}
 	targetConn := r.targets[address]
 	r.mu.Unlock()
 	if targetConn != nil {
@@ -425,6 +434,7 @@ func (r *udpRelay) target(address string) (*udpTarget, error) {
 			return nil, err
 		}
 		targetConn = &udpTarget{address: address, conn: connection}
+		targetConn.lastActive.Store(time.Now().UnixNano())
 		if uc, ok := connection.(*net.UDPConn); ok {
 			_ = uc.SetReadBuffer(r.targetBuffer)
 			_ = uc.SetWriteBuffer(r.targetBuffer)
@@ -474,6 +484,7 @@ func (t *udpTarget) writeBatch(payloads [][]byte) error {
 
 func (r *udpRelay) receive(targetConn *udpTarget) {
 	defer r.waitGroup.Done()
+	defer r.removeTarget(targetConn)
 	if targetConn.batch != nil {
 		r.receiveBatch(targetConn)
 		return
@@ -488,6 +499,7 @@ func (r *udpRelay) receiveSingle(targetConn *udpTarget) {
 	for {
 		var n int
 		var err error
+		_ = targetConn.conn.SetReadDeadline(time.Unix(0, targetConn.lastActive.Load()).Add(time.Minute))
 		address := targetConn.conn.RemoteAddr().String()
 		if reader, ok := targetConn.conn.(interface {
 			ReadFrom([]byte) (int, net.Addr, error)
@@ -501,8 +513,12 @@ func (r *udpRelay) receiveSingle(targetConn *udpTarget) {
 			n, err = targetConn.conn.Read(buffer)
 		}
 		if err != nil {
+			if e, ok := err.(net.Error); ok && e.Timeout() && time.Since(time.Unix(0, targetConn.lastActive.Load())) < time.Minute && r.ctx.Err() == nil {
+				continue
+			}
 			return
 		}
+		targetConn.lastActive.Store(time.Now().UnixNano())
 		if n > frame.MaxDatagramPayload {
 			continue
 		}
@@ -528,11 +544,15 @@ func (r *udpRelay) receiveBatch(targetConn *udpTarget) {
 	}
 	oversizeLogged := false
 	for {
+		_ = targetConn.conn.SetReadDeadline(time.Unix(0, targetConn.lastActive.Load()).Add(time.Minute))
 		count, readErr := targetConn.batch.ReadBatch(messages[:], 0)
 		if count < 0 || count > len(messages) {
 			return
 		}
 		datagramCount := 0
+		if count > 0 {
+			targetConn.lastActive.Store(time.Now().UnixNano())
+		}
 		for i := range count {
 			if messages[i].N > frame.MaxDatagramPayload {
 				continue
@@ -556,6 +576,9 @@ func (r *udpRelay) receiveBatch(targetConn *udpTarget) {
 			datagrams[i] = nil
 		}
 		if readErr != nil {
+			if e, ok := readErr.(net.Error); ok && e.Timeout() && time.Since(time.Unix(0, targetConn.lastActive.Load())) < time.Minute && r.ctx.Err() == nil {
+				continue
+			}
 			return
 		}
 	}
@@ -593,12 +616,26 @@ func (r *udpRelay) sendResponseBatch(datagrams [][]byte, oversizeLogged *bool) e
 	return nil
 }
 
-func (r *udpRelay) Close() {
+func (r *udpRelay) removeTarget(targetConn *udpTarget) {
 	r.mu.Lock()
-	r.closed = true
-	for _, targetConn := range r.targets {
-		_ = targetConn.conn.Close()
+	if r.targets[targetConn.address] == targetConn {
+		delete(r.targets, targetConn.address)
 	}
 	r.mu.Unlock()
+	_ = targetConn.conn.Close()
+}
+
+func (r *udpRelay) Close() {
+	if r.cancel != nil {
+		r.cancel()
+	}
+	r.mu.Lock()
+	r.closed = true
+	targets := r.targets
+	r.targets = make(map[string]*udpTarget)
+	r.mu.Unlock()
+	for _, targetConn := range targets {
+		_ = targetConn.conn.Close()
+	}
 	r.waitGroup.Wait()
 }

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/netip"
 	"strconv"
 	"sync"
 
@@ -72,6 +71,9 @@ func NewChitanda(option ChitandaOption) (*Chitanda, error) {
 	if sni == "" && option.Transport != "h1" && option.Transport != "plain-h1" {
 		sni = option.Server
 	}
+	if err := client.ValidateConfig(client.Config{Server: serverAddr, ServerName: sni, PSK: []byte(option.PSK), Path: option.Path, TCPTransport: option.Transport}); err != nil {
+		return nil, err
+	}
 
 	c := &Chitanda{
 		Base: NewBase(BaseOption{
@@ -117,19 +119,8 @@ func (c *Chitanda) getClient() (*client.Client, error) {
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return c.dialer.DialContext(ctx, network, addr)
 		},
-		ListenPacket: func(ctx context.Context, network, addr string) (net.PacketConn, error) {
-			var rAddr netip.AddrPort
-			if addr != "" && addr != ":0" {
-				if ap, err := netip.ParseAddrPort(addr); err == nil {
-					rAddr = ap
-				}
-			}
-			if !rAddr.IsValid() {
-				if srvUdp, err := resolveUDPAddr(ctx, "udp", serverAddr, c.option.IPVersion); err == nil {
-					rAddr = srvUdp.AddrPort()
-				}
-			}
-			return c.dialer.ListenPacket(ctx, network, addr, rAddr)
+		DialPacket: func(ctx context.Context, remote *net.UDPAddr) (net.PacketConn, error) {
+			return c.dialer.ListenPacket(ctx, "udp", ":0", remote.AddrPort())
 		},
 		ResolveUDP: func(ctx context.Context, network, addr string) (*net.UDPAddr, error) {
 			return resolveUDPAddr(ctx, network, addr, c.option.IPVersion)

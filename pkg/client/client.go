@@ -92,6 +92,9 @@ func (c *Client) dialRaw(ctx context.Context, network, addr string) (net.Conn, e
 
 // New creates and initializes a new MyXray Client.
 func New(cfg Config) (*Client, error) {
+	if err := ValidateConfig(cfg); err != nil {
+		return nil, err
+	}
 	if cfg.TCPTransport == TCPTransportStream {
 		if cfg.Server == "" || len(cfg.PSK) < 32 {
 			return nil, errors.New("server and valid PSK (>=32 bytes) are required for stream")

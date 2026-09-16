@@ -16,6 +16,7 @@ import (
 	quic "github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/violetaini/chitanda/pkg/auth"
+	"github.com/violetaini/chitanda/pkg/connio"
 	"github.com/violetaini/chitanda/pkg/server"
 
 	"golang.org/x/net/http2"
@@ -23,12 +24,10 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
-	udp_proto "github.com/xtls/xray-core/common/protocol/udp"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport/internet/stat"
-	"github.com/xtls/xray-core/transport/internet/udp"
 )
 
 // InboundHandler implements proxy.Inbound for Chitanda protocol in Xray
@@ -45,6 +44,7 @@ type InboundHandler struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	mu           sync.Mutex
+	httpSlots    chan struct{}
 }
 
 func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHandler, error) {
@@ -93,7 +93,7 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 			ctx = session.ContextWithInbound(ctx, &copyInbound)
 		}
 
-		link, err := dispatcher.Dispatch(ctx, dest)
+		link, err := dispatcher.Dispatch(requestContext(ctx), dest)
 		if err != nil {
 			return nil, err
 		}
@@ -156,6 +156,7 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 		dispatcher:   dispatcher,
 		ctx:          inCtx,
 		cancel:       inCancel,
+		httpSlots:    make(chan struct{}, 1024),
 	}
 	go h.udpReplays.run(inCtx)
 
@@ -247,6 +248,16 @@ func (h *InboundHandler) Process(ctx context.Context, network xnet.Network, conn
 		h.streamServer.HandleConnContext(ctx, conn)
 		return nil
 	}
+	// Bound non-RawStream carrier processing, including incomplete unauthenticated
+	// HTTP requests. Authenticated carriers release this slot on connection close.
+	if h.httpSlots != nil {
+		select {
+		case h.httpSlots <- struct{}{}:
+			defer func() { <-h.httpSlots }()
+		default:
+			return fmt.Errorf("chitanda: HTTP carrier limit reached")
+		}
+	}
 
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	br := bufio.NewReader(conn)
@@ -271,8 +282,11 @@ func (h *InboundHandler) Process(ctx context.Context, network xnet.Network, conn
 	// HTTP/1.x
 	sl := &singleListener{conn: bconn, done: make(chan struct{})}
 	httpServer := &http.Server{
-		Handler:     h.server,
-		BaseContext: func(net.Listener) context.Context { return ctx },
+		Handler:           h.server,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
+		ReadHeaderTimeout: 2 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+		IdleTimeout:       30 * time.Second,
 	}
 
 	go func() {
@@ -306,32 +320,8 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 		defer h.vconn.unregisterConn(key, conn)
 	}
 
-	var targetSessions sync.Map // string(targetAddr) -> uint64(sessionID)
-	var lastSessionID atomic.Uint64
-
-	var udpServer *udp.Dispatcher
-	if h.plainCodec != nil {
-		udpServer = udp.NewDispatcher(dispatcher, func(ctx context.Context, packet *udp_proto.Packet) {
-			payload := packet.Payload
-			if payload == nil {
-				return
-			}
-			defer payload.Release()
-
-			srcAddr := packet.Source.NetAddr()
-			sessionID := lastSessionID.Load()
-			if v, ok := targetSessions.Load(srcAddr); ok {
-				sessionID = v.(uint64)
-			}
-
-			encoded, err := h.plainCodec.EncodeServerPacket(sessionID, srcAddr, payload.Bytes(), time.Now())
-			if err != nil {
-				return
-			}
-			_, _ = conn.Write(encoded)
-		})
-		defer udpServer.RemoveRay()
-	}
+	routes := newUDPRoutes(ctx, dispatcher, h.plainCodec, conn)
+	defer routes.Close()
 
 	reader := newFullPacketReader(conn)
 	for {
@@ -365,9 +355,6 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 						continue // drop replayed packet across any connection/association!
 					}
 
-					lastSessionID.Store(sessionID)
-					targetSessions.Store(targetAddr, sessionID)
-
 					dest, err := xnet.ParseDestination("udp:" + targetAddr)
 					if err != nil {
 						payload.Release()
@@ -391,12 +378,8 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 						}
 					}
 
-					b := ownedDatagram(rawData)
-					b.UDP = &dest
 					payload.Release()
-					if udpServer != nil {
-						udpServer.Dispatch(packetCtx, dest, b)
-					}
+					_ = routes.Write(packetCtx, sessionID, dest, rawData)
 					continue
 				}
 			}
@@ -435,80 +418,50 @@ type pipeConn struct {
 	writer      buf.Writer
 	readCloser  interface{}
 	writeCloser interface{}
-	readTimer   *time.Timer
-	timerMu     sync.Mutex
+	reads       *connio.Reader
+	writes      *connio.Writer
 }
 
 func newPipeConn(reader buf.Reader, writer buf.Writer) *pipeConn {
-	return &pipeConn{
+	c := &pipeConn{
 		reader:      &buf.BufferedReader{Reader: reader},
 		writer:      writer,
 		readCloser:  reader,
 		writeCloser: writer,
 	}
+	c.reads = connio.NewReader(func() ([]byte, net.Addr, error) {
+		b := make([]byte, 32<<10)
+		n, err := c.reader.Read(b)
+		return b[:n], nil, err
+	}, func() error { _ = common.Interrupt(reader); return common.Close(reader) })
+	c.writes = connio.NewWriter(func(b []byte, _ net.Addr) (int, error) {
+		if err := writer.WriteMultiBuffer(buf.MergeBytes(nil, b)); err != nil {
+			return 0, err
+		}
+		return len(b), nil
+	}, func() error { return common.Close(writer) }, func() error { _ = common.Interrupt(writer); return common.Close(writer) })
+	return c
 }
 
 func (c *pipeConn) Read(b []byte) (n int, err error) {
-	return c.reader.Read(b)
+	return c.reads.Read(b)
 }
 
 func (c *pipeConn) Write(b []byte) (n int, err error) {
-	if len(b) == 0 {
-		return 0, nil
-	}
-	// Older Xray BufferedWriter.Write returns ErrBufferFull for inputs larger
-	// than buf.Size (8 KiB), aborting valid RawStream frames of up to 32 KiB.
-	// MergeBytes copies into owned buffers; WriteMultiBuffer transfers their
-	// ownership to the dispatcher, including on error. Do not retain b or
-	// release those buffers here: the caller may immediately reuse b.
-	if err := c.writer.WriteMultiBuffer(buf.MergeBytes(nil, b)); err != nil {
-		return 0, err
-	}
-	return len(b), nil
+	return c.writes.Write(b)
 }
 
 func (c *pipeConn) Close() error {
-	c.timerMu.Lock()
-	if c.readTimer != nil {
-		c.readTimer.Stop()
-		c.readTimer = nil
-	}
-	c.timerMu.Unlock()
-
-	var err1, err2 error
-	if c.writeCloser != nil {
-		err1 = common.Close(c.writeCloser)
-	}
-	if c.readCloser != nil {
-		_ = common.Interrupt(c.readCloser)
-		err2 = common.Close(c.readCloser)
-	}
-	if err1 != nil {
-		return err1
-	}
-	return err2
+	_ = c.writes.Close()
+	return c.reads.Close()
 }
 
 func (c *pipeConn) CloseWrite() error {
-	if c.writeCloser != nil {
-		return common.Close(c.writeCloser)
-	}
-	return nil
+	return c.writes.CloseWrite()
 }
 
 func (c *pipeConn) CloseRead() error {
-	c.timerMu.Lock()
-	if c.readTimer != nil {
-		c.readTimer.Stop()
-		c.readTimer = nil
-	}
-	c.timerMu.Unlock()
-
-	if c.readCloser != nil {
-		_ = common.Interrupt(c.readCloser)
-		return common.Close(c.readCloser)
-	}
-	return nil
+	return c.reads.Close()
 }
 
 func (c *pipeConn) LocalAddr() net.Addr  { return &net.TCPAddr{IP: net.IPv4zero, Port: 0} }
@@ -520,35 +473,10 @@ func (c *pipeConn) SetDeadline(t time.Time) error {
 }
 
 func (c *pipeConn) SetReadDeadline(t time.Time) error {
-	c.timerMu.Lock()
-	defer c.timerMu.Unlock()
-
-	if c.readTimer != nil {
-		c.readTimer.Stop()
-		c.readTimer = nil
-	}
-
-	if t.IsZero() {
-		return nil
-	}
-
-	d := time.Until(t)
-	if d <= 0 {
-		if c.readCloser != nil {
-			_ = common.Interrupt(c.readCloser)
-		}
-		return nil
-	}
-
-	c.readTimer = time.AfterFunc(d, func() {
-		if c.readCloser != nil {
-			_ = common.Interrupt(c.readCloser)
-		}
-	})
-	return nil
+	return c.reads.SetDeadline(t)
 }
 
-func (c *pipeConn) SetWriteDeadline(t time.Time) error { return nil }
+func (c *pipeConn) SetWriteDeadline(t time.Time) error { return c.writes.SetDeadline(t) }
 
 func isQUICPacket(data []byte) bool {
 	if len(data) < 20 {
@@ -605,10 +533,11 @@ type virtualPacketConn struct {
 	readDeadline    time.Time
 	deadlineChanged chan struct{}
 	contexts        map[string]context.Context
+	writeQueue      *connio.Writer
 }
 
 func newVirtualPacketConn() *virtualPacketConn {
-	return &virtualPacketConn{
+	c := &virtualPacketConn{
 		recvCh:          make(chan *packetItem, 2048),
 		closeCh:         make(chan struct{}),
 		localAddr:       &net.UDPAddr{IP: net.IPv4zero, Port: 0},
@@ -616,6 +545,29 @@ func newVirtualPacketConn() *virtualPacketConn {
 		contexts:        make(map[string]context.Context),
 		deadlineChanged: make(chan struct{}),
 	}
+	c.writeQueue = connio.NewWriter(func(p []byte, addr net.Addr) (int, error) {
+		c.mu.RLock()
+		conn := c.writers[addr.String()]
+		c.mu.RUnlock()
+		// A datagram accepted into the bounded send queue can be lost if its
+		// association disappears. Do not poison other QUIC peers on that loss.
+		if conn != nil {
+			_, _ = conn.Write(p)
+		}
+		return len(p), nil
+	}, nil, func() error {
+		c.mu.RLock()
+		connections := make([]stat.Connection, 0, len(c.writers))
+		for _, conn := range c.writers {
+			connections = append(connections, conn)
+		}
+		c.mu.RUnlock()
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+		return nil
+	})
+	return c
 }
 
 func (c *virtualPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
@@ -660,19 +612,23 @@ func (c *virtualPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if c.closed.Load() {
 		return 0, net.ErrClosed
 	}
+	if addr == nil {
+		return 0, net.InvalidAddrError("nil UDP peer")
+	}
 	c.mu.RLock()
 	conn, ok := c.writers[addr.String()]
 	c.mu.RUnlock()
 	if !ok || conn == nil {
 		return 0, fmt.Errorf("no active connection for %s", addr.String())
 	}
-	return conn.Write(p)
+	return c.writeQueue.WritePacket(p, addr)
 }
 
 func (c *virtualPacketConn) Close() error {
 	if c.closed.CompareAndSwap(false, true) {
 		close(c.closeCh)
 	}
+	_ = c.writeQueue.Close()
 	return nil
 }
 
@@ -695,7 +651,7 @@ func (c *virtualPacketConn) SetReadDeadline(t time.Time) error {
 }
 
 func (c *virtualPacketConn) SetWriteDeadline(t time.Time) error {
-	return nil
+	return c.writeQueue.SetDeadline(t)
 }
 
 func (c *virtualPacketConn) feed(data []byte, addr net.Addr) {

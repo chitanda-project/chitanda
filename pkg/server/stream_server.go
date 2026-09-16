@@ -77,19 +77,26 @@ func (s *StreamServer) SetReplayCache(cache *auth.ReplayCache) {
 
 // AttachUDP binds a Native PlainUDP listener to this server and starts the UDP serve loop.
 func (s *StreamServer) AttachUDP(udpConn *net.UDPConn) error {
+	s.listenersMu.Lock()
+	defer s.listenersMu.Unlock()
+	if s.closed.Load() || s.udpServer != nil {
+		return errors.New("stream server closed or UDP already attached")
+	}
 	udpSrv, err := NewPlainUDPServer(udpConn, s.psk)
 	if err != nil {
 		return err
 	}
 	s.udpServer = udpSrv
 	go func() {
-		_ = udpSrv.Serve(context.Background())
+		_ = udpSrv.Serve(s.ctx)
 	}()
 	return nil
 }
 
 // UDPServer returns the underlying PlainUDPServer instance.
 func (s *StreamServer) UDPServer() *PlainUDPServer {
+	s.listenersMu.Lock()
+	defer s.listenersMu.Unlock()
 	return s.udpServer
 }
 
@@ -101,6 +108,13 @@ func (s *StreamServer) Serve(listeners ...net.Listener) error {
 		return errors.New("no listeners provided")
 	}
 	s.listenersMu.Lock()
+	if s.closed.Load() {
+		s.listenersMu.Unlock()
+		for _, ln := range listeners {
+			_ = ln.Close()
+		}
+		return net.ErrClosed
+	}
 	s.listeners = append(s.listeners, listeners...)
 	s.listenersMu.Unlock()
 
@@ -421,9 +435,10 @@ func (s *StreamServer) Close() error {
 		}
 	}
 	s.listeners = nil
+	udpServer := s.udpServer
 	s.listenersMu.Unlock()
-	if s.udpServer != nil {
-		s.udpServer.Close()
+	if udpServer != nil {
+		udpServer.Close()
 	}
 	if s.replays != nil {
 		_ = s.replays.Close()
