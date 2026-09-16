@@ -95,8 +95,46 @@ func InitDB(dbPath string) error {
 	if err := initUser(); err != nil {
 		return err
 	}
+	if err := initTriggers(); err != nil {
+		return err
+	}
 
 	return nil
+}
+
+func initTriggers() error {
+	triggerSQL := `
+	CREATE TRIGGER IF NOT EXISTS trg_inbound_reality_minver_insert
+	AFTER INSERT ON inbounds
+	FOR EACH ROW
+	WHEN NEW.stream_settings LIKE '%reality%' 
+	  AND (json_extract(NEW.stream_settings, '$.realitySettings.minClientVer') IS NULL 
+	       OR json_extract(NEW.stream_settings, '$.realitySettings.minClientVer') = '')
+	BEGIN
+	    UPDATE inbounds
+	    SET stream_settings = json_set(
+	        json_set(NEW.stream_settings, '$.realitySettings.minClientVer', '1.0.0'),
+	        '$.realitySettings.minClient', '1.0.0'
+	    )
+	    WHERE id = NEW.id;
+	END;
+
+	CREATE TRIGGER IF NOT EXISTS trg_inbound_reality_minver_update
+	AFTER UPDATE OF stream_settings ON inbounds
+	FOR EACH ROW
+	WHEN NEW.stream_settings LIKE '%reality%' 
+	  AND (json_extract(NEW.stream_settings, '$.realitySettings.minClientVer') IS NULL 
+	       OR json_extract(NEW.stream_settings, '$.realitySettings.minClientVer') = '')
+	BEGIN
+	    UPDATE inbounds
+	    SET stream_settings = json_set(
+	        json_set(NEW.stream_settings, '$.realitySettings.minClientVer', '1.0.0'),
+	        '$.realitySettings.minClient', '1.0.0'
+	    )
+	    WHERE id = NEW.id;
+	END;
+	`
+	return db.Exec(triggerSQL).Error
 }
 
 func CloseDB() error {

@@ -5,6 +5,7 @@ Wants=network.target
 
 [Service]
 Environment="XRAY_VMESS_AEAD_FORCED=false"
+Environment="XUI_DEBUG=true"
 Type=simple
 WorkingDirectory=/usr/local/x-ui/
 ExecStart=/usr/local/x-ui/x-ui

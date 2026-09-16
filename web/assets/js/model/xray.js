@@ -852,7 +852,7 @@ class RealityStreamSettings extends XrayCommonClass {
         dest = 'yahoo.com:443',
         serverNames = 'yahoo.com,www.yahoo.com',
         privateKey = '',
-        minClient = '',
+        minClient = '1.0.0',
         maxClient = '',
         maxTimediff = 0,
         shortIds = RandomUtil.randomShortId(),
@@ -864,8 +864,10 @@ class RealityStreamSettings extends XrayCommonClass {
         this.dest = dest;
         this.serverNames = serverNames instanceof Array ? serverNames.join(",") : serverNames;
         this.privateKey = privateKey;
-        this.minClient = minClient;
+        this.minClient = minClient || '1.0.0';
+        this.minClientVer = minClient || '1.0.0';
         this.maxClient = maxClient;
+        this.maxClientVer = maxClient;
         this.maxTimediff = maxTimediff;
         this.shortIds = shortIds instanceof Array ? shortIds.join(",") : shortIds; 
         this.settings = settings;
@@ -882,8 +884,8 @@ class RealityStreamSettings extends XrayCommonClass {
             json.dest,
             json.serverNames,
             json.privateKey,
-            json.minClient,
-            json.maxClient,
+            json.minClientVer || json.minClient || '1.0.0',
+            json.maxClientVer || json.maxClient,
             json.maxTimediff,
             json.shortIds,
             json.settings,
@@ -897,8 +899,10 @@ class RealityStreamSettings extends XrayCommonClass {
             dest: this.dest,
             serverNames: this.serverNames.split(","),
             privateKey: this.privateKey,
-            minClient: this.minClient,
+            minClient: this.minClient || '1.0.0',
+            minClientVer: this.minClientVer || this.minClient || '1.0.0',
             maxClient: this.maxClient,
+            maxClientVer: this.maxClientVer || this.maxClient,
             maxTimediff: this.maxTimediff,
             shortIds: this.shortIds.split(","),
             settings: this.settings,
