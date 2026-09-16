@@ -342,10 +342,38 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 	}
 
 	fileName := fmt.Sprintf("Xray-%s-%s.zip", osName, arch)
-	url := fmt.Sprintf("https://github.com/violetaini/chitanda/releases/download/%s/%s", version, fileName)
-	resp, err := http.Get(url)
-	if err != nil {
-		return "", err
+	rawUrl := fmt.Sprintf("https://github.com/violetaini/chitanda/releases/download/%s/%s", version, fileName)
+
+	urls := []string{
+		"https://github.boki.moe/" + rawUrl,
+		"https://ghfast.top/" + rawUrl,
+		rawUrl,
+	}
+
+	client := &http.Client{
+		Timeout: 90 * time.Second,
+	}
+
+	var resp *http.Response
+	var err error
+	for _, u := range urls {
+		logger.Infof("downloading xray from: %s", u)
+		resp, err = client.Get(u)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			break
+		}
+		if resp != nil {
+			resp.Body.Close()
+			resp = nil
+		}
+		logger.Warningf("download from %s failed: %v, trying next mirror...", u, err)
+	}
+
+	if resp == nil {
+		if err != nil {
+			return "", err
+		}
+		return "", fmt.Errorf("failed to download xray: all sources failed")
 	}
 	defer resp.Body.Close()
 
