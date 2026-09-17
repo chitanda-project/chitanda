@@ -415,21 +415,16 @@ func (h *InboundHandler) Close() error {
 }
 
 type pipeConn struct {
-	reader        *buf.BufferedReader
-	writer        buf.Writer
-	readCloser    interface{}
-	writeCloser   interface{}
-	reads         *connio.Reader
-	writeMu       sync.Mutex
-	writeClosed   bool
-	writeDeadline atomic.Pointer[time.Time]
+	reader     *buf.BufferedReader
+	readCloser interface{}
+	reads      *connio.Reader
+	writes     *pipeWriteQueue
 }
 
 func newPipeConn(reader buf.Reader, writer buf.Writer) *pipeConn {
 	c := &pipeConn{
-		writer:      writer,
-		readCloser:  reader,
-		writeCloser: writer,
+		readCloser: reader,
+		writes:     newPipeWriteQueue(writer),
 	}
 	if reader != nil {
 		c.reader = &buf.BufferedReader{Reader: reader}
@@ -450,36 +445,11 @@ func (c *pipeConn) Read(b []byte) (n int, err error) {
 }
 
 func (c *pipeConn) Write(b []byte) (n int, err error) {
-	if len(b) == 0 {
-		return 0, nil
-	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-
-	if c.writeClosed || c.writer == nil {
-		return 0, io.ErrClosedPipe
-	}
-	if dl := c.writeDeadline.Load(); dl != nil && !dl.IsZero() {
-		d := time.Until(*dl)
-		if d <= 0 {
-			return 0, os.ErrDeadlineExceeded
-		}
-		timer := time.AfterFunc(d, func() {
-			if c.writeCloser != nil {
-				_ = common.Interrupt(c.writeCloser)
-			}
-		})
-		defer timer.Stop()
-	}
-
-	if err := c.writer.WriteMultiBuffer(buf.MergeBytes(nil, b)); err != nil {
-		return 0, err
-	}
-	return len(b), nil
+	return c.writes.Write(b)
 }
 
 func (c *pipeConn) Close() error {
-	err1 := c.CloseWrite()
+	err1 := c.writes.Close()
 	var err2 error
 	if c.reads != nil {
 		err2 = c.reads.Close()
@@ -494,17 +464,7 @@ func (c *pipeConn) Close() error {
 }
 
 func (c *pipeConn) CloseWrite() error {
-	c.writeMu.Lock()
-	if c.writeClosed {
-		c.writeMu.Unlock()
-		return nil
-	}
-	c.writeClosed = true
-	c.writeMu.Unlock()
-	if c.writeCloser != nil {
-		return common.Close(c.writeCloser)
-	}
-	return nil
+	return c.writes.CloseWrite()
 }
 
 func (c *pipeConn) CloseRead() error {
@@ -534,12 +494,7 @@ func (c *pipeConn) SetReadDeadline(t time.Time) error {
 }
 
 func (c *pipeConn) SetWriteDeadline(t time.Time) error {
-	if t.IsZero() {
-		c.writeDeadline.Store(nil)
-	} else {
-		c.writeDeadline.Store(&t)
-	}
-	return nil
+	return c.writes.SetDeadline(t)
 }
 
 func isQUICPacket(data []byte) bool {

@@ -45,7 +45,6 @@ func (r *fullPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 // packetLinkConn preserves one Buffer per UDP packet (unlike BufferedReader and
 // MergeBytes, which intentionally flatten/split TCP streams).
 type packetLinkConn struct {
-	*pipeConn
 	packetReader buf.Reader
 	readMu       sync.Mutex
 	pending      buf.MultiBuffer
@@ -56,7 +55,7 @@ type packetLinkConn struct {
 }
 
 func newPacketLinkConn(r buf.Reader, w buf.Writer, remote net.Addr) *packetLinkConn {
-	c := &packetLinkConn{pipeConn: newPipeConn(r, w), packetReader: r, remote: remote}
+	c := &packetLinkConn{packetReader: r, remote: remote}
 	c.packetReads = connio.NewReader(func() ([]byte, net.Addr, error) {
 		b := make([]byte, 65535)
 		n, a, err := c.readPacket(b)
@@ -111,7 +110,7 @@ func (c *packetLinkConn) Write(p []byte) (int, error) {
 }
 
 func (c *packetLinkConn) Close() error {
-	err := c.pipeConn.Close()
+	err := c.writes.Close()
 	_ = c.packetReads.Close()
 	c.readMu.Lock()
 	c.pending = buf.ReleaseMulti(c.pending)
@@ -120,9 +119,12 @@ func (c *packetLinkConn) Close() error {
 	return err
 }
 
-func (c *packetLinkConn) RemoteAddr() net.Addr              { return c.remote }
-func (c *packetLinkConn) CloseRead() error                  { return c.packetReads.Close() }
-func (c *packetLinkConn) SetReadDeadline(t time.Time) error { return c.packetReads.SetDeadline(t) }
+func (c *packetLinkConn) RemoteAddr() net.Addr               { return c.remote }
+func (c *packetLinkConn) LocalAddr() net.Addr                { return &net.UDPAddr{IP: net.IPv4zero} }
+func (c *packetLinkConn) CloseWrite() error                  { return c.writes.CloseWrite() }
+func (c *packetLinkConn) CloseRead() error                   { return c.packetReads.Close() }
+func (c *packetLinkConn) SetReadDeadline(t time.Time) error  { return c.packetReads.SetDeadline(t) }
+func (c *packetLinkConn) SetWriteDeadline(t time.Time) error { return c.writes.SetDeadline(t) }
 func (c *packetLinkConn) SetDeadline(t time.Time) error {
 	_ = c.SetReadDeadline(t)
 	return c.SetWriteDeadline(t)
