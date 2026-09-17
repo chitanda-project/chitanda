@@ -179,7 +179,13 @@ func (h *OutboundHandler) Process(ctx context.Context, link *transport.Link, dia
 
 		uploadDone := make(chan error, 1)
 		go func() {
-			err := buf.Copy(link.Reader, buf.NewWriter(conn), buf.UpdateActivity(activity))
+			var writer buf.Writer
+			if bw, ok := conn.(batchWriter); ok {
+				writer = &streamBufWriter{bw: bw}
+			} else {
+				writer = buf.NewWriter(conn)
+			}
+			err := buf.Copy(link.Reader, writer, buf.UpdateActivity(activity))
 			if err == nil {
 				if cw, ok := conn.(interface{ CloseWrite() error }); ok {
 					err = cw.CloseWrite()
@@ -328,6 +334,38 @@ func (h *OutboundHandler) Close() error {
 		h.client.Close()
 	}
 	return nil
+}
+
+type batchWriter interface {
+	WriteBatch(buffers [][]byte) (int, error)
+}
+
+type streamBufWriter struct {
+	bw batchWriter
+}
+
+func (w *streamBufWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	defer buf.ReleaseMulti(mb)
+	if mb.IsEmpty() {
+		return nil
+	}
+	var stackBufs [32][]byte
+	var bufs [][]byte
+	if len(mb) <= len(stackBufs) {
+		bufs = stackBufs[:0]
+	} else {
+		bufs = make([][]byte, 0, len(mb))
+	}
+	for _, b := range mb {
+		if !b.IsEmpty() {
+			bufs = append(bufs, b.Bytes())
+		}
+	}
+	if len(bufs) == 0 {
+		return nil
+	}
+	_, err := w.bw.WriteBatch(bufs)
+	return err
 }
 
 func init() {

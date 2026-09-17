@@ -52,6 +52,7 @@ type packetLinkConn struct {
 	readErr      error
 	remote       net.Addr
 	packetReads  *connio.Reader
+	writes       *connio.Writer
 }
 
 func newPacketLinkConn(r buf.Reader, w buf.Writer, remote net.Addr) *packetLinkConn {

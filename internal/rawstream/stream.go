@@ -40,6 +40,13 @@ func NewFramedWriter(w io.Writer, stream *AEADStream) *FramedWriter {
 }
 
 func (fw *FramedWriter) Write(p []byte) (n int, err error) {
+	return fw.WriteBatch([][]byte{p})
+}
+
+// WriteBatch encrypts and flushes multiple buffer slices in a single batch.
+// Chunks are packed into fw.buf and flushed when reaching MaxBatchFlushLen,
+// and trailing bytes are flushed at the end of the batch to guarantee TTFB.
+func (fw *FramedWriter) WriteBatch(buffers [][]byte) (n int, err error) {
 	fw.mu.Lock()
 	defer fw.mu.Unlock()
 
@@ -54,57 +61,60 @@ func (fw *FramedWriter) Write(p []byte) (n int, err error) {
 	fw.lastWrite = now
 
 	fw.buf = fw.buf[:0]
+	totalPlaintext := 0
 	unflushedPlaintext := 0
 
-	for len(p) > 0 {
-		var maxChunk int
-		var flushThreshold int
+	for _, p := range buffers {
+		for len(p) > 0 {
+			var maxChunk int
+			var flushThreshold int
 
-		if fw.burstBytes < Phase1Threshold {
-			maxChunk = MinRecordPayloadLen
-			flushThreshold = 0 // Immediate flush for sub-millisecond TTFB
-		} else if fw.burstBytes < Phase2Threshold {
-			maxChunk = MidRecordPayloadLen
-			flushThreshold = MidRecordPayloadLen
-		} else {
-			maxChunk = MaxChunkPayloadLen
-			flushThreshold = MaxBatchFlushLen
-		}
-
-		chunkSize := len(p)
-		if chunkSize > maxChunk {
-			chunkSize = maxChunk
-		}
-		chunk := p[:chunkSize]
-		p = p[chunkSize:]
-
-		fw.buf, err = fw.stream.EncryptChunk(fw.buf, chunk)
-		if err != nil {
-			return n, err
-		}
-		unflushedPlaintext += chunkSize
-		fw.burstBytes += int64(chunkSize)
-
-		// Flush batch if accumulated buffer reaches flushThreshold (or immediate in Phase 1)
-		if flushThreshold == 0 || len(fw.buf) >= flushThreshold {
-			if err := fw.flush(); err != nil {
-				return n, err
+			if fw.burstBytes < Phase1Threshold {
+				maxChunk = MinRecordPayloadLen
+				flushThreshold = 0 // Immediate flush for sub-millisecond TTFB
+			} else if fw.burstBytes < Phase2Threshold {
+				maxChunk = MidRecordPayloadLen
+				flushThreshold = MidRecordPayloadLen
+			} else {
+				maxChunk = MaxChunkPayloadLen
+				flushThreshold = MaxBatchFlushLen
 			}
-			n += unflushedPlaintext
-			unflushedPlaintext = 0
-			fw.buf = fw.buf[:0]
+
+			chunkSize := len(p)
+			if chunkSize > maxChunk {
+				chunkSize = maxChunk
+			}
+			chunk := p[:chunkSize]
+			p = p[chunkSize:]
+
+			fw.buf, err = fw.stream.EncryptChunk(fw.buf, chunk)
+			if err != nil {
+				return totalPlaintext, err
+			}
+			unflushedPlaintext += chunkSize
+			fw.burstBytes += int64(chunkSize)
+
+			// Flush batch if accumulated buffer reaches flushThreshold (or immediate in Phase 1)
+			if flushThreshold == 0 || len(fw.buf) >= flushThreshold {
+				if err := fw.flush(); err != nil {
+					return totalPlaintext, err
+				}
+				totalPlaintext += unflushedPlaintext
+				unflushedPlaintext = 0
+				fw.buf = fw.buf[:0]
+			}
 		}
 	}
 
 	if len(fw.buf) > 0 {
 		if err := fw.flush(); err != nil {
-			return n, err
+			return totalPlaintext, err
 		}
-		n += unflushedPlaintext
+		totalPlaintext += unflushedPlaintext
 		unflushedPlaintext = 0
 		fw.buf = fw.buf[:0]
 	}
-	return n, nil
+	return totalPlaintext, nil
 }
 
 // flush fails closed on partial writes: a consumed nonce must never be retried.
@@ -285,6 +295,10 @@ func (c *StreamConn) Read(b []byte) (int, error) {
 
 func (c *StreamConn) Write(b []byte) (int, error) {
 	return c.Writer.Write(b)
+}
+
+func (c *StreamConn) WriteBatch(buffers [][]byte) (int, error) {
+	return c.Writer.WriteBatch(buffers)
 }
 
 func (c *StreamConn) CloseWrite() error {

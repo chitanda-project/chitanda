@@ -912,3 +912,69 @@ func TestFramedReader_LeftoverDecBufReturnsImmediatelyWithoutBlocking(t *testing
 		t.Fatalf("STALL DETECTED: FramedReader.Read blocked waiting for network instead of returning leftover decBuf!")
 	}
 }
+
+type countingWriter struct {
+	writes [][]byte
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	w.writes = append(w.writes, bytes.Clone(p))
+	return len(p), nil
+}
+
+func TestFramedWriter_WriteBatch_IntegrityAndFlushCount(t *testing.T) {
+	var key [16]byte
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	streamEnc, _ := NewAEADStream(key)
+	streamDec, _ := NewAEADStream(key)
+
+	cw := &countingWriter{}
+	fw := NewFramedWriter(cw, streamEnc)
+	// Fast forward to Phase 3 (> 1 MiB burst)
+	fw.burstBytes = Phase2Threshold + 100
+
+	// 16 slices of 8 KiB (128 KiB total), matching Xray MultiBuffer
+	var slices [][]byte
+	var fullPlaintext []byte
+	for i := 0; i < 16; i++ {
+		chunk := bytes.Repeat([]byte{byte(i + 65)}, 8192)
+		slices = append(slices, chunk)
+		fullPlaintext = append(fullPlaintext, chunk...)
+	}
+
+	n, err := fw.WriteBatch(slices)
+	if err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+	if n != len(fullPlaintext) {
+		t.Fatalf("WriteBatch returned %d, want %d", n, len(fullPlaintext))
+	}
+
+	// In Phase 3, flushThreshold is 128 KiB. All 16 slices should be flushed in AT MOST 2 underlying writes (typically 1 or 2 due to 128K threshold + framing overhead)
+	// Compare with 16 writes if done sequentially!
+	if len(cw.writes) > 2 {
+		t.Fatalf("WriteBatch produced %d writes, want <= 2", len(cw.writes))
+	}
+
+	if err := fw.WriteEOF(); err != nil {
+		t.Fatalf("WriteEOF: %v", err)
+	}
+
+	// Verify reader can decrypt everything back identically
+	var combinedEnc []byte
+	for _, w := range cw.writes {
+		combinedEnc = append(combinedEnc, w...)
+	}
+
+	fr := NewFramedReader(bytes.NewReader(combinedEnc), streamDec)
+	got, err := io.ReadAll(fr)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, fullPlaintext) {
+		t.Fatalf("decrypted payload mismatch: got %d bytes, want %d bytes", len(got), len(fullPlaintext))
+	}
+}
+

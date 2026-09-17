@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -414,54 +415,107 @@ func (h *InboundHandler) Close() error {
 }
 
 type pipeConn struct {
-	reader      *buf.BufferedReader
-	writer      buf.Writer
-	readCloser  interface{}
-	writeCloser interface{}
-	reads       *connio.Reader
-	writes      *connio.Writer
+	reader        *buf.BufferedReader
+	writer        buf.Writer
+	readCloser    interface{}
+	writeCloser   interface{}
+	reads         *connio.Reader
+	writeMu       sync.Mutex
+	writeClosed   bool
+	writeDeadline atomic.Pointer[time.Time]
 }
 
 func newPipeConn(reader buf.Reader, writer buf.Writer) *pipeConn {
 	c := &pipeConn{
-		reader:      &buf.BufferedReader{Reader: reader},
 		writer:      writer,
 		readCloser:  reader,
 		writeCloser: writer,
 	}
-	c.reads = connio.NewReader(func() ([]byte, net.Addr, error) {
-		b := make([]byte, 32<<10)
-		n, err := c.reader.Read(b)
-		return b[:n], nil, err
-	}, func() error { _ = common.Interrupt(reader); return common.Close(reader) })
-	c.writes = connio.NewWriter(func(b []byte, _ net.Addr) (int, error) {
-		if err := writer.WriteMultiBuffer(buf.MergeBytes(nil, b)); err != nil {
-			return 0, err
-		}
-		return len(b), nil
-	}, func() error { return common.Close(writer) }, func() error { _ = common.Interrupt(writer); return common.Close(writer) })
+	if reader != nil {
+		c.reader = &buf.BufferedReader{Reader: reader}
+		c.reads = connio.NewReader(func() ([]byte, net.Addr, error) {
+			b := make([]byte, 32<<10)
+			n, err := c.reader.Read(b)
+			return b[:n], nil, err
+		}, func() error { _ = common.Interrupt(reader); return common.Close(reader) })
+	}
 	return c
 }
 
 func (c *pipeConn) Read(b []byte) (n int, err error) {
+	if c.reads == nil {
+		return 0, io.EOF
+	}
 	return c.reads.Read(b)
 }
 
 func (c *pipeConn) Write(b []byte) (n int, err error) {
-	return c.writes.Write(b)
+	if len(b) == 0 {
+		return 0, nil
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	if c.writeClosed || c.writer == nil {
+		return 0, io.ErrClosedPipe
+	}
+	if dl := c.writeDeadline.Load(); dl != nil && !dl.IsZero() {
+		d := time.Until(*dl)
+		if d <= 0 {
+			return 0, os.ErrDeadlineExceeded
+		}
+		timer := time.AfterFunc(d, func() {
+			if c.writeCloser != nil {
+				_ = common.Interrupt(c.writeCloser)
+			}
+		})
+		defer timer.Stop()
+	}
+
+	if err := c.writer.WriteMultiBuffer(buf.MergeBytes(nil, b)); err != nil {
+		return 0, err
+	}
+	return len(b), nil
 }
 
 func (c *pipeConn) Close() error {
-	_ = c.writes.Close()
-	return c.reads.Close()
+	err1 := c.CloseWrite()
+	var err2 error
+	if c.reads != nil {
+		err2 = c.reads.Close()
+	} else if c.readCloser != nil {
+		_ = common.Interrupt(c.readCloser)
+		err2 = common.Close(c.readCloser)
+	}
+	if err1 != nil {
+		return err1
+	}
+	return err2
 }
 
 func (c *pipeConn) CloseWrite() error {
-	return c.writes.CloseWrite()
+	c.writeMu.Lock()
+	if c.writeClosed {
+		c.writeMu.Unlock()
+		return nil
+	}
+	c.writeClosed = true
+	c.writeMu.Unlock()
+	if c.writeCloser != nil {
+		return common.Close(c.writeCloser)
+	}
+	return nil
 }
 
 func (c *pipeConn) CloseRead() error {
-	return c.reads.Close()
+	if c.reads != nil {
+		return c.reads.Close()
+	}
+	if c.readCloser != nil {
+		_ = common.Interrupt(c.readCloser)
+		return common.Close(c.readCloser)
+	}
+	return nil
 }
 
 func (c *pipeConn) LocalAddr() net.Addr  { return &net.TCPAddr{IP: net.IPv4zero, Port: 0} }
@@ -473,10 +527,20 @@ func (c *pipeConn) SetDeadline(t time.Time) error {
 }
 
 func (c *pipeConn) SetReadDeadline(t time.Time) error {
-	return c.reads.SetDeadline(t)
+	if c.reads != nil {
+		return c.reads.SetDeadline(t)
+	}
+	return nil
 }
 
-func (c *pipeConn) SetWriteDeadline(t time.Time) error { return c.writes.SetDeadline(t) }
+func (c *pipeConn) SetWriteDeadline(t time.Time) error {
+	if t.IsZero() {
+		c.writeDeadline.Store(nil)
+	} else {
+		c.writeDeadline.Store(&t)
+	}
+	return nil
+}
 
 func isQUICPacket(data []byte) bool {
 	if len(data) < 20 {
