@@ -92,6 +92,7 @@ type Server struct {
 	tgbotService   service.Tgbot
 
 	cron *cron.Cron
+	updateGeoEntry cron.EntryID
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -296,6 +297,39 @@ func (s *Server) startTask() {
 		}
 	} else {
 		s.cron.Remove(entry)
+	}
+
+	s.registerUpdateGeoJob()
+}
+
+func (s *Server) registerUpdateGeoJob() {
+	if s.updateGeoEntry != 0 {
+		s.cron.Remove(s.updateGeoEntry)
+		s.updateGeoEntry = 0
+	}
+
+	enabled, err := s.settingService.GetGeoAutoUpdateEnable()
+	if err != nil || !enabled {
+		return
+	}
+
+	schedule, err := s.settingService.GetGeoAutoUpdateSchedule()
+	if err != nil || schedule == "" {
+		schedule = "@weekly"
+	}
+
+	entry, err := s.cron.AddJob(schedule, job.NewUpdateGeoJob())
+	if err != nil {
+		logger.Warning("Add UpdateGeoJob error:", err, "with schedule:", schedule)
+		return
+	}
+	s.updateGeoEntry = entry
+	logger.Infof("GeoIP/GeoSite auto update job registered with schedule: %s", schedule)
+}
+
+func (s *Server) ReloadUpdateGeoJob() {
+	if s.cron != nil {
+		s.registerUpdateGeoJob()
 	}
 }
 

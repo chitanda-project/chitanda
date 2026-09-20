@@ -143,6 +143,59 @@
                   <setting-list-item type="number" title='{{ i18n "pages.settings.expireTimeDiff" }}' desc='{{ i18n "pages.settings.expireTimeDiffDesc" }}' v-model="allSetting.expireDiff" :min="0"></setting-list-item>
                   <setting-list-item type="number" title='{{ i18n "pages.settings.trafficDiff" }}' desc='{{ i18n "pages.settings.trafficDiffDesc" }}' v-model="allSetting.trafficDiff" :min="0"></setting-list-item>
                   <setting-list-item type="text" title='{{ i18n "pages.settings.timeZone"}}' desc='{{ i18n "pages.settings.timeZoneDesc"}}' v-model="allSetting.timeLocation"></setting-list-item>
+                  <setting-list-item type="switch" title='{{ i18n "pages.settings.geoAutoUpdateEnable"}}' desc='{{ i18n "pages.settings.geoAutoUpdateEnableDesc"}}' v-model="allSetting.geoAutoUpdateEnable"></setting-list-item>
+                  <a-list-item v-if="allSetting.geoAutoUpdateEnable">
+                    <a-row style="padding: 20px">
+                      <a-col :lg="24" :xl="12">
+                        <a-list-item-meta title='{{ i18n "pages.settings.geoAutoUpdateSchedule"}}'>
+                          <template slot="description">{{ i18n "pages.settings.geoAutoUpdateScheduleDesc"}}</template>
+                        </a-list-item-meta>
+                      </a-col>
+                      <a-col :lg="24" :xl="12">
+                        <template>
+                          <a-select style="width: 100%" :dropdown-class-name="themeSwitcher.currentTheme" v-model="allSetting.geoAutoUpdateSchedule">
+                            <a-select-option v-for="item in geoScheduleList" :value="item.value">
+                              <span v-text="item.name"></span>
+                            </a-select-option>
+                          </a-select>
+                        </template>
+                      </a-col>
+                    </a-row>
+                  </a-list-item>
+                  <a-list-item v-if="allSetting.geoAutoUpdateEnable">
+                    <a-row style="padding: 20px">
+                      <a-col :lg="24" :xl="12">
+                        <a-list-item-meta title='{{ i18n "pages.settings.geoAutoUpdateSources"}}'>
+                          <template slot="description">{{ i18n "pages.settings.geoAutoUpdateSourcesDesc"}}</template>
+                        </a-list-item-meta>
+                      </a-col>
+                      <a-col :lg="24" :xl="12">
+                        <template>
+                          <a-select style="width: 100%" :dropdown-class-name="themeSwitcher.currentTheme" v-model="allSetting.geoAutoUpdateSources">
+                            <a-select-option v-for="item in geoSourcesList" :value="item.value">
+                              <span v-text="item.name"></span>
+                            </a-select-option>
+                          </a-select>
+                        </template>
+                      </a-col>
+                    </a-row>
+                  </a-list-item>
+                  <a-list-item v-if="allSetting.geoAutoUpdateEnable">
+                    <a-row style="padding: 20px">
+                      <a-col :lg="24" :xl="12">
+                        <a-list-item-meta title='{{ i18n "pages.settings.updateGeoNow"}}'>
+                          <template slot="description">{{ i18n "pages.settings.updateGeoNowDesc"}}</template>
+                        </a-list-item-meta>
+                      </a-col>
+                      <a-col :lg="24" :xl="12">
+                        <template>
+                          <a-button type="primary" :loading="updatingGeo" @click="updateGeoNow">
+                            {{ i18n "pages.settings.updateGeoNow"}}
+                          </a-button>
+                        </template>
+                      </a-col>
+                    </a-row>
+                  </a-list-item>
                   <a-list-item>
                     <a-row style="padding: 20px">
                       <a-col :lg="24" :xl="12">
@@ -392,6 +445,19 @@
       remarkModels: { i: 'Inbound', e: 'Email', o: 'Other' },
       remarkSeparators: [' ', '-', '_', '@', ':', '~', '|', ',', '.', '/'],
       datepickerList: [{ name: 'Gregorian (Standard)', value: 'gregorian' }, { name: 'Jalalian (شمسی)', value: 'jalalian' }],
+      geoScheduleList: [
+        { name: 'Daily (每天 03:00)', value: '@daily' },
+        { name: 'Weekly (每周日 03:00)', value: '@weekly' },
+        { name: 'Bi-weekly (每两周)', value: '@every 336h' },
+        { name: 'Monthly (每月1日 03:00)', value: '0 3 1 * *' },
+      ],
+      geoSourcesList: [
+        { name: 'Loyalsoldier (Standard)', value: 'Loyalsoldier' },
+        { name: 'chocolate4u (Iran)', value: 'chocolate4u' },
+        { name: 'runetfreedom (Russia)', value: 'runetfreedom' },
+        { name: 'vuong2023 (Vietnam)', value: 'vuong2023' },
+      ],
+      updatingGeo: false,
       remarkSample: '',
       defaultFragment: {
         tag: "fragment",
@@ -496,6 +562,11 @@
         if (msg.success) {
           await this.getAllSetting();
         }
+      },
+      async updateGeoNow() {
+        this.updatingGeo = true;
+        await HttpUtil.post("/panel/setting/updateGeoNow", { sources: this.allSetting.geoAutoUpdateSources });
+        this.updatingGeo = false;
       },
       async updateUser() {
         this.loading(true);

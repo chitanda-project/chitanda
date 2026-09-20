@@ -55,6 +55,9 @@ type AllSetting struct {
 	SubJsonMux       string `json:"subJsonMux" form:"subJsonMux"`
 	SubJsonRules     string `json:"subJsonRules" form:"subJsonRules"`
 	Datepicker       string `json:"datepicker" form:"datepicker"`
+	GeoAutoUpdateEnable   bool   `json:"geoAutoUpdateEnable" form:"geoAutoUpdateEnable"`
+	GeoAutoUpdateSchedule string `json:"geoAutoUpdateSchedule" form:"geoAutoUpdateSchedule"`
+	GeoAutoUpdateSources  string `json:"geoAutoUpdateSources" form:"geoAutoUpdateSources"`
 }
 
 func (s *AllSetting) CheckValid() error {

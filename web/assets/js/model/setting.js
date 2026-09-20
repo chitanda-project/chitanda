@@ -41,6 +41,10 @@ class AllSetting {
         this.subJsonMux = "";
         this.subJsonRules = "";
 
+        this.geoAutoUpdateEnable = false;
+        this.geoAutoUpdateSchedule = "@weekly";
+        this.geoAutoUpdateSources = "Loyalsoldier";
+
         this.timeLocation = "Asia/Tehran";
 
         if (data == null) {

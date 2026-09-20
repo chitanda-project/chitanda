@@ -2,9 +2,13 @@ package controller
 
 import (
 	"errors"
+	"fmt"
+	"net/http"
 	"time"
 
 	"x-ui/web/entity"
+	"x-ui/web/global"
+	"x-ui/web/job"
 	"x-ui/web/service"
 	"x-ui/web/session"
 
@@ -26,6 +30,7 @@ type SettingController struct {
 	settingService service.SettingService
 	userService    service.UserService
 	panelService   service.PanelService
+	xrayService    service.XrayService
 }
 
 func NewSettingController(g *gin.RouterGroup) *SettingController {
@@ -45,6 +50,7 @@ func (a *SettingController) initRouter(g *gin.RouterGroup) {
 	g.GET("/getDefaultJsonConfig", a.getDefaultXrayConfig)
 	g.POST("/updateUserSecret", a.updateSecret)
 	g.POST("/getUserSecret", a.getUserSecret)
+	g.POST("/updateGeoNow", a.updateGeoNow)
 }
 
 func (a *SettingController) getAllSetting(c *gin.Context) {
@@ -73,6 +79,11 @@ func (a *SettingController) updateSetting(c *gin.Context) {
 		return
 	}
 	err = a.settingService.UpdateAllSetting(allSetting)
+	if err == nil {
+		if ws := global.GetWebServer(); ws != nil {
+			ws.ReloadUpdateGeoJob()
+		}
+	}
 	jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
 }
 
@@ -137,3 +148,36 @@ func (a *SettingController) getDefaultXrayConfig(c *gin.Context) {
 	}
 	jsonObj(c, defaultJsonConfig, nil)
 }
+
+type updateGeoForm struct {
+	Sources string `json:"sources" form:"sources"`
+}
+
+func (a *SettingController) updateGeoNow(c *gin.Context) {
+	var form updateGeoForm
+	_ = c.ShouldBind(&form)
+
+	sources := form.Sources
+	if sources == "" {
+		var err error
+		sources, err = a.settingService.GetGeoAutoUpdateSources()
+		if err != nil || sources == "" {
+			sources = "Loyalsoldier"
+		}
+	}
+	updated, unchanged, err := job.UpdateGeo(sources, &a.xrayService)
+	if err != nil {
+		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.updateGeo"), err)
+		return
+	}
+	msg := fmt.Sprintf(I18nWeb(c, "pages.settings.toasts.updateGeoSuccess"), len(updated), len(unchanged))
+	c.JSON(http.StatusOK, entity.Msg{
+		Success: true,
+		Msg:     msg,
+		Obj: gin.H{
+			"updated":   updated,
+			"unchanged": unchanged,
+		},
+	})
+}
+

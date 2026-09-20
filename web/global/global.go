@@ -15,6 +15,7 @@ var (
 type WebServer interface {
 	GetCron() *cron.Cron
 	GetCtx() context.Context
+	ReloadUpdateGeoJob()
 }
 
 type SubServer interface {

@@ -66,6 +66,9 @@ var defaultValueMap = map[string]string{
 	"subJsonRules":       "",
 	"datepicker":         "gregorian",
 	"warp":               "",
+	"geoAutoUpdateEnable":   "false",
+	"geoAutoUpdateSchedule": "@weekly",
+	"geoAutoUpdateSources":  "Loyalsoldier",
 }
 
 type SettingService struct{}
@@ -531,6 +534,9 @@ func (s *SettingService) GetDefaultSettings(host string) (interface{}, error) {
 		"remarkModel":   func() (interface{}, error) { return s.GetRemarkModel() },
 		"datepicker":    func() (interface{}, error) { return s.GetDatepicker() },
 		"ipLimitEnable": func() (interface{}, error) { return s.GetIpLimitEnable() },
+		"geoAutoUpdateEnable":   func() (interface{}, error) { return s.GetGeoAutoUpdateEnable() },
+		"geoAutoUpdateSchedule": func() (interface{}, error) { return s.GetGeoAutoUpdateSchedule() },
+		"geoAutoUpdateSources":  func() (interface{}, error) { return s.GetGeoAutoUpdateSources() },
 	}
 
 	result := make(map[string]interface{})
@@ -577,4 +583,16 @@ func (s *SettingService) GetDefaultSettings(host string) (interface{}, error) {
 	}
 
 	return result, nil
+}
+
+func (s *SettingService) GetGeoAutoUpdateEnable() (bool, error) {
+	return s.getBool("geoAutoUpdateEnable")
+}
+
+func (s *SettingService) GetGeoAutoUpdateSchedule() (string, error) {
+	return s.getString("geoAutoUpdateSchedule")
+}
+
+func (s *SettingService) GetGeoAutoUpdateSources() (string, error) {
+	return s.getString("geoAutoUpdateSources")
 }
