@@ -1,0 +1,217 @@
+name: Build Mihomo (Alpha)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'integration/mihomo/**'
+      - 'scripts/inject-mihomo.py'
+      - 'pkg/**'
+      - 'internal/**'
+      - 'go.mod'
+      - '.github/workflows/build-mihomo-alpha.yml'
+  schedule:
+    - cron: '0 3 * * *' # Daily at 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build and overwrite existing release assets'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'schedule' }}
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Chitanda Core Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go (Stable)
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          check-latest: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check Upstream Alpha Commit
+        id: upstream_check
+        run: |
+          ALPHA_COMMIT=$(curl -fsSL --retry 3 --retry-all-errors \
+            https://api.github.com/repos/MetaCubeX/mihomo/commits/Alpha 2>/dev/null \
+            | jq -r '.sha // empty' 2>/dev/null || true)
+          test -n "$ALPHA_COMMIT"
+          SHORT_SHA=$(echo "$ALPHA_COMMIT" | cut -c1-7)
+          echo "Latest Upstream Alpha Commit: $ALPHA_COMMIT ($SHORT_SHA)"
+          echo "alpha_commit=$ALPHA_COMMIT" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          
+          # Read local record
+          LOCAL_COMMIT=""
+          if [ -f "releases/mihomo/alpha-commit.txt" ]; then
+            LOCAL_COMMIT=$(cat releases/mihomo/alpha-commit.txt | tr -d '[:space:]')
+          fi
+          echo "Local recorded Alpha Commit: $LOCAL_COMMIT"
+          
+          if [ "${{ github.event_name }}" == "push" ] || [ "${{ inputs.force_build }}" == "true" ] || [ "$LOCAL_COMMIT" != "$ALPHA_COMMIT" ]; then
+            echo "Triggering Alpha build for commit $SHORT_SHA (Event: ${{ github.event_name }}, Force: ${{ inputs.force_build }})..."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "Alpha build already up-to-date with commit $SHORT_SHA. Skipping build."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Clone Upstream Alpha Source
+        if: steps.upstream_check.outputs.should_build == 'true'
+        run: |
+          git clone --depth 1 --branch Alpha https://github.com/MetaCubeX/mihomo.git upstream_src
+
+      - name: Inject Chitanda Protocol Adapter
+        if: steps.upstream_check.outputs.should_build == 'true'
+        run: |
+          python3 scripts/inject-mihomo.py upstream_src $PWD
+
+      - name: Test Mihomo Chitanda adapter regressions
+        if: steps.upstream_check.outputs.should_build == 'true'
+        run: |
+          cd upstream_src
+          go mod tidy
+          go test -race ./config ./adapter/outbound -run 'Chitanda|RegressionMihomo' -count=1 -timeout 120s
+
+      - name: Build Multi-Architecture Binaries
+        if: steps.upstream_check.outputs.should_build == 'true'
+        run: |
+          cd upstream_src
+          go mod tidy || true
+          python3 "$GITHUB_WORKSPACE/scripts/patch_xnet.py"
+          mkdir -p ../dist
+          
+          SHORT_SHA="${{ steps.upstream_check.outputs.short_sha }}"
+          TAG="alpha-${SHORT_SHA}"
+          
+          PLATFORMS=(
+            "linux/amd64" "linux/386" "linux/arm" "linux/arm64"
+            "linux/riscv64" "linux/loong64"
+            "windows/amd64" "windows/386" "windows/arm64"
+            "darwin/amd64" "darwin/arm64"
+          )
+          
+          for PLATFORM in "${PLATFORMS[@]}"; do
+            GOOS=${PLATFORM%/*}
+            GOARCH=${PLATFORM#*/}
+            GOARM_VALUE=""
+            ASSET_ARCH="$GOARCH"
+            if [ "$GOARCH" == "arm" ]; then
+              GOARM_VALUE="7"
+              ASSET_ARCH="armv7"
+            fi
+            EXT=""
+            if [ "$GOOS" == "windows" ]; then EXT=".exe"; fi
+            
+            BIN_NAME="mihomo${EXT}"
+            echo "Building $BIN_NAME for $GOOS/$GOARCH..."
+            
+            BUILD_FLAGS="-tags with_gvisor"
+            LDFLAGS="-s -w -buildid= -X github.com/metacubex/mihomo/constant.Version=${TAG}"
+            
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM_VALUE go build $BUILD_FLAGS -trimpath -ldflags="$LDFLAGS" -o "../dist/$BIN_NAME" .
+            
+            if [ "$GOOS" == "linux" ] && [ "$GOARCH" == "amd64" ]; then
+              echo "===> Running Mihomo Alpha smoke test with Chitanda configurations..."
+              "../dist/$BIN_NAME" -t -f "$GITHUB_WORKSPACE/examples/mihomo/config.yaml"
+              printf 'mixed-port: 7890\nproxies:\n  - {name: test-minimal, server: 127.0.0.1, port: 443, type: chitanda, psk: test-secret-token-at-least-32-bytes}\n' > /tmp/test-minimal.yaml
+              "../dist/$BIN_NAME" -t -f /tmp/test-minimal.yaml
+              rm -f /tmp/test-minimal.yaml
+              echo "===> Mihomo Alpha smoke test PASSED successfully!"
+            fi
+            
+            cd ../dist
+            
+            # Upstream Mihomo Alpha naming rules:
+            # mihomo-linux-amd64-alpha-5019cc0.gz, mihomo-windows-amd64-alpha-5019cc0.zip, etc.
+            if [ "$GOOS" == "windows" ]; then
+              zip "mihomo-${GOOS}-${ASSET_ARCH}-${TAG}.zip" "mihomo.exe"
+              rm -f "mihomo.exe"
+            else
+              gzip -c "$BIN_NAME" > "mihomo-${GOOS}-${ASSET_ARCH}-${TAG}.gz"
+              rm -f "$BIN_NAME"
+            fi
+            
+            cd ../upstream_src
+          done
+
+          # Build OpenClash Targets for Alpha
+          OPENCLASH_TARGETS=(
+            "linux-amd64-v1|amd64||"
+            "linux-arm64|arm64||"
+            "linux-armv7|arm|7|"
+            "linux-armv6|arm|6|"
+            "linux-armv5|arm|5|"
+            "linux-386|386||"
+            "linux-mips64le|mips64le||"
+            "linux-mips64|mips64||"
+            "linux-mips-softfloat|mips||softfloat"
+            "linux-mipsle-softfloat|mipsle||softfloat"
+            "linux-riscv64|riscv64||"
+            "linux-loong64-abi2|loong64||"
+          )
+          for TARGET in "${OPENCLASH_TARGETS[@]}"; do
+            IFS='|' read -r OPENCLASH_ARCH GOARCH_VALUE GOARM_VALUE GOMIPS_VALUE <<< "$TARGET"
+            echo "Building OpenClash Alpha core for $OPENCLASH_ARCH..."
+            CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH_VALUE GOARM=$GOARM_VALUE GOMIPS=$GOMIPS_VALUE \
+              go build -tags with_gvisor -trimpath -ldflags="$LDFLAGS" -o ../dist/clash .
+            mkdir -p ../dist/openclash-stage
+            mv ../dist/clash ../dist/openclash-stage/clash
+            tar -C ../dist/openclash-stage -czf "../dist/clash-${OPENCLASH_ARCH}.tar.gz" clash
+            rm -f ../dist/openclash-stage/clash
+          done
+          rmdir ../dist/openclash-stage
+          
+          cd ../dist
+          echo "${TAG}" > version.txt
+          sha256sum * > sha256sums.txt
+
+      - name: Publish GitHub Alpha Release
+        if: steps.upstream_check.outputs.should_build == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "Prerelease-Alpha"
+          name: "Mihomo Prerelease-Alpha (${{ steps.upstream_check.outputs.short_sha }})"
+          body: |
+            Automated build of **MetaCubeX/mihomo** `Alpha` branch with native **Chitanda Protocol** integrated.
+            
+            ### Details:
+            - **Upstream Alpha Commit**: `MetaCubeX/mihomo@${{ steps.upstream_check.outputs.alpha_commit }}`
+            - **Version Tag**: `alpha-${{ steps.upstream_check.outputs.short_sha }}`
+            - **gVisor TUN Support**: `-tags with_gvisor` enabled.
+            - **Clash Verge Compatible**: Drop into Clash Verge directory as `verge-mihomo-alpha.exe` to run.
+            - **OpenClash Assets**: Included for OpenWrt router users testing Alpha.
+            - **Checksums**: `sha256sums.txt` included.
+            - **Build Commit**: `${{ github.sha }}`
+          files: |
+            dist/*
+          draft: false
+          prerelease: true
+          make_latest: false
+          clobber: true
+
+      - name: Update Alpha commit record in main branch
+        if: steps.upstream_check.outputs.should_build == 'true'
+        run: |
+          mkdir -p releases/mihomo
+          echo "${{ steps.upstream_check.outputs.alpha_commit }}" > releases/mihomo/alpha-commit.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add releases/mihomo/alpha-commit.txt
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore(release): record latest Mihomo Alpha commit ${{ steps.upstream_check.outputs.short_sha }}" && git push origin main)

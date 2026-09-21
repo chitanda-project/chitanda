@@ -1,0 +1,279 @@
+name: Build Mihomo (Stable)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'integration/mihomo/**'
+      - 'scripts/inject-mihomo.py'
+      - 'releases/mihomo/**'
+      - 'pkg/**'
+      - 'internal/**'
+      - 'go.mod'
+      - '.github/workflows/build-mihomo-stable.yml'
+  schedule:
+    - cron: '0 2 * * *' # Daily at 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build and overwrite existing release assets'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'schedule' }}
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Chitanda Core Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go (Stable)
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          check-latest: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check Latest Upstream Tag
+        id: upstream_check
+        run: |
+          LATEST_TAG=$(curl -fsSL --retry 3 --retry-all-errors \
+            https://api.github.com/repos/MetaCubeX/mihomo/releases/latest 2>/dev/null \
+            | jq -r 'if type == "object" then (.tag_name // empty) else empty end' 2>/dev/null \
+            || true)
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG=$(git ls-remote --tags --refs https://github.com/MetaCubeX/mihomo.git \
+              | awk -F/ '{print $3}' \
+              | sort -V \
+              | tail -n 1)
+          fi
+          test -n "$LATEST_TAG"
+          echo "Latest Mihomo Tag: $LATEST_TAG"
+          echo "upstream_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          
+          # Check if this release tag already exists in our repo
+          RELEASE_EXISTS=$(curl -fsSL --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/releases/tags/$LATEST_TAG 2>/dev/null \
+            | jq -r 'if type == "object" then (.id // empty) else empty end' 2>/dev/null \
+            || true)
+          
+          if [ "${{ github.event_name }}" == "push" ] || [ "${{ inputs.force_build }}" == "true" ] || [ -z "$RELEASE_EXISTS" ]; then
+            echo "Triggering build for $LATEST_TAG (Event: ${{ github.event_name }}, Force: ${{ inputs.force_build }})..."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "Release $LATEST_TAG already exists. Skipping build."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Clone Upstream Source
+        if: steps.upstream_check.outputs.should_build == 'true'
+        run: |
+          git clone --depth 1 --branch ${{ steps.upstream_check.outputs.upstream_tag }} https://github.com/MetaCubeX/mihomo.git upstream_src
+
+      - name: Inject Chitanda Protocol Adapter
+        if: steps.upstream_check.outputs.should_build == 'true'
+        run: |
+          python3 scripts/inject-mihomo.py upstream_src $PWD
+
+      - name: Test Mihomo Chitanda adapter regressions
+        if: steps.upstream_check.outputs.should_build == 'true'
+        run: |
+          cd upstream_src
+          go mod tidy
+          go test -race ./config ./adapter/outbound -run 'Chitanda|RegressionMihomo' -count=1 -timeout 120s
+
+      - name: Build Multi-Architecture Binaries
+        if: steps.upstream_check.outputs.should_build == 'true'
+        run: |
+          cd upstream_src
+          go mod tidy || true
+          python3 "$GITHUB_WORKSPACE/scripts/patch_xnet.py"
+          mkdir -p ../dist
+          
+          TAG="${{ steps.upstream_check.outputs.upstream_tag }}"
+          
+          PLATFORMS=(
+            "linux/amd64" "linux/386" "linux/arm" "linux/arm64"
+            "linux/riscv64" "linux/loong64"
+            "windows/amd64" "windows/386" "windows/arm64"
+            "darwin/amd64" "darwin/arm64"
+          )
+          
+          for PLATFORM in "${PLATFORMS[@]}"; do
+            GOOS=${PLATFORM%/*}
+            GOARCH=${PLATFORM#*/}
+            GOARM_VALUE=""
+            ASSET_ARCH="$GOARCH"
+            if [ "$GOARCH" == "arm" ]; then
+              GOARM_VALUE="7"
+              ASSET_ARCH="armv7"
+            fi
+            EXT=""
+            if [ "$GOOS" == "windows" ]; then EXT=".exe"; fi
+            
+            BIN_NAME="mihomo${EXT}"
+            echo "Building $BIN_NAME for $GOOS/$GOARCH..."
+            
+            BUILD_FLAGS="-tags with_gvisor"
+            LDFLAGS="-s -w -buildid= -X github.com/metacubex/mihomo/constant.Version=${TAG}"
+            
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM_VALUE go build $BUILD_FLAGS -trimpath -ldflags="$LDFLAGS" -o "../dist/$BIN_NAME" .
+            
+            if [ "$GOOS" == "linux" ] && [ "$GOARCH" == "amd64" ]; then
+              echo "===> Running Mihomo smoke test with Chitanda configurations..."
+              "../dist/$BIN_NAME" -t -f "$GITHUB_WORKSPACE/examples/mihomo/config.yaml"
+              printf 'mixed-port: 7890\nproxies:\n  - {name: test-minimal, server: 127.0.0.1, port: 443, type: chitanda, psk: test-secret-token-at-least-32-bytes}\n' > /tmp/test-minimal.yaml
+              "../dist/$BIN_NAME" -t -f /tmp/test-minimal.yaml
+              rm -f /tmp/test-minimal.yaml
+              echo "===> Mihomo smoke test PASSED successfully!"
+            fi
+            
+            cd ../dist
+            
+            # Standard upstream Mihomo naming rules:
+            # mihomo-linux-amd64-v1.19.30.gz, mihomo-windows-amd64-v1.19.30.zip, etc.
+            if [ "$GOOS" == "windows" ]; then
+              zip "mihomo-${GOOS}-${ASSET_ARCH}-${TAG}.zip" "mihomo.exe"
+              rm -f "mihomo.exe"
+            else
+              gzip -c "$BIN_NAME" > "mihomo-${GOOS}-${ASSET_ARCH}-${TAG}.gz"
+              rm -f "$BIN_NAME"
+            fi
+            
+            cd ../upstream_src
+          done
+
+          # Build OpenClash Targets
+          OPENCLASH_TARGETS=(
+            "linux-amd64-v1|amd64||"
+            "linux-arm64|arm64||"
+            "linux-armv7|arm|7|"
+            "linux-armv6|arm|6|"
+            "linux-armv5|arm|5|"
+            "linux-386|386||"
+            "linux-mips64le|mips64le||"
+            "linux-mips64|mips64||"
+            "linux-mips-softfloat|mips||softfloat"
+            "linux-mipsle-softfloat|mipsle||softfloat"
+            "linux-riscv64|riscv64||"
+            "linux-loong64-abi2|loong64||"
+          )
+          for TARGET in "${OPENCLASH_TARGETS[@]}"; do
+            IFS='|' read -r OPENCLASH_ARCH GOARCH_VALUE GOARM_VALUE GOMIPS_VALUE <<< "$TARGET"
+            echo "Building OpenClash core for $OPENCLASH_ARCH..."
+            CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH_VALUE GOARM=$GOARM_VALUE GOMIPS=$GOMIPS_VALUE \
+              go build -tags with_gvisor -trimpath -ldflags="$LDFLAGS" -o ../dist/clash .
+            mkdir -p ../dist/openclash-stage
+            mv ../dist/clash ../dist/openclash-stage/clash
+            tar -C ../dist/openclash-stage -czf "../dist/clash-${OPENCLASH_ARCH}.tar.gz" clash
+            rm -f ../dist/openclash-stage/clash
+          done
+          rmdir ../dist/openclash-stage
+          
+          # Validate and generate manifest
+          cd ../dist
+          python3 - "$TAG" "$GITHUB_WORKSPACE/releases/mihomo/release-contract.json" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          tag, contract_path = sys.argv[1:]
+          contract = json.loads(Path(contract_path).read_text(encoding="utf-8"))
+          assets = {}
+          for target, pattern in contract["desktopAssets"].items():
+              name = pattern.format(upstreamTag=tag)
+              path = Path(name)
+              if not path.is_file():
+                  raise SystemExit(f"missing required desktop asset: {target} -> {name}")
+              assets[target] = {
+                  "name": name,
+                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+              }
+          openclash_assets = {}
+          for target, name in contract["openClashAssets"]["assets"].items():
+              path = Path(name)
+              if not path.is_file():
+                  raise SystemExit(f"missing required OpenClash asset: {target} -> {name}")
+              openclash_assets[target] = {
+                  "name": name,
+                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+              }
+          Path("version.txt").write_text(tag + "\n", encoding="utf-8")
+          Path("manifest.json").write_text(
+              json.dumps(
+                  {
+                      "schema": contract["schema"],
+                      "upstreamTag": tag,
+                      "assets": assets,
+                      "openClashAssets": openclash_assets,
+                  },
+                  indent=2,
+                  sort_keys=True,
+              ) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          sha256sum * > sha256sums.txt
+
+      - name: Publish GitHub Release
+        if: steps.upstream_check.outputs.should_build == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "${{ steps.upstream_check.outputs.upstream_tag }}"
+          name: "mihomo ${{ steps.upstream_check.outputs.upstream_tag }}"
+          body: |
+            Automated release of **MetaCubeX/mihomo** `${{ steps.upstream_check.outputs.upstream_tag }}` (Stable) with native **Chitanda Protocol** integrated.
+            
+            ### Package Standard:
+            - **Strict Ecosystem Alignment**: Identical naming rules to official upstream releases.
+            - **gVisor TUN Support**: Compiled with `-tags with_gvisor` for full Clash Verge / Mihomo Party TUN compatibility.
+            - **OpenClash Bundle**: Complete multi-architecture OpenClash tarball assets.
+            - **Checksum Sidecars**: `manifest.json` and `sha256sums.txt` included.
+            - **Commit**: `${{ github.sha }}`
+          files: |
+            dist/*
+          draft: false
+          prerelease: false
+          make_latest: false
+          clobber: true
+
+      - name: Update Mihomo version.txt in main branch
+        if: steps.upstream_check.outputs.should_build == 'true'
+        run: |
+          mkdir -p releases/mihomo
+          echo "${{ steps.upstream_check.outputs.upstream_tag }}" > releases/mihomo/version.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add releases/mihomo/version.txt
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore(release): update Mihomo latest version to ${{ steps.upstream_check.outputs.upstream_tag }}" && git push origin main)
+
+      - name: Trigger Downstream CMFA Build
+        if: steps.upstream_check.outputs.should_build == 'true'
+        env:
+          DISPATCH_TOKEN: ${{ secrets.DISPATCH_TOKEN || secrets.GH_PAT || secrets.PERSONAL_ACCESS_TOKEN }}
+        run: |
+          if [ -n "$DISPATCH_TOKEN" ]; then
+            echo "Triggering chitanda-cmfa build via repository_dispatch..."
+            curl -s -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $DISPATCH_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository_owner }}/chitanda-cmfa/dispatches" \
+              -d '{"event_type":"chitanda-core-updated","client_payload":{"upstream_tag":"${{ steps.upstream_check.outputs.upstream_tag }}","commit":"${{ github.sha }}"}}'
+            echo "Dispatched event to chitanda-cmfa."
+          else
+            echo "Notice: DISPATCH_TOKEN secret is not configured in this repo. CMFA will auto-sync via its watch workflow."
+          fi
