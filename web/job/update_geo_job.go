@@ -165,7 +165,7 @@ func UpdateGeo(selectedSources string, xrayService *service.XrayService) (update
 	if len(updatedFiles) > 0 && xrayService != nil {
 		if xrayService.IsXrayRunning() {
 			logger.Infof("[UpdateGeoJob] %d files updated, restarting Xray...", len(updatedFiles))
-			if restartErr := xrayService.RestartXray(false); restartErr != nil {
+			if restartErr := xrayService.RestartXray(true); restartErr != nil {
 				logger.Errorf("[UpdateGeoJob] Restart Xray failed: %v", restartErr)
 			}
 		}
