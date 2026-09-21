@@ -1,5 +1,10 @@
 const supportLangs = [
     {
+        name: '汉语',
+        value: 'zh-Hans',
+        icon: '🇨🇳',
+    },
+    {
         name: 'English',
         value: 'en-US',
         icon: '🇺🇸',
@@ -8,11 +13,6 @@ const supportLangs = [
         name: 'فارسی',
         value: 'fa-IR',
         icon: '🇮🇷',
-    },
-    {
-        name: '汉语',
-        value: 'zh-Hans',
-        icon: '🇨🇳',
     },
     {
         name: 'Русский',
@@ -41,33 +41,43 @@ const supportLangs = [
     },
 ];
 
+function normalizeLang(lang) {
+    if (!lang) return 'zh-Hans';
+    const lower = lang.toLowerCase();
+    if (lower.startsWith('zh')) return 'zh-Hans';
+    if (lower.startsWith('en')) return 'en-US';
+    if (lower.startsWith('fa')) return 'fa-IR';
+    if (lower.startsWith('ru')) return 'ru-RU';
+    if (lower.startsWith('vi')) return 'vi-VN';
+    if (lower.startsWith('es')) return 'es-ES';
+    if (lower.startsWith('id')) return 'id-ID';
+    if (lower.startsWith('uk')) return 'uk-UA';
+    for (const l of supportLangs) {
+        if (l.value.toLowerCase() === lower) {
+            return l.value;
+        }
+    }
+    return 'zh-Hans';
+}
+
 function getLang() {
     let lang = getCookie('lang');
 
     if (!lang) {
+        let navLang = '';
         if (window.navigator) {
-            lang = window.navigator.language || window.navigator.userLanguage;
-
-            if (isSupportLang(lang)) {
-                setCookie('lang', lang, 150);
-            } else {
-                setCookie('lang', 'en-US', 150);
-                window.location.reload();
-            }
-        } else {
-            setCookie('lang', 'en-US', 150);
-            window.location.reload();
+            navLang = window.navigator.language || window.navigator.userLanguage || '';
         }
+        lang = normalizeLang(navLang);
+        setCookie('lang', lang, 150);
+        window.location.reload();
     }
 
     return lang;
 }
 
 function setLang(lang) {
-    if (!isSupportLang(lang)) {
-        lang = 'en-US';
-    }
-
+    lang = normalizeLang(lang);
     setCookie('lang', lang, 150);
     window.location.reload();
 }
@@ -81,3 +91,4 @@ function isSupportLang(lang) {
 
     return false;
 }
+

@@ -31,8 +31,8 @@ type SettingService interface {
 }
 
 func InitLocalizer(i18nFS embed.FS, settingService SettingService) error {
-	// set default bundle to english
-	i18nBundle = i18n.NewBundle(language.MustParse("en-US"))
+	// set default bundle to chinese
+	i18nBundle = i18n.NewBundle(language.MustParse("zh-Hans"))
 	i18nBundle.RegisterUnmarshalFunc("toml", toml.Unmarshal)
 
 	// parse files
@@ -92,11 +92,11 @@ func I18n(i18nType I18nType, key string, params ...string) string {
 
 func initTGBotLocalizer(settingService SettingService) error {
 	botLang, err := settingService.GetTgLang()
-	if err != nil {
-		return err
+	if err != nil || botLang == "" {
+		botLang = "zh-Hans"
 	}
 
-	LocalizerBot = i18n.NewLocalizer(i18nBundle, botLang)
+	LocalizerBot = i18n.NewLocalizer(i18nBundle, botLang, "zh-Hans")
 	return nil
 }
 
@@ -109,8 +109,11 @@ func LocalizerMiddleware() gin.HandlerFunc {
 		} else {
 			lang = c.GetHeader("Accept-Language")
 		}
+		if lang == "" {
+			lang = "zh-Hans"
+		}
 
-		LocalizerWeb = i18n.NewLocalizer(i18nBundle, lang)
+		LocalizerWeb = i18n.NewLocalizer(i18nBundle, lang, "zh-Hans")
 
 		c.Set("localizer", LocalizerWeb)
 		c.Set("I18n", I18n)

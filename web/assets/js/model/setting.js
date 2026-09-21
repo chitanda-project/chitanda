@@ -21,7 +21,7 @@ class AllSetting {
         this.tgBotBackup = false;
         this.tgBotLoginNotify = false;
         this.tgCpu = "";
-        this.tgLang = "en-US";
+        this.tgLang = "zh-Hans";
         this.xrayTemplateConfig = "";
         this.secretEnable = false;
         this.subEnable = false;
