@@ -1,15 +1,27 @@
 <div align="center">
 
-<img src="public/avatar.webp" alt="Chitanda" width="120" />
+<img src="https://raw.githubusercontent.com/chitanda-project/chitanda/main/public/avatar.webp" alt="Chitanda" width="120" />
 
 # **Chitanda (千反田)**
 
 ### 高性能・探知耐性プライベートセキュア転送プロトコル
 
-[![Release](https://img.shields.io/github/v/release/violetaini/chitanda?style=flat-square)](https://github.com/violetaini/chitanda/releases)
-[![License](https://img.shields.io/badge/License-PolyForm_Noncommercial_1.0.0-orange.svg?style=flat-square)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/chitanda-project/chitanda?color=blue&style=flat-square)](https://github.com/chitanda-project/chitanda/releases)
+[![Build](https://github.com/chitanda-project/chitanda/actions/workflows/build-mihomo-stable.yml/badge.svg)](https://github.com/chitanda-project/chitanda/actions)
+[![License](https://img.shields.io/badge/License-GPL--3.0%20%2F%20MIT-green?style=flat-square)](LICENSE)
+[![Official Website](https://img.shields.io/badge/Official-chitanda.net-blue?style=flat-square)](https://chitanda.net)
 
 </div>
+
+> [!WARNING]
+> ### ⚠️ 免責事項 (Disclaimer)
+> 本プロジェクトおよび関連リソースは、学術研究、ネットワークセキュリティ検証、および正当な管理運用を目的として公開・提供されています。
+> 
+> 1. **法令遵守の義務**：本ソフトウェアおよび関連コードを利用する際は、**必ずご利用者ご自身の所在国・地域の法令および規則を遵守してください**。
+> 2. **利用の禁止**：本ソフトウェアの利用が所在国または地域の法令・規則に違反する場合、**いかなる目的であっても本ソフトウェアのダウンロード、インストール、実行、および二次配布を行わないでください**。
+> 3. **免責条項**：開発者およびプロジェクト保守管理者は、本ソフトウェアの使用、誤用、またはそれに関連して生じたいかなる損害、法的紛争、および責任についても一切の責任を負いません。
+
+---
 
 
 Chitanda は、セルフホスト（自前運用）サーバー環境向けに設計された、高パフォーマンスかつ探知耐性（Anti-Probing）に優れた Go 言語製プロキシ転送プロトコルです。モジュール化されたサーバー実装、組み込み可能なクライアント SDK（Go 標準の `net.Conn` および `net.PacketConn` インターフェースを提供）、およびダイレクト接続用ベンチマークツールを備えています。
