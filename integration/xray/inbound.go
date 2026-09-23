@@ -165,20 +165,24 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 		return dialTargetFn(ctx, "udp", address)
 	})
 
-	userCodecs := make([]*server.PlainUDPCodec, 0, len(serverUsers))
-	for _, u := range serverUsers {
-		codec, err := server.NewPlainUDPCodec(u.PSK)
-		if err != nil {
-			_ = replays.Close()
-			return nil, fmt.Errorf("init plain-udp codec: %w", err)
-		}
-		userCodecs = append(userCodecs, codec)
-	}
-
+	var userCodecs []*server.PlainUDPCodec
+	var userReplays []udpReplayRegistry
 	inCtx, inCancel := context.WithCancel(context.Background())
-	userReplays := make([]udpReplayRegistry, len(serverUsers))
-	for i := range userReplays {
-		go userReplays[i].run(inCtx)
+	if config.Transport == "stream" || config.Transport == "h1" || config.Transport == "plain-h1" {
+		userCodecs = make([]*server.PlainUDPCodec, 0, len(serverUsers))
+		for _, u := range serverUsers {
+			codec, err := server.NewPlainUDPCodec(u.PSK)
+			if err != nil {
+				_ = replays.Close()
+				inCancel()
+				return nil, fmt.Errorf("init plain-udp codec: %w", err)
+			}
+			userCodecs = append(userCodecs, codec)
+		}
+		userReplays = make([]udpReplayRegistry, len(serverUsers))
+		for i := range userReplays {
+			go userReplays[i].run(inCtx)
+		}
 	}
 
 	var h3Server *http3.Server
@@ -366,19 +370,35 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 		stopHandler := context.AfterFunc(h.ctx, func() { _ = conn.Close() })
 		defer stopHandler()
 	}
-	userCodecs := h.userCodecs
-	userReplays := h.userReplays
-	if len(userCodecs) != len(userReplays) {
-		return fmt.Errorf("chitanda: UDP codec/replay registry mismatch")
-	}
-	if len(userCodecs) == 0 && h.h3Server == nil {
-		return fmt.Errorf("neither chitanda plain-udp nor h3 initialized")
-	}
 
-	key := conn.RemoteAddr().String()
+	// 1. HTTP/3 UDP path for h2, h3, and auto inbounds (QUIC Datagrams).
+	// Directly routes to QUIC stack with 0 µs Plain-UDP trial decryption overhead.
 	if h.vconn != nil {
+		key := conn.RemoteAddr().String()
 		h.vconn.registerConn(key, conn, ctx)
 		defer h.vconn.unregisterConn(key, conn)
+
+		reader := newFullPacketReader(conn)
+		for {
+			mpayload, err := reader.ReadMultiBuffer()
+			if err != nil {
+				return err
+			}
+			for _, payload := range mpayload {
+				data := payload.Bytes()
+				if len(data) > 0 && isQUICPacket(data) {
+					h.vconn.feed(data, conn.RemoteAddr())
+				}
+				payload.Release()
+			}
+		}
+	}
+
+	// 2. Native Plain-UDP path for stream, h1, and plain-h1 inbounds.
+	userCodecs := h.userCodecs
+	userReplays := h.userReplays
+	if len(userCodecs) != len(userReplays) || len(userCodecs) == 0 {
+		return fmt.Errorf("chitanda: plain-udp not initialized for transport %q", h.config.Transport)
 	}
 
 	routes := newUDPRoutes(ctx, dispatcher, userCodecs, conn)
@@ -398,57 +418,36 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 				continue
 			}
 
-			// If transport is strictly h3, route directly to H3
-			if h.config.Transport == "h3" {
-				if h.vconn != nil {
-					h.vconn.feed(data, conn.RemoteAddr())
-				}
-				payload.Release()
-				continue
-			}
-
-			// Try Plain-UDP decode first if codecs initialized
-			if len(userCodecs) > 0 {
-				matchedIdx, sessionID, targetAddr, rawData, _, seq, err := server.DecodeClientPacketMulti(userCodecs, data, time.Now())
-				if err == nil {
-					if matchedIdx < 0 || matchedIdx >= len(userReplays) || !userReplays[matchedIdx].accept(sessionID, seq, time.Now()) {
-						payload.Release()
-						continue // drop replayed packet across any connection/association!
-					}
-
-					dest, err := xnet.ParseDestination("udp:" + targetAddr)
-					if err != nil {
-						payload.Release()
-						continue
-					}
-
-					var packetCtx context.Context
-					inbound := session.InboundFromContext(ctx)
-					copyInbound := session.Inbound{Tag: "chitanda-inbound"}
-					if inbound != nil {
-						copyInbound = *inbound
-						if copyInbound.Tag == "" {
-							copyInbound.Tag = "chitanda-inbound"
-						}
-					}
-					if matchedIdx >= 0 && matchedIdx < len(h.users) && h.users[matchedIdx].Email != "" {
-						copyInbound.User = &protocol.MemoryUser{
-							Email: h.users[matchedIdx].Email,
-							Level: h.users[matchedIdx].Level,
-						}
-					}
-					packetCtx = session.ContextWithInbound(ctx, &copyInbound)
-
+			matchedIdx, sessionID, targetAddr, rawData, _, seq, err := server.DecodeClientPacketMulti(userCodecs, data, time.Now())
+			if err == nil {
+				if matchedIdx < 0 || matchedIdx >= len(userReplays) || !userReplays[matchedIdx].accept(sessionID, seq, time.Now()) {
 					payload.Release()
-					_ = routes.Write(packetCtx, matchedIdx, sessionID, dest, rawData)
+					continue // drop replayed packet across any connection/association!
+				}
+
+				dest, err := xnet.ParseDestination("udp:" + targetAddr)
+				if err != nil {
+					payload.Release()
 					continue
 				}
-			}
 
-			// If not Plain-UDP, check if H3 is enabled and if packet looks like QUIC
-			if h.vconn != nil && isQUICPacket(data) {
-				h.vconn.feed(data, conn.RemoteAddr())
+				copyInbound := session.Inbound{Tag: "chitanda-inbound"}
+				if inbound := session.InboundFromContext(ctx); inbound != nil {
+					copyInbound = *inbound
+					if copyInbound.Tag == "" {
+						copyInbound.Tag = "chitanda-inbound"
+					}
+				}
+				if matchedIdx >= 0 && matchedIdx < len(h.users) && h.users[matchedIdx].Email != "" {
+					copyInbound.User = &protocol.MemoryUser{
+						Email: h.users[matchedIdx].Email,
+						Level: h.users[matchedIdx].Level,
+					}
+				}
+				packetCtx := session.ContextWithInbound(ctx, &copyInbound)
+
 				payload.Release()
+				_ = routes.Write(packetCtx, matchedIdx, sessionID, dest, rawData)
 				continue
 			}
 
