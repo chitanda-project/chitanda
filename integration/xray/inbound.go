@@ -348,6 +348,11 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 	if len(h.userReplays) < len(userCodecs) {
 		replays := make([]udpReplayRegistry, len(userCodecs))
 		copy(replays, h.userReplays)
+		for i := len(h.userReplays); i < len(userCodecs); i++ {
+			if h.ctx != nil {
+				go replays[i].run(h.ctx)
+			}
+		}
 		h.userReplays = replays
 	}
 	userReplays := h.userReplays

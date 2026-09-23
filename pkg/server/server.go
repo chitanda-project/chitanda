@@ -93,22 +93,25 @@ func NewServer(path string, psk []byte, replays *auth.ReplayCache, fallback http
 
 // NewServerWithUsers creates a new Server instance supporting multiple users.
 func NewServerWithUsers(path string, users []UserKey, replays *auth.ReplayCache, fallback http.Handler, udpTargetBuffer int) *Server {
+	validUsers := make([]UserKey, 0, len(users))
+	pskList := make([][]byte, 0, len(users))
+	for _, u := range users {
+		if len(u.PSK) >= 32 {
+			validUsers = append(validUsers, u)
+			pskList = append(pskList, u.PSK)
+		}
+	}
 	s := &Server{
 		path:            path,
-		users:           users,
+		users:           validUsers,
+		pskList:         pskList,
 		replays:         replays,
 		fallback:        fallback,
 		udpTargetBuffer: udpTargetBuffer,
 		dialTarget:      target.DialContext,
 	}
-	s.pskList = make([][]byte, 0, len(users))
-	for _, u := range users {
-		if len(u.PSK) >= 32 {
-			s.pskList = append(s.pskList, u.PSK)
-		}
-	}
-	if len(users) == 1 {
-		s.psk = users[0].PSK
+	if len(validUsers) == 1 {
+		s.psk = validUsers[0].PSK
 	}
 	return s
 }

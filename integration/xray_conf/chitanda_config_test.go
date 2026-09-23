@@ -105,4 +105,13 @@ func TestChitandaMultiUserConfig(t *testing.T) {
 	if _, err := dupPSKCfg.Build(); err == nil {
 		t.Fatal("expected error for duplicate PSK, got nil")
 	}
+
+	// 6. Reject users list with only nil entries
+	nilUsersCfg := ChitandaInboundConfig{
+		Transport: "h2",
+		Users:     []*ChitandaUser{nil},
+	}
+	if _, err := nilUsersCfg.Build(); err == nil {
+		t.Fatal("expected error for nil users list, got nil")
+	}
 }

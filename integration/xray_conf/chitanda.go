@@ -100,6 +100,9 @@ func (c *ChitandaInboundConfig) Build() (proto.Message, error) {
 				Level: u.Level,
 			})
 		}
+		if len(protoUsers) == 0 {
+			return nil, fmt.Errorf("chitanda: no valid users configured in users list")
+		}
 	} else {
 		if err := validateChitanda(c.PSK, c.Transport); err != nil {
 			return nil, err

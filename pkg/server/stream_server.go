@@ -75,9 +75,18 @@ func NewStreamServerWithUsers(users []UserKey, serverID string, replays *auth.Re
 	if replays == nil {
 		replays = auth.NewReplayCache()
 	}
+	validUsers := make([]UserKey, 0, len(users))
+	pskList := make([][]byte, 0, len(users))
+	for _, u := range users {
+		if len(u.PSK) >= 32 {
+			validUsers = append(validUsers, u)
+			pskList = append(pskList, u.PSK)
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &StreamServer{
-		users:        users,
+		users:        validUsers,
+		pskList:      pskList,
 		serverID:     serverID,
 		dialTarget:   dialTarget,
 		replays:      replays,
@@ -86,14 +95,8 @@ func NewStreamServerWithUsers(users []UserKey, serverID string, replays *auth.Re
 		ctx:          ctx,
 		cancel:       cancel,
 	}
-	s.pskList = make([][]byte, 0, len(users))
-	for _, u := range users {
-		if len(u.PSK) >= 32 {
-			s.pskList = append(s.pskList, u.PSK)
-		}
-	}
-	if len(users) == 1 {
-		s.psk = users[0].PSK
+	if len(validUsers) == 1 {
+		s.psk = validUsers[0].PSK
 	}
 	return s
 }
