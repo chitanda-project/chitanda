@@ -198,9 +198,23 @@ func TestH3AndPlainUDPDemuxing(t *testing.T) {
 		t.Fatalf("NewPlainUDPCodec: %v", err)
 	}
 
-	plainPkt, err := codec.EncodeClientPacket(1001, "8.8.8.8:53", []byte("dns query"), time.Now())
-	if err != nil {
-		t.Fatalf("EncodeClientPacket: %v", err)
+	// A Plain-UDP nonce is random. Select an authentic packet whose QUIC fixed
+	// bit is clear, so only the trailing QUIC packet can trigger onFeed below.
+	var plainPkt []byte
+	for attempt := 0; attempt < 64; attempt++ {
+		plainPkt, err = codec.EncodeClientPacket(1001, "8.8.8.8:53", []byte("dns query"), time.Now())
+		if err != nil {
+			t.Fatalf("EncodeClientPacket: %v", err)
+		}
+		if !isQUICPacket(plainPkt) {
+			break
+		}
+	}
+	if isQUICPacket(plainPkt) {
+		t.Fatal("could not generate a valid Plain-UDP packet distinguishable from QUIC")
+	}
+	if _, _, _, _, _, err := codec.DecodeClientPacket(plainPkt, time.Now()); err != nil {
+		t.Fatalf("selected Plain-UDP packet must remain authentic: %v", err)
 	}
 
 	quicPkt := make([]byte, 1200)
