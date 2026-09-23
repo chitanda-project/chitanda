@@ -285,7 +285,7 @@ message InboundConfig {
   - 在 `integration/xray/config.proto` 与 `integration/xray_conf/chitanda.go` 中解析并校验用户数组。
   - 在 `integration/xray/inbound.go` 中为请求或 UDP 包绑定独立用户上下文；真正产生计数器还需 Xray Policy 与 Stats 配置。
 - [ ] **Phase 3: 自动化回归测试与性能基准**
-  - 现有回归覆盖 HTTP 请求级身份、H1、Stream、原生 UDP、H3/auto 两用户分别连通及 Xray 计数器策略；H3/auto 双用户并发、Linux race 与真实计费验收尚未完成。
+  - 现有回归覆盖 HTTP 请求级身份、H1、Stream、原生 UDP、H3/auto 同一入站双用户并发身份，以及真实 Xray 中 Stream TCP/原生 UDP 的按用户计费；目标机器性能与线上效果仍待验证。
   - 编写未授权探测回归：验证 `stream` 下非法请求无应用层响应；HTTP 族验证已配置与未配置 Fallback 的实际响应。
 - [ ] **Phase 4: 3X-UI 面板适配（不在本仓库）**
   - 更新 3X-UI 的 Inbound 模板，支持在 `chitanda` 协议下动态添加、删除用户，绑定 `email` 与一键生成 `psk`。

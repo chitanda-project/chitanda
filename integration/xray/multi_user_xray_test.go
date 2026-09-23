@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -221,6 +222,119 @@ func TestXrayInboundMultiUserH3AndAuto(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestXrayInboundMultiUserH3AndAutoConcurrent(t *testing.T) {
+	users := []struct {
+		email  string
+		key    []byte
+		target string
+	}{
+		{"alice", []byte("alice-key-at-least-32-bytes-long!"), "192.0.2.1:443"},
+		{"bob", []byte("bob---key-at-least-32-bytes-long!"), "192.0.2.2:443"},
+	}
+	for _, mode := range []string{"h3", "auto"} {
+		t.Run(mode, func(t *testing.T) {
+			type event struct{ email, target string }
+			events := make(chan event, 4)
+			dispatcher := &mockTestDispatcher{dispatchFn: func(ctx context.Context, dest xnet.Destination) (*transport.Link, error) {
+				email := ""
+				if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.User != nil {
+					email = inbound.User.Email
+				}
+				events <- event{email, dest.NetAddr()}
+				reader, writer := pipe.New()
+				return &transport.Link{Reader: reader, Writer: writer}, nil
+			}}
+			h, err := newTestInboundHandler(t, newTestContextWithDispatcher(t, dispatcher), &InboundConfig{
+				Path: "/api/sync", Transport: mode, StrictSni: "localhost",
+				Users: []*User{{Email: users[0].email, Psk: string(users[0].key)}, {Email: users[1].email, Psk: string(users[1].key)}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer h.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			clients := make([]*client.Client, len(users))
+			for i, user := range users {
+				serverPacket, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer serverPacket.Close()
+				clientPacket, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer clientPacket.Close()
+				bridge := &reviewUDPBridge{UDPConn: serverPacket, remote: clientPacket.LocalAddr()}
+				go func() { _ = h.Process(ctx, xnet.Network_UDP, bridge, dispatcher) }()
+				clients[i], err = client.New(client.Config{
+					Server: serverPacket.LocalAddr().String(), ServerName: "localhost", Path: "/api/sync",
+					PSK: user.key, TCPTransport: mode, InsecureSkipVerify: true,
+					ListenPacket: func(context.Context, string, string) (net.PacketConn, error) { return clientPacket, nil },
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer clients[i].Close()
+			}
+
+			var wg sync.WaitGroup
+			failures := make(chan error, len(users))
+			for i, user := range users {
+				wg.Add(1)
+				go func(c *client.Client, user struct {
+					email  string
+					key    []byte
+					target string
+				}) {
+					defer wg.Done()
+					dialCtx, stop := context.WithTimeout(ctx, 8*time.Second)
+					defer stop()
+					conn, err := c.DialContext(dialCtx, "tcp", user.target)
+					if err != nil {
+						failures <- fmt.Errorf("%s dial: %w", user.email, err)
+						return
+					}
+					defer conn.Close()
+					_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+					if _, err := conn.Write([]byte(user.email)); err != nil {
+						failures <- fmt.Errorf("%s write: %w", user.email, err)
+						return
+					}
+					echo := make([]byte, len(user.email))
+					if _, err := io.ReadFull(conn, echo); err != nil {
+						failures <- fmt.Errorf("%s read: %w", user.email, err)
+						return
+					}
+					if string(echo) != user.email {
+						failures <- fmt.Errorf("%s echo mismatch: %q", user.email, echo)
+					}
+				}(clients[i], user)
+			}
+			wg.Wait()
+			close(failures)
+			for err := range failures {
+				t.Error(err)
+			}
+			if t.Failed() {
+				return
+			}
+			seen := make(map[string]string)
+			for range users {
+				e := recvReview(t, events)
+				seen[e.target] = e.email
+			}
+			for _, user := range users {
+				if got := seen[user.target]; got != user.email {
+					t.Errorf("target %s attributed to %q, want %q", user.target, got, user.email)
+				}
+			}
+		})
 	}
 }
 

@@ -39,6 +39,21 @@ type udpRoutes struct {
 	wg         sync.WaitGroup
 }
 
+// A UDP association owns the route lifetime, while each authenticated packet
+// supplies the user identity. Prefer packet-scoped values over the physical
+// connection's inbound metadata so Xray does not lose the authenticated user.
+type udpRouteValueContext struct {
+	context.Context
+	packet context.Context
+}
+
+func (c udpRouteValueContext) Value(key any) any {
+	if value := c.packet.Value(key); value != nil {
+		return value
+	}
+	return c.Context.Value(key)
+}
+
 func newUDPRoutes(ctx context.Context, d routing.Dispatcher, codecs []*server.PlainUDPCodec, outer net.Conn) *udpRoutes {
 	ctx, cancel := context.WithCancel(ctx)
 	r := &udpRoutes{ctx: ctx, cancel: cancel, dispatcher: d, codecs: codecs, outer: outer, entries: make(map[udpRouteKey]*udpRoute)}
@@ -90,7 +105,7 @@ func (r *udpRoutes) Write(ctx context.Context, userIndex int, sid uint64, dest x
 		}
 		// Preserve packet policy, but bind its lifetime to the association and
 		// give this session/target its own mutable routing and sniffing state.
-		flowCtx, cancel := context.WithCancel(inboundValueContext{Context: r.ctx, values: ctx})
+		flowCtx, cancel := context.WithCancel(udpRouteValueContext{Context: r.ctx, packet: ctx})
 		link, err := r.dispatcher.Dispatch(requestContext(flowCtx), dest)
 		if err != nil {
 			cancel()
