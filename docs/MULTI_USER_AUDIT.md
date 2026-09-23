@@ -12,7 +12,7 @@
 
 ## 已运行的门禁
 
-- `go test -mod=mod ./internal/... ./pkg/... -count=1 -timeout=180s`：通过；dev 专用 Linux Actions 在 3ed74e3 上的 SDK 与注入 Xray `-race`、构建工作流均通过。最新上下文修复仍需再跑一次该门禁。
+- `go test -mod=mod ./internal/... ./pkg/... -count=1 -timeout=180s`：通过；dev 专用 Linux Actions 在 ad77d01 上的 SDK 与注入 Xray `-race`、构建工作流均通过（[运行记录](https://github.com/chitanda-project/chitanda/actions/runs/35828583289)）。
 - 注入 Xray 后 `go test -mod=mod ./proxy/chitanda -count=1 -timeout=180s`：通过；新增真实 H3/auto 双用户分别连通及同一入站并发身份测试，针对并发测试本地重复运行 10 次通过。
 - 真实 Xray JSON 入站 + Freedom 出站 + Policy/Stats 全栈回环：两个用户的 Stream TCP 与原生 UDP 上下行计数精确归属，本地重复运行 10 次通过。
 - `go test -mod=mod ./infra/conf -run Chitanda -count=1 -timeout=120s`：通过。
@@ -23,7 +23,7 @@
 ## 尚未通过的合入门禁
 
 1. 原实现的 30 用户最坏位置基准在 Windows/amd64、Hygon C86-3G 为 **56.7 µs/op、385 allocs/op**。服务端改为启动时预计算每个用户的掩码后，生产路径基准为 **19.8 µs/op、145 allocs/op**，达到本机 `<25 µs` 目标；仍需在目标 Linux/ARM 与指定负载下复测，不能将本机数据当成线上性能保证。
-2. 本地 Windows 无法运行 race；Linux Actions 在 3ed74e3 上已通过，但最新 UDP 上下文修复和并发/全栈回归尚待同一门禁验证。
-3. 目标环境真实 TCP/UDP 吞吐、尾延迟与单/多用户抓包差异未测。尤其 `auto` 的 UDP 入站先对所有用户试算原生 UDP，再识别 QUIC，可能在高用户数下显著消耗 CPU；需压测并剖析。
+2. `auto` 同端口的 H3/Plain-UDP 混合识别仍是明确性能阻断项：非 Plain-UDP 的 1200B 报文按 1/30/128 用户试解密，在本机 Windows/Hygon 分别约 **1.5/45/215 µs/包**（`BenchmarkDecodePacketMultiMiss`）。现有 `TestH3AndPlainUDPDemuxing` 明确覆盖同端口混合行为；绕过试解密会改变这一兼容性。需决定是保留混合并做有状态、可靠的 QUIC 分类，还是将 H2/H3/auto 限定为 H3 UDP 并明确迁移规则。未经选择不能用“直接跳过 Plain-UDP”冒充无损优化。
+3. 目标环境真实 TCP/UDP 吞吐、尾延迟与单/多用户抓包差异未测。本机微基准不能代替目标机器压测或抗封锁结论。
 
-结论：**未验收，不应合入 `main`**。已修正的安全问题可先保留在 `dev`；上述门禁通过后再进行 fast-forward 合入。
+结论：**未验收，不应合入 `main`**。功能与安全修复先保留在 `dev`；先确定同端口 H3/Plain-UDP 混合兼容与速度的取舍，再完成相应实现和目标环境性能门禁。

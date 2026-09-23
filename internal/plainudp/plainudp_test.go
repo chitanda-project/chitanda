@@ -3,6 +3,7 @@ package plainudp
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -10,6 +11,31 @@ import (
 
 	"github.com/violetaini/chitanda/internal/frame"
 )
+
+func BenchmarkDecodePacketMultiMiss(b *testing.B) {
+	for _, count := range []int{1, 30, 128} {
+		b.Run(fmt.Sprintf("users_%d", count), func(b *testing.B) {
+			codecs := make([]*Codec, count)
+			for i := range codecs {
+				key := []byte(fmt.Sprintf("plainudp-benchmark-user-%03d-secret-key", i))
+				var err error
+				codecs[i], err = NewCodec(key)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			packet := make([]byte, 1200)
+			packet[0] = 0xc0 // QUIC-like long header, not valid plain UDP.
+			now := time.Now()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, _, _, _, _, _, err := DecodePacketMulti(codecs, packet, DirClientToServer, now); err != ErrDecryptionFailed {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
 
 func TestPlainUDPRoundTripAndReplay(t *testing.T) {
 	psk := []byte(strings.Repeat("u", 32))
@@ -206,4 +232,3 @@ func TestPlainUDPZeroFingerprintAndEntropy(t *testing.T) {
 		t.Fatalf("entropy %.4f < 7.95: traffic is not indistinguishable from random noise", entropy)
 	}
 }
-
