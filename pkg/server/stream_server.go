@@ -22,6 +22,7 @@ type StreamServer struct {
 	psk          []byte
 	users        []UserKey
 	pskList      [][]byte
+	matcher      *rawstream.PreparedClientHelloMatcher
 	serverID     string
 	dialTarget   func(ctx context.Context, network, address string) (net.Conn, error)
 	listenersMu  sync.Mutex
@@ -80,10 +81,15 @@ func NewStreamServerWithUsers(users []UserKey, serverID string, replays *auth.Re
 		replays = auth.NewReplayCache()
 	}
 	validUsers, pskList := copyUserKeys(users)
+	matcher, err := rawstream.NewPreparedClientHelloMatcher(pskList, serverID)
+	if err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &StreamServer{
 		users:        validUsers,
 		pskList:      pskList,
+		matcher:      matcher,
 		serverID:     serverID,
 		dialTarget:   dialTarget,
 		replays:      replays,
@@ -281,7 +287,7 @@ func (s *StreamServer) handleConn(ctx context.Context, conn net.Conn) {
 			matchedUser = &UserKey{PSK: s.psk}
 		}
 	} else {
-		matchedIdx, cNonce, tStamp, err := rawstream.ReadAndMatchPolymorphicClientHello(conn, s.pskList, s.serverID, time.Now())
+		matchedIdx, cNonce, tStamp, err := s.matcher.ReadAndMatch(conn, time.Now())
 		if err != nil || matchedIdx < 0 || matchedIdx >= len(s.users) {
 			return
 		}

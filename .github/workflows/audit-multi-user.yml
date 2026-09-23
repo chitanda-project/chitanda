@@ -39,4 +39,4 @@ jobs:
           go test -race ./infra/conf -run Chitanda -count=1 -timeout=120s
       - name: Build injected Xray
         working-directory: upstream_src
-        run: go build ./main
+        run: go build -o /tmp/chitanda-xray ./main

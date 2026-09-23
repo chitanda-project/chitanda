@@ -85,13 +85,51 @@ func BenchmarkMatchPolymorphicClientHello(b *testing.B) {
 		b.Fatalf("CreatePolymorphicClientHello failed: %v", err)
 	}
 	header := cHello[:49]
+	matcher, err := NewPreparedClientHelloMatcher(keys, serverID)
+	if err != nil {
+		b.Fatal(err)
+	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		matchedIdx, _, _, _, err := MatchPolymorphicClientHelloHeader(header, keys, serverID, now)
+		matchedIdx, _, _, _, err := matcher.MatchHeader(header, now)
 		if err != nil || matchedIdx != targetUserIdx {
 			b.Fatalf("unexpected match result: idx=%d, err=%v", matchedIdx, err)
 		}
+	}
+}
+
+func TestPreparedClientHelloMatcherMatchesLegacy(t *testing.T) {
+	now := time.Now()
+	keys := [][]byte{
+		[]byte("alice-key-at-least-32-bytes-long!"),
+		[]byte("bob---key-at-least-32-bytes-long!"),
+	}
+	matcher, err := NewPreparedClientHelloMatcher(keys, "prepared-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, key := range keys {
+		record, _, _, err := CreatePolymorphicClientHello(key, "prepared-test", now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantIdx, wantPad, wantNonce, wantTS, wantErr := MatchPolymorphicClientHelloHeader(record[:49], keys, "prepared-test", now)
+		gotIdx, gotPad, gotNonce, gotTS, gotErr := matcher.MatchHeader(record[:49], now)
+		if gotErr != wantErr || gotIdx != wantIdx || gotIdx != i || gotPad != wantPad || gotNonce != wantNonce || gotTS != wantTS {
+			t.Fatalf("user %d: prepared=(%d,%d,%v,%d,%v), legacy=(%d,%d,%v,%d,%v)", i, gotIdx, gotPad, gotNonce, gotTS, gotErr, wantIdx, wantPad, wantNonce, wantTS, wantErr)
+		}
+		readIdx, readNonce, readTS, err := matcher.ReadAndMatch(bytes.NewReader(record), now)
+		if err != nil || readIdx != i || readNonce != wantNonce || readTS != wantTS {
+			t.Fatalf("user %d full read: index=%d err=%v", i, readIdx, err)
+		}
+	}
+	bad, _, _, err := CreatePolymorphicClientHello([]byte("unknown-key-at-least-32-bytes-long!"), "prepared-test", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, err := matcher.MatchHeader(bad[:49], now); err != ErrInvalidClientAuth {
+		t.Fatalf("unknown key accepted: %v", err)
 	}
 }
 

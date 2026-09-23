@@ -337,6 +337,92 @@ func MatchPolymorphicClientHelloHeader(header []byte, keys [][]byte, serverID st
 	return -1, 0, clientNonce, 0, ErrInvalidClientAuth
 }
 
+// PreparedClientHelloMatcher computes the per-user padding masks once when the
+// listener starts. Its fields are immutable and safe for concurrent handshakes.
+type PreparedClientHelloMatcher struct {
+	keys        [][]byte
+	clientMasks []byte
+	serverID    string
+}
+
+func NewPreparedClientHelloMatcher(keys [][]byte, serverID string) (*PreparedClientHelloMatcher, error) {
+	if len(keys) == 0 {
+		return nil, errors.New("rawstream: at least one PSK is required")
+	}
+	m := &PreparedClientHelloMatcher{
+		keys: make([][]byte, len(keys)), clientMasks: make([]byte, len(keys)), serverID: serverID,
+	}
+	for i, key := range keys {
+		if len(key) < 32 {
+			return nil, errors.New("rawstream: PSK must be at least 32 bytes")
+		}
+		m.keys[i] = append([]byte(nil), key...)
+		m.clientMasks[i], _ = DerivePolymorphicMasks(m.keys[i], serverID)
+	}
+	return m, nil
+}
+
+func (m *PreparedClientHelloMatcher) MatchHeader(header []byte, now time.Time) (matchedIndex int, padLen int, clientNonce [24]byte, timestamp uint64, err error) {
+	if len(header) < 1+ClientHelloSize {
+		return -1, 0, clientNonce, 0, ErrInvalidRecordLen
+	}
+	copy(clientNonce[:], header[9:33])
+	clientTag := header[33:49]
+	nowSec := uint64(now.Unix())
+	expiredFound := false
+	for i, psk := range m.keys {
+		pLen := int(header[0] ^ m.clientMasks[i])
+		if pLen > MaxPolymorphicPadding {
+			continue
+		}
+		tsMask := deriveTimestampMask(psk, clientNonce)
+		var tsBuf [8]byte
+		for j := range tsBuf {
+			tsBuf[j] = header[1+j] ^ tsMask[j]
+		}
+		mac := hmac.New(sha256.New, psk)
+		mac.Write([]byte(DomainClientHello))
+		if m.serverID != "" {
+			mac.Write([]byte(m.serverID))
+		}
+		mac.Write(tsBuf[:])
+		mac.Write(clientNonce[:])
+		mac.Write([]byte{byte(pLen)})
+		expectedTag := mac.Sum(nil)
+		if !hmac.Equal(clientTag, expectedTag[:16]) {
+			continue
+		}
+		ts := binary.BigEndian.Uint64(tsBuf[:])
+		diff := int64(nowSec) - int64(ts)
+		if diff < -int64(MaxTimestampSkew/time.Second) || diff > int64(MaxTimestampSkew/time.Second) {
+			expiredFound = true
+			continue
+		}
+		return i, pLen, clientNonce, ts, nil
+	}
+	if expiredFound {
+		return -1, 0, clientNonce, 0, ErrTimestampExpired
+	}
+	return -1, 0, clientNonce, 0, ErrInvalidClientAuth
+}
+
+func (m *PreparedClientHelloMatcher) ReadAndMatch(r io.Reader, now time.Time) (matchedIndex int, clientNonce [24]byte, timestamp uint64, err error) {
+	var header [1 + ClientHelloSize]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return -1, clientNonce, 0, err
+	}
+	matchedIdx, padLen, nonce, ts, err := m.MatchHeader(header[:], now)
+	if err != nil {
+		return -1, clientNonce, 0, err
+	}
+	if padLen > 0 {
+		var pad [MaxPolymorphicPadding]byte
+		if _, err := io.ReadFull(r, pad[:padLen]); err != nil {
+			return -1, clientNonce, 0, err
+		}
+	}
+	return matchedIdx, nonce, ts, nil
+}
 
 // ReadAndMatchPolymorphicClientHello reads the fixed 49-byte header from r, matches against multiple keys,
 // and if matched, reads the trailing padBytes (if padLen > 0).
@@ -373,7 +459,6 @@ func ReadAndVerifyPolymorphicClientHello(r io.Reader, psk []byte, serverID strin
 	}
 	return cNonce, ts, nil
 }
-
 
 // Derive0RTTKey derives a 16-byte key for AES-128-GCM 0-RTT frame encryption.
 func Derive0RTTKey(psk []byte, serverID string, timestamp uint64, clientNonce [24]byte) ([16]byte, error) {

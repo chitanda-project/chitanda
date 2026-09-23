@@ -11,7 +11,7 @@
 
 ## 已运行的门禁
 
-- `go test -mod=mod ./internal/... ./pkg/... -count=1 -timeout=180s`：通过。
+- `go test -mod=mod ./internal/... ./pkg/... -count=1 -timeout=180s`：通过；dev 专用 Linux Actions 的 SDK 与注入 Xray `-race` 测试也已通过（首次构建步骤因输出名与 `main/` 目录冲突而失败，工作流已改为显式 `-o`，待重跑）。
 - 注入 Xray 后 `go test -mod=mod ./proxy/chitanda -count=1 -timeout=180s`：通过；新增真实 H3/auto 双密钥分别连通与身份归属测试，针对该测试的本地运行也已通过。
 - `go test -mod=mod ./infra/conf -run Chitanda -count=1 -timeout=120s`：通过。
 - `go vet`（SDK、Xray 适配与配置包）及 `go build -mod=mod ./main`（注入 Xray）：通过。
@@ -20,9 +20,9 @@
 
 ## 尚未通过的合入门禁
 
-1. 计划的 `BenchmarkMatchPolymorphicClientHello` 30 用户最坏位置 `<25 µs`：本机 Windows/amd64、Hygon C86-3G 实测约 **56.7 µs/op、385 allocs/op**。需在目标 Linux/ARM 与指定负载下复测，并决定优化实现还是正式修订目标；不能仅删掉失败的指标。
+1. 原实现的 30 用户最坏位置基准在 Windows/amd64、Hygon C86-3G 为 **56.7 µs/op、385 allocs/op**。服务端改为启动时预计算每个用户的掩码后，生产路径基准为 **19.8 µs/op、145 allocs/op**，达到本机 `<25 µs` 目标；仍需在目标 Linux/ARM 与指定负载下复测，不能将本机数据当成线上性能保证。
 2. H3/auto 已有两个用户分别连通的端到端回归，但**同一入站的双用户并发**与真实 Xray Policy 计费仍无完整覆盖。现有测试另覆盖通用 HTTP 身份和 Xray Stats 机制，组合风险仍在。
-3. 当前 Windows 环境 `CGO_ENABLED=0`、无可用 Linux 运行环境；无法执行计划要求的 `go test -race`。需在 Linux CI 或隔离测试机对 SDK 与注入 Xray 适配运行 race 门禁。
+3. 本地 Windows 无法运行 race；Linux Actions 的 SDK 与注入 Xray race 已通过，但整个工作流仍需在修正构建命令后重跑为绿色。
 4. 目标环境真实 TCP/UDP 吞吐、尾延迟与单/多用户抓包差异未测。尤其 `auto` 的 UDP 入站先对所有用户试算原生 UDP，再识别 QUIC，可能在高用户数下显著消耗 CPU；需压测并剖析。
 
 结论：**未验收，不应合入 `main`**。已修正的安全问题可先保留在 `dev`；上述门禁通过后再进行 fast-forward 合入。
