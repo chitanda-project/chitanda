@@ -10,7 +10,8 @@
 - **解耦 UDP 路径以消除试解密开销（方案 A 落地）**：用户确认生产部署（如 3X-UI / Xray 标准实践）中各入站端口均有独立确定的协议与 Transport，无需在同端口混跑 Stream 与 H3 UDP。因此在 `integration/xray/inbound.go` 中完成路径分立：
   - `h2`、`h3` 与 `auto` 入站：UDP 路径专供 HTTP/3 (QUIC Datagrams)，收到 UDP 报文直接投递 `vconn`，**Plain-UDP 试解密开销彻底归零（0 µs）**，完全解除了多用户下的 UDP 性能阻断项；
   - `stream`、`h1` 与 `plain-h1` 入站：UDP 路径专供 Native Plain-UDP，仅在此类入站中初始化 `userCodecs` 并按包级多用户解密路由；
-  - `TestH3AndPlainUDPDemuxing` 同步更新为分协议入站测试，回归 100% 通过。
+  - `TestH3AndPlainUDPDemuxing` 使用真实的 `auto` 与 `stream` 实例断言底层状态，发送合法未改坏的 Plain-UDP 密文以因果序（FIFO Causal Flush）严格断言不会发生试解密与串账，杜绝任意 `50ms` 盲等；
+  - `virtualPacketConn` 将生产收包路径的统计操作改为仅供测试的钩子函数 `onFeed`（生产环境为 `nil` 零开销），彻底规避每包原子增量的吞吐损耗。
 
 ## 已运行的门禁
 

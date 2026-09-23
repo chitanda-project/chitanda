@@ -231,6 +231,14 @@ func TestH3AndPlainUDPDemuxing(t *testing.T) {
 		t.Fatal("auto inbound must initialize h3Server and vconn")
 	}
 
+	quicFed := make(chan struct{}, 1)
+	hAuto.vconn.onFeed = func() {
+		select {
+		case quicFed <- struct{}{}:
+		default:
+		}
+	}
+
 	quicConn := &mockStatConn{
 		remoteAddr: clientAddr,
 		localAddr:  &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 443},
@@ -239,34 +247,41 @@ func TestH3AndPlainUDPDemuxing(t *testing.T) {
 		_ = hAuto.handleUDP(context.Background(), quicConn, mockDispatcher)
 	}()
 
-	// 1a. Negative test with authentic Plain-UDP packet:
-	// Send an uncorrupted, valid Plain-UDP packet (plainPkt) to the auto inbound.
-	// In the old implementation (which performed trial decryption on every packet),
-	// this authentic Plain-UDP packet WOULD decrypt and dispatch to upstream.
-	// In the new decoupled implementation, Plain-UDP trial decryption is eliminated (0 µs overhead);
-	// thus, the packet is NOT trial-decrypted and plainDispatched remains false.
+	// Push authentic Plain-UDP packet first, followed immediately by valid QUIC packet.
+	// Because handleUDP processes packets strictly in FIFO order from quicConn,
+	// when the trailing QUIC packet arrives and triggers onFeed, the leading Plain-UDP
+	// packet is guaranteed to have already been evaluated and dropped.
 	quicConn.push(buf.MergeBytes(nil, plainPkt)...)
-	time.Sleep(50 * time.Millisecond)
-	if plainDispatched.Load() {
-		t.Fatal("auto inbound unexpectedly trial-decrypted and dispatched authentic Plain-UDP packet")
-	}
-
-	// 1b. Positive test: send valid QUIC packet -> should be fed directly into vconn.
-	// The atomic fedCount eliminates any race with the live h3Server's background Serve loop.
-	initFed := hAuto.vconn.fedCount()
 	quicConn.push(buf.MergeBytes(nil, quicPkt)...)
 
-	deadline := time.Now().Add(2 * time.Second)
-	for hAuto.vconn.fedCount() == initFed && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if hAuto.vconn.fedCount() == initFed {
+	select {
+	case <-quicFed:
+		// Trailing QUIC packet was processed and fed to vconn!
+	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for QUIC packet to be fed to vconn")
+	}
+
+	// Strictly assert with causal ordering (zero arbitrary sleep):
+	// Even though an authentic, valid Plain-UDP packet was received right before the QUIC packet,
+	// it was NEVER trial-decrypted or dispatched to mockDispatcher.
+	if plainDispatched.Load() {
+		t.Fatal("auto inbound unexpectedly trial-decrypted and dispatched authentic Plain-UDP packet")
 	}
 	_ = quicConn.Close()
 
 	// 2. Stream Inbound handles Plain-UDP packets via dispatcher and refuses QUIC packets.
-	hStream, err := newTestInboundHandler(t, ctx, &InboundConfig{
+	var streamDispatchCount atomic.Int32
+	mockDispatcherStream := &mockTestDispatcher{
+		dispatchFn: func(ctx context.Context, dest xnet.Destination) (*transport.Link, error) {
+			if dest.Network == xnet.Network_UDP && dest.Address.String() == "8.8.8.8" {
+				streamDispatchCount.Add(1)
+			}
+			pReader, pWriter := pipe.New()
+			return &transport.Link{Reader: pReader, Writer: pWriter}, nil
+		},
+	}
+	ctxStream := newTestContextWithDispatcher(t, mockDispatcherStream)
+	hStream, err := newTestInboundHandler(t, ctxStream, &InboundConfig{
 		Psk:       string(psk),
 		Path:      "/api/sync",
 		Transport: "stream",
@@ -288,28 +303,24 @@ func TestH3AndPlainUDPDemuxing(t *testing.T) {
 		localAddr:  &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8443},
 	}
 	go func() {
-		_ = hStream.handleUDP(context.Background(), plainConn, mockDispatcher)
+		_ = hStream.handleUDP(context.Background(), plainConn, mockDispatcherStream)
 	}()
 
-	// 2a. Positive: send authentic Plain-UDP packet -> should be dispatched
+	// Push invalid/QUIC packet first, followed immediately by authentic Plain-UDP packet.
+	// In FIFO order, when plainPkt triggers dispatch, quicPkt has already been processed.
+	plainConn.push(buf.MergeBytes(nil, quicPkt)...)
 	plainConn.push(buf.MergeBytes(nil, plainPkt)...)
 
-	deadline = time.Now().Add(2 * time.Second)
-	for !plainDispatched.Load() && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	deadline := time.Now().Add(2 * time.Second)
+	for streamDispatchCount.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
 	}
-	if !plainDispatched.Load() {
+	if streamDispatchCount.Load() == 0 {
 		t.Fatal("Plain-UDP packet was not dispatched to upstream")
 	}
-
-	// 2b. Negative: send QUIC packet (wrong transport) to stream inbound.
-	// Reset plainDispatched and verify dispatcher is NOT called.
-	plainDispatched.Store(false)
-	plainConn.push(buf.MergeBytes(nil, quicPkt)...)
-
-	time.Sleep(50 * time.Millisecond)
-	if plainDispatched.Load() {
-		t.Fatal("stream inbound unexpectedly dispatched invalid/QUIC packet to upstream")
+	// The dispatch count must be EXACTLY 1 (for plainPkt only, proving quicPkt was dropped without dispatch)
+	if streamDispatchCount.Load() != 1 {
+		t.Fatalf("expected exactly 1 dispatch for plain packet, got %d (quic packet dispatched unexpectedly)", streamDispatchCount.Load())
 	}
 
 	_ = plainConn.Close()

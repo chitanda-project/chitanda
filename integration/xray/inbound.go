@@ -602,7 +602,7 @@ type virtualPacketConn struct {
 	recvCh    chan *packetItem
 	closeCh   chan struct{}
 	closed    atomic.Bool
-	fed       atomic.Uint64
+	onFeed    func() // test hook; nil in production to avoid atomic overhead
 	localAddr net.Addr
 
 	mu      sync.RWMutex
@@ -737,17 +737,15 @@ func (c *virtualPacketConn) feed(data []byte, addr net.Addr) {
 	if c.closed.Load() {
 		return
 	}
-	c.fed.Add(1)
+	if c.onFeed != nil {
+		c.onFeed()
+	}
 	buf := make([]byte, len(data))
 	copy(buf, data)
 	select {
 	case c.recvCh <- &packetItem{data: buf, addr: addr}:
 	default:
 	}
-}
-
-func (c *virtualPacketConn) fedCount() uint64 {
-	return c.fed.Load()
 }
 
 func (c *virtualPacketConn) registerConn(key string, conn stat.Connection, contexts ...context.Context) {
