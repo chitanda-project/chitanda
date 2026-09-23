@@ -1,0 +1,42 @@
+name: Audit multi-user on dev
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sdk-race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -mod=mod -race ./internal/... ./pkg/... -count=1 -timeout=180s
+
+  xray-race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Inject into pinned upstream Xray
+        run: |
+          git clone --depth 1 --branch v1.260327.0 https://github.com/XTLS/Xray-core.git upstream_src
+          python3 scripts/inject-xray.py upstream_src "$GITHUB_WORKSPACE"
+          cd upstream_src
+          go mod edit -replace="github.com/violetaini/chitanda=$GITHUB_WORKSPACE"
+          go mod tidy
+      - name: Xray Chitanda adapter and configuration race tests
+        working-directory: upstream_src
+        run: |
+          go test -race ./proxy/chitanda -count=1 -timeout=180s
+          go test -race ./infra/conf -run Chitanda -count=1 -timeout=120s
+      - name: Build injected Xray
+        working-directory: upstream_src
+        run: go build ./main

@@ -1,6 +1,6 @@
 # Chitanda 协议多用户服务端开发计划 (v2 修订版)
 
-> 状态（审计中）：以下 Proposed Changes 保留原始施工计划，并非已验收事实。当前代码已覆盖多用户身份与原生 UDP，但 30 用户最坏位置握手匹配在 Windows/Hygon 上测得约 56.7 µs（原目标 <25 µs）；H3/auto 双用户端到端并发、Linux race 与目标机器性能仍待验证。详见 `docs/MULTI_USER_AUDIT.md`。
+> 状态（审计中）：以下 Proposed Changes 保留原始施工计划，并非已验收事实。当前代码已覆盖多用户身份与原生 UDP；H3/auto 已有两用户分别连通回归，但并发计费尚未验收。30 用户最坏位置握手匹配在 Windows/Hygon 上测得约 56.7 µs（原目标 <25 µs）；Linux race 与目标机器性能仍待验证。详见 `docs/MULTI_USER_AUDIT.md`。
 
 本文档记录 Chitanda 服务端多用户识别与 Xray 按用户计费的实施设计。此次改动不更改客户端线格式；旧客户端在其 PSK 仍被服务端配置保留时可继续使用。抗审查性与性能需通过独立抓包和基准测试评估，不能由线格式不变直接推断。
 

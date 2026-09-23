@@ -147,6 +147,83 @@ func TestXrayInboundMultiUserHTTP(t *testing.T) {
 	}
 }
 
+func TestXrayInboundMultiUserH3AndAuto(t *testing.T) {
+	users := []struct {
+		email string
+		key   []byte
+	}{
+		{"alice", []byte("alice-key-at-least-32-bytes-long!")},
+		{"bob", []byte("bob---key-at-least-32-bytes-long!")},
+	}
+	for _, mode := range []string{"h3", "auto"} {
+		for _, expected := range users {
+			t.Run(mode+"/"+expected.email, func(t *testing.T) {
+				serverPacket, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer serverPacket.Close()
+				clientPacket, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer clientPacket.Close()
+
+				identities := make(chan string, 2)
+				dispatcher := &mockTestDispatcher{dispatchFn: func(ctx context.Context, _ xnet.Destination) (*transport.Link, error) {
+					identity := ""
+					if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.User != nil {
+						identity = inbound.User.Email
+					}
+					identities <- identity
+					reader, writer := pipe.New()
+					return &transport.Link{Reader: reader, Writer: writer}, nil
+				}}
+				h, err := newTestInboundHandler(t, newTestContextWithDispatcher(t, dispatcher), &InboundConfig{
+					Path: "/api/sync", Transport: mode, StrictSni: "localhost",
+					Users: []*User{{Email: users[0].email, Psk: string(users[0].key)}, {Email: users[1].email, Psk: string(users[1].key)}},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer h.Close()
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				bridge := &reviewUDPBridge{UDPConn: serverPacket, remote: clientPacket.LocalAddr()}
+				go func() { _ = h.Process(ctx, xnet.Network_UDP, bridge, dispatcher) }()
+
+				c, err := client.New(client.Config{
+					Server: serverPacket.LocalAddr().String(), ServerName: "localhost", Path: "/api/sync",
+					PSK: expected.key, TCPTransport: mode, InsecureSkipVerify: true,
+					ListenPacket: func(context.Context, string, string) (net.PacketConn, error) { return clientPacket, nil },
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer c.Close()
+				dialCtx, stop := context.WithTimeout(ctx, 8*time.Second)
+				defer stop()
+				conn, err := c.DialContext(dialCtx, "tcp", "192.0.2.1:443")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+				if _, err := conn.Write([]byte("ping")); err != nil {
+					t.Fatal(err)
+				}
+				var echo [4]byte
+				if _, err := io.ReadFull(conn, echo[:]); err != nil || string(echo[:]) != "ping" {
+					t.Fatalf("H3 echo=%q err=%v", echo[:], err)
+				}
+				if got := recvReview(t, identities); got != expected.email {
+					t.Fatalf("user=%q, want %q", got, expected.email)
+				}
+			})
+		}
+	}
+}
+
 func TestXrayInboundRejectsInvalidMultiUserProto(t *testing.T) {
 	key := "0123456789abcdef0123456789abcdef"
 	for name, cfg := range map[string]*InboundConfig{
