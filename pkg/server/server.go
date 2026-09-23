@@ -5,10 +5,12 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,7 +41,52 @@ const (
 type UserKey struct {
 	Email string
 	PSK   []byte
-	Level int32
+	Level uint32
+}
+
+const MaxUserKeys = 128
+
+// ValidateUserKeys rejects ambiguous or unusable identities before a listener
+// starts. A single anonymous key is reserved for the legacy single-PSK API.
+func ValidateUserKeys(users []UserKey) error {
+	if len(users) == 0 || len(users) > MaxUserKeys {
+		return fmt.Errorf("chitanda: user count must be between 1 and %d", MaxUserKeys)
+	}
+	seenEmails := make(map[string]struct{}, len(users))
+	seenKeys := make(map[string]struct{}, len(users))
+	for i, user := range users {
+		email := strings.TrimSpace(user.Email)
+		if len(users) > 1 && email == "" {
+			return fmt.Errorf("chitanda: user %d has no email", i)
+		}
+		if email != "" {
+			key := strings.ToLower(email)
+			if _, exists := seenEmails[key]; exists {
+				return fmt.Errorf("chitanda: duplicate user email %q", email)
+			}
+			seenEmails[key] = struct{}{}
+		}
+		if len(user.PSK) < 32 {
+			return fmt.Errorf("chitanda: user %d PSK must contain at least 32 bytes", i)
+		}
+		if _, exists := seenKeys[string(user.PSK)]; exists {
+			return fmt.Errorf("chitanda: duplicate PSK for user %d", i)
+		}
+		seenKeys[string(user.PSK)] = struct{}{}
+	}
+	return nil
+}
+
+func copyUserKeys(users []UserKey) ([]UserKey, [][]byte) {
+	copied := make([]UserKey, len(users))
+	keys := make([][]byte, len(users))
+	for i, user := range users {
+		copied[i] = user
+		copied[i].Email = strings.TrimSpace(user.Email)
+		copied[i].PSK = append([]byte(nil), user.PSK...)
+		keys[i] = copied[i].PSK
+	}
+	return copied, keys
 }
 
 type userContextKey struct{}
@@ -76,6 +123,7 @@ type Server struct {
 
 // NewServer creates a new Server instance with a single PSK.
 func NewServer(path string, psk []byte, replays *auth.ReplayCache, fallback http.Handler, udpTargetBuffer int) *Server {
+	psk = append([]byte(nil), psk...)
 	s := &Server{
 		path:            path,
 		psk:             psk,
@@ -92,15 +140,11 @@ func NewServer(path string, psk []byte, replays *auth.ReplayCache, fallback http
 }
 
 // NewServerWithUsers creates a new Server instance supporting multiple users.
-func NewServerWithUsers(path string, users []UserKey, replays *auth.ReplayCache, fallback http.Handler, udpTargetBuffer int) *Server {
-	validUsers := make([]UserKey, 0, len(users))
-	pskList := make([][]byte, 0, len(users))
-	for _, u := range users {
-		if len(u.PSK) >= 32 {
-			validUsers = append(validUsers, u)
-			pskList = append(pskList, u.PSK)
-		}
+func NewServerWithUsers(path string, users []UserKey, replays *auth.ReplayCache, fallback http.Handler, udpTargetBuffer int) (*Server, error) {
+	if err := ValidateUserKeys(users); err != nil {
+		return nil, err
 	}
+	validUsers, pskList := copyUserKeys(users)
 	s := &Server{
 		path:            path,
 		users:           validUsers,
@@ -113,9 +157,8 @@ func NewServerWithUsers(path string, users []UserKey, replays *auth.ReplayCache,
 	if len(validUsers) == 1 {
 		s.psk = validUsers[0].PSK
 	}
-	return s
+	return s, nil
 }
-
 
 // SetDialTargetForTest allows overriding upstream dialer in tests (e.g. for loopback echo servers).
 func (s *Server) SetDialTargetForTest(fn func(ctx context.Context, address string) (net.Conn, error)) {
@@ -367,7 +410,6 @@ func (s *Server) servePlainH1(w http.ResponseWriter, r *http.Request) {
 
 	reqCtx := ContextWithUser(r.Context(), matchedUser)
 	r = r.WithContext(reqCtx)
-
 
 	// 4. Read 0-RTT OPEN frame from Chunk 2
 	var wireLenBuf [2]byte

@@ -3,6 +3,7 @@ package conf
 import (
 	"fmt"
 	"github.com/violetaini/chitanda/pkg/client"
+	"github.com/violetaini/chitanda/pkg/server"
 	"github.com/xtls/xray-core/proxy/chitanda"
 	"google.golang.org/protobuf/proto"
 	"net"
@@ -70,11 +71,17 @@ func (c *ChitandaInboundConfig) Build() (proto.Message, error) {
 
 	var protoUsers []*chitanda.User
 	if len(c.Users) > 0 {
+		if c.PSK != "" {
+			return nil, fmt.Errorf("chitanda: psk and users cannot be configured together")
+		}
+		if len(c.Users) > server.MaxUserKeys {
+			return nil, fmt.Errorf("chitanda: no more than %d users are supported", server.MaxUserKeys)
+		}
 		seenEmails := make(map[string]struct{})
 		seenPSKs := make(map[string]struct{})
 		for idx, u := range c.Users {
 			if u == nil {
-				continue
+				return nil, fmt.Errorf("chitanda: user at index %d is nil", idx)
 			}
 			email := strings.TrimSpace(u.Email)
 			if email == "" {

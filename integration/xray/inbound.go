@@ -40,18 +40,50 @@ type InboundHandler struct {
 	streamServer *server.StreamServer
 	h3Server     *http3.Server
 	vconn        *virtualPacketConn
-	plainCodec   *server.PlainUDPCodec
 	userCodecs   []*server.PlainUDPCodec
 	replays      *auth.ReplayCache
 	userReplays  []udpReplayRegistry
 	dispatcher   routing.Dispatcher
 	ctx          context.Context
 	cancel       context.CancelFunc
-	mu           sync.Mutex
 	httpSlots    chan struct{}
 }
 
 func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHandler, error) {
+	if config == nil {
+		return nil, fmt.Errorf("chitanda: inbound config is required")
+	}
+	if len(config.Users) > 0 && config.Psk != "" {
+		return nil, fmt.Errorf("chitanda: psk and users cannot be configured together")
+	}
+	if len(config.Users) == 0 && len(config.Psk) < 32 {
+		return nil, fmt.Errorf("chitanda: psk must contain at least 32 bytes")
+	}
+	switch config.Transport {
+	case "", "stream", "h1", "plain-h1", "h2", "h3", "auto":
+	default:
+		return nil, fmt.Errorf("chitanda: unsupported transport %q", config.Transport)
+	}
+	var serverUsers []server.UserKey
+	if len(config.Users) > 0 {
+		serverUsers = make([]server.UserKey, 0, len(config.Users))
+		for i, user := range config.Users {
+			if user == nil {
+				return nil, fmt.Errorf("chitanda: user %d is nil", i)
+			}
+			email := strings.TrimSpace(user.Email)
+			if email == "" {
+				return nil, fmt.Errorf("chitanda: user %d has no email", i)
+			}
+			serverUsers = append(serverUsers, server.UserKey{Email: email, PSK: []byte(user.Psk), Level: user.Level})
+		}
+	} else {
+		serverUsers = []server.UserKey{{PSK: []byte(config.Psk)}}
+	}
+	if err := server.ValidateUserKeys(serverUsers); err != nil {
+		return nil, err
+	}
+
 	v := core.MustFromContext(ctx)
 	dispatcher := v.GetFeature(routing.DispatcherType()).(routing.Dispatcher)
 
@@ -76,28 +108,6 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 		fbHandler = fb
 	}
 
-	var serverUsers []server.UserKey
-	if len(config.Users) > 0 {
-		serverUsers = make([]server.UserKey, 0, len(config.Users))
-		for _, u := range config.Users {
-			if u != nil && len(u.Psk) >= 32 {
-				serverUsers = append(serverUsers, server.UserKey{
-					Email: u.Email,
-					PSK:   []byte(u.Psk),
-					Level: int32(u.Level),
-				})
-			}
-		}
-	} else if len(config.Psk) >= 32 {
-		serverUsers = []server.UserKey{
-			{
-				Email: "",
-				PSK:   []byte(config.Psk),
-				Level: 0,
-			},
-		}
-	}
-
 	dialTargetFn := func(ctx context.Context, network, address string) (net.Conn, error) {
 		if network == "" {
 			network = "tcp"
@@ -112,7 +122,7 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 		if u, ok := server.UserFromContext(ctx); ok && u != nil && u.Email != "" {
 			inbound.User = &protocol.MemoryUser{
 				Email: u.Email,
-				Level: uint32(u.Level),
+				Level: u.Level,
 			}
 		}
 
@@ -127,16 +137,32 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 		return newPipeConn(link.Reader, link.Writer), nil
 	}
 
-	srv := server.NewServerWithUsers(config.Path, serverUsers, replays, fbHandler, 1024)
+	var srv *server.Server
+	var streamSrv *server.StreamServer
+	if len(config.Users) > 0 {
+		srv, err = server.NewServerWithUsers(config.Path, serverUsers, replays, fbHandler, 1024)
+		if err != nil {
+			_ = replays.Close()
+			return nil, err
+		}
+		streamSrv, err = server.NewStreamServerWithUsers(serverUsers, config.ServerId, replays, func(ctx context.Context, network, address string) (net.Conn, error) {
+			return dialTargetFn(ctx, network, address)
+		})
+		if err != nil {
+			_ = replays.Close()
+			return nil, err
+		}
+	} else {
+		srv = server.NewServer(config.Path, serverUsers[0].PSK, replays, fbHandler, 1024)
+		streamSrv = server.NewStreamServer(serverUsers[0].PSK, config.ServerId, replays, func(ctx context.Context, network, address string) (net.Conn, error) {
+			return dialTargetFn(ctx, network, address)
+		})
+	}
 	srv.SetDialTargetForTest(func(ctx context.Context, address string) (net.Conn, error) {
 		return dialTargetFn(ctx, "tcp", address)
 	})
 	srv.SetDialUDP(func(ctx context.Context, address string) (net.Conn, error) {
 		return dialTargetFn(ctx, "udp", address)
-	})
-
-	streamSrv := server.NewStreamServerWithUsers(serverUsers, config.ServerId, replays, func(ctx context.Context, network, address string) (net.Conn, error) {
-		return dialTargetFn(ctx, network, address)
 	})
 
 	userCodecs := make([]*server.PlainUDPCodec, 0, len(serverUsers))
@@ -341,22 +367,10 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 		defer stopHandler()
 	}
 	userCodecs := h.userCodecs
-	if len(userCodecs) == 0 && h.plainCodec != nil {
-		userCodecs = []*server.PlainUDPCodec{h.plainCodec}
-	}
-	h.mu.Lock()
-	if len(h.userReplays) < len(userCodecs) {
-		replays := make([]udpReplayRegistry, len(userCodecs))
-		copy(replays, h.userReplays)
-		for i := len(h.userReplays); i < len(userCodecs); i++ {
-			if h.ctx != nil {
-				go replays[i].run(h.ctx)
-			}
-		}
-		h.userReplays = replays
-	}
 	userReplays := h.userReplays
-	h.mu.Unlock()
+	if len(userCodecs) != len(userReplays) {
+		return fmt.Errorf("chitanda: UDP codec/replay registry mismatch")
+	}
 	if len(userCodecs) == 0 && h.h3Server == nil {
 		return fmt.Errorf("neither chitanda plain-udp nor h3 initialized")
 	}
@@ -420,7 +434,7 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 					if matchedIdx >= 0 && matchedIdx < len(h.users) && h.users[matchedIdx].Email != "" {
 						copyInbound.User = &protocol.MemoryUser{
 							Email: h.users[matchedIdx].Email,
-							Level: uint32(h.users[matchedIdx].Level),
+							Level: h.users[matchedIdx].Level,
 						}
 					}
 					packetCtx = session.ContextWithInbound(ctx, &copyInbound)

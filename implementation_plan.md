@@ -1,6 +1,8 @@
 # Chitanda 协议多用户服务端开发计划 (v2 修订版)
 
-本文档是针对 Chitanda 协议引入**服务端多用户识别与 Xray 独立流量计费**的即时可执行技术开发计划。在维持现有**零静态特征、抗审查离散握手**与**全线存量客户端 100% 向后兼容（0 代码改动）**的前提下，分阶段改造底层协议库与 Xray 集成层。
+> 状态（审计中）：以下 Proposed Changes 保留原始施工计划，并非已验收事实。当前代码已覆盖多用户身份与原生 UDP，但 30 用户最坏位置握手匹配在 Windows/Hygon 上测得约 56.7 µs（原目标 <25 µs）；H3/auto 双用户端到端并发、Linux race 与目标机器性能仍待验证。详见 `docs/MULTI_USER_AUDIT.md`。
+
+本文档记录 Chitanda 服务端多用户识别与 Xray 按用户计费的实施设计。此次改动不更改客户端线格式；旧客户端在其 PSK 仍被服务端配置保留时可继续使用。抗审查性与性能需通过独立抓包和基准测试评估，不能由线格式不变直接推断。
 
 本版本已完整吸纳代码审查意见，重点解决了 **H1 实现路径修正、H2/H3 连接复用请求级上下文隔离、Xray 原生 UDP 多用户隔离、Go 跨包循环依赖规避、Xray Policy 计费策略前置约束与科学验收基准**。
 
@@ -10,7 +12,7 @@
 
 > [!IMPORTANT]
 > 1. **单/多用户双模自适应与配置优先级规范**：
->    - 若配置提供 `users` 数组（元素 $\ge 1$），则 `users` 作为唯一用户凭证源。若同时传入旧版顶层 `psk`，系统将校验其与 `users` 的一致性或直接发出弃用警告，以 `users` 为准。
+>    - 若配置提供非空 `users` 数组，则 `users` 作为唯一用户凭证源；同时传入旧版顶层 `psk` 会报错，避免凭证优先级歧义。迁移时需把旧 PSK 加入 `users`。
 >    - 若仅提供顶层 `psk` 且无 `users`，自动启用 **Fast Path** 单用户快速路径。
 >    - 严禁配置中出现**重复 Email**（避免 Xray 统计计数器覆盖）与**重复 PSK**（避免试算歧义），校验将在 Protobuf 运行时与 JSON 构建层双重拦截。
 > 2. **H2 / H3 连接复用防串账（Per-Request Context Decoupling）**：
@@ -24,7 +26,7 @@
 
 ## Open Questions
 
-无阻塞性分歧。所有实现细节（H1 独立握手、底层索引解耦、Xray 原生 UDP 改造）均已理清并在下方列出对应改动点。
+上线前仍需验证真实 Linux/Xray 环境下的双用户计费、UDP 丢包与吞吐；Windows 本地自动化测试不能代替这些实测。
 
 ---
 
@@ -63,7 +65,7 @@
 ### 2. 核心服务端 (Core Server)
 
 #### [MODIFY] [`pkg/server/server.go`](file:///d:/myprojetct/my_xray/pkg/server/server.go)
-- 定义用户实体：`type UserKey struct { Email string; PSK []byte; Level int32 }`。
+- 定义用户实体：`type UserKey struct { Email string; PSK []byte; Level uint32 }`。
 - `Server` 结构体维护 `users []UserKey` 与预提取的 `pskList [][]byte`。
 - 构造函数支持多用户初始化，并在单用户时保留 `psk` 快速路径。
 - **H2 / H3 / Auto 模式改造**：
@@ -89,7 +91,7 @@
   3. 匹配成功得到 `matchedIndex` 与 `padLen`：
      - 若 `padLen > 0`，使用 `io.ReadFull(conn, padBuf[:padLen])` 吞掉填充字节；
      - 派生会话密钥，将命中的 `users[matchedIndex]` 注入会话上下文，建立流转发；
-  4. 匹配失败：立即以 0 字节关闭连接（触发对端 RST）。
+  4. 匹配失败：不写应用层响应并关闭连接；TCP 最终表现为 FIN 还是 RST 取决于套接字状态与系统实现。
 
 ---
 
@@ -101,7 +103,7 @@
   message User {
     string email = 1;
     string psk = 2;
-    int32 level = 3;
+    uint32 level = 3;
   }
   message InboundConfig {
     string psk = 1;              // 兼容单用户
@@ -114,7 +116,7 @@
 - 增加 `ChitandaUserConfig` 解析与校验：
   - 检查 `email != ""`、`len(psk) >= 32`；
   - 检查 `users` 内不得有重复 `email` 或重复 `psk`；
-  - 若 `users` 与顶层 `psk` 同时存在，当配置不一致时报错或以 `users` 为准。
+  - 若 `users` 与顶层 `psk` 同时存在，直接报错。
 
 #### [MODIFY] [`integration/xray/inbound.go`](file:///d:/myprojetct/my_xray/integration/xray/inbound.go)
 - `NewInboundHandler` 增加 Protobuf 运行时的二次全量校验（防止绕过 JSON 直接加载 PB 配置）。
@@ -151,7 +153,7 @@
 ### 4. 自动化测试与科学验收体系 (Verification & Test Suite)
 
 #### [NEW] [`pkg/server/multi_user_test.go`](file:///d:/myprojetct/my_xray/pkg/server/multi_user_test.go)
-- **H2/H3/Auto 并发多用户测试**：多客户端使用不同 PSK 并发向同一 Server 发起请求，断言 Context 中提取的用户身份 100% 准确，单用户配置走 Fast Path。
+- **H2/H3/Auto 并发多用户测试**：多客户端使用不同 PSK 并发向同一 Server 发起请求，断言 Context 中提取的用户身份与所用密钥一致，单用户配置走 Fast Path。
 - **H1 模式多用户测试**：验证客户端发送真实 `clientHello`，服务端准确识别对应用户并完成 0-RTT/1-RTT 密钥协商。
 - **未授权探测测试**：非法 PSK 均被无歧义回退至 Fallback 伪装站。
 
@@ -159,7 +161,7 @@
 - 针对 30 个并发配置密钥的 ClientHello 试算准确率断言。
 - **可观测基准测试**：
   - 编写 `BenchmarkMatchPolymorphicClientHello`：验证在 30 个用户下单次匹配耗时的基准目标为 $< 25 \mu s$。
-  - 编写 `TestClientHelloEntropy`：基于大样本量（$N \ge 1000$）抽样统计 ClientHello 经验香农熵，要求满足 $\ge 7.95$。
+  - 若评估握手随机性，需用足够大的跨样本字节集合与明确的统计方法；单个 49 字节样本的经验熵不可能达到 7.95 bit/byte。
 
 #### [NEW] [`internal/plainudp/multi_user_test.go`](file:///d:/myprojetct/my_xray/internal/plainudp/multi_user_test.go)
 - 验证多用户数据报试算解密，非授权数据报静默丢弃断言。

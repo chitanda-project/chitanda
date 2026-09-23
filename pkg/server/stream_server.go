@@ -39,6 +39,7 @@ type StreamServer struct {
 
 // NewStreamServer creates a new StreamServer with a single PSK.
 func NewStreamServer(psk []byte, serverID string, replays *auth.ReplayCache, dialTarget func(ctx context.Context, network, address string) (net.Conn, error)) *StreamServer {
+	psk = append([]byte(nil), psk...)
 	if dialTarget == nil {
 		dialTarget = func(ctx context.Context, network, address string) (net.Conn, error) {
 			return target.DialContext(ctx, address)
@@ -66,7 +67,10 @@ func NewStreamServer(psk []byte, serverID string, replays *auth.ReplayCache, dia
 }
 
 // NewStreamServerWithUsers creates a new StreamServer supporting multiple users.
-func NewStreamServerWithUsers(users []UserKey, serverID string, replays *auth.ReplayCache, dialTarget func(ctx context.Context, network, address string) (net.Conn, error)) *StreamServer {
+func NewStreamServerWithUsers(users []UserKey, serverID string, replays *auth.ReplayCache, dialTarget func(ctx context.Context, network, address string) (net.Conn, error)) (*StreamServer, error) {
+	if err := ValidateUserKeys(users); err != nil {
+		return nil, err
+	}
 	if dialTarget == nil {
 		dialTarget = func(ctx context.Context, network, address string) (net.Conn, error) {
 			return target.DialContext(ctx, address)
@@ -75,14 +79,7 @@ func NewStreamServerWithUsers(users []UserKey, serverID string, replays *auth.Re
 	if replays == nil {
 		replays = auth.NewReplayCache()
 	}
-	validUsers := make([]UserKey, 0, len(users))
-	pskList := make([][]byte, 0, len(users))
-	for _, u := range users {
-		if len(u.PSK) >= 32 {
-			validUsers = append(validUsers, u)
-			pskList = append(pskList, u.PSK)
-		}
-	}
+	validUsers, pskList := copyUserKeys(users)
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &StreamServer{
 		users:        validUsers,
@@ -98,9 +95,8 @@ func NewStreamServerWithUsers(users []UserKey, serverID string, replays *auth.Re
 	if len(validUsers) == 1 {
 		s.psk = validUsers[0].PSK
 	}
-	return s
+	return s, nil
 }
-
 
 // SetMaxConns sets the maximum number of concurrent connections (for testing or configuration).
 func (s *StreamServer) SetMaxConns(n int) {
@@ -126,7 +122,7 @@ func (s *StreamServer) AttachUDP(udpConn *net.UDPConn) error {
 	if s.closed.Load() || s.udpServer != nil {
 		return errors.New("stream server closed or UDP already attached")
 	}
-	udpSrv, err := NewPlainUDPServer(udpConn, s.psk)
+	udpSrv, err := NewPlainUDPServerWithUsers(udpConn, s.users)
 	if err != nil {
 		return err
 	}

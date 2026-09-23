@@ -223,4 +223,3 @@ func TestMatchClientHelloMultiUser(t *testing.T) {
 		t.Fatalf("expected ErrInvalidClientAuth, got %v", err)
 	}
 }
-

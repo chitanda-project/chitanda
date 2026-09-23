@@ -1,6 +1,7 @@
 package conf
 
 import (
+	"github.com/violetaini/chitanda/pkg/server"
 	"github.com/xtls/xray-core/proxy/chitanda"
 	"testing"
 )
@@ -113,5 +114,16 @@ func TestChitandaMultiUserConfig(t *testing.T) {
 	}
 	if _, err := nilUsersCfg.Build(); err == nil {
 		t.Fatal("expected error for nil users list, got nil")
+	}
+	for name, invalid := range map[string]ChitandaInboundConfig{
+		"mixed psk and users": {PSK: "0123456789abcdef0123456789abcdef", Users: validCfg.Users},
+		"partially nil users": {Users: []*ChitandaUser{validCfg.Users[0], nil}},
+		"too many users":      {Users: make([]*ChitandaUser, server.MaxUserKeys+1)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := invalid.Build(); err == nil {
+				t.Fatal("invalid user config was accepted")
+			}
+		})
 	}
 }

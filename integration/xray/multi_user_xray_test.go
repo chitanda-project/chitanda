@@ -16,6 +16,9 @@ import (
 	"github.com/violetaini/chitanda/pkg/auth"
 	"github.com/violetaini/chitanda/pkg/client"
 	"github.com/violetaini/chitanda/pkg/server"
+	xdispatcher "github.com/xtls/xray-core/app/dispatcher"
+	xpolicy "github.com/xtls/xray-core/app/policy"
+	xstats "github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
@@ -141,6 +144,91 @@ func TestXrayInboundMultiUserHTTP(t *testing.T) {
 	}
 	if dispatchedUsers[1].Email != "bob@chitanda.org" || dispatchedUsers[1].Level != 2 {
 		t.Errorf("expected bob@chitanda.org level 2, got %+v", dispatchedUsers[1])
+	}
+}
+
+func TestXrayInboundRejectsInvalidMultiUserProto(t *testing.T) {
+	key := "0123456789abcdef0123456789abcdef"
+	for name, cfg := range map[string]*InboundConfig{
+		"nil config":          nil,
+		"missing credentials": {Transport: "stream"},
+		"mixed credentials":   {Transport: "stream", Psk: key, Users: []*User{{Email: "alice", Psk: key}}},
+		"nil user":            {Transport: "stream", Users: []*User{nil}},
+		"empty email":         {Transport: "stream", Users: []*User{{Psk: key}}},
+		"short key":           {Transport: "stream", Users: []*User{{Email: "alice", Psk: "short"}}},
+		"duplicate key":       {Transport: "stream", Users: []*User{{Email: "alice", Psk: key}, {Email: "bob", Psk: key}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if h, err := NewInboundHandler(context.Background(), cfg); err == nil {
+				_ = h.Close()
+				t.Fatal("invalid protobuf config was accepted")
+			}
+		})
+	}
+}
+
+func TestXrayMultiUserStatsPolicy(t *testing.T) {
+	policy, err := xpolicy.New(context.Background(), &xpolicy.Config{Level: map[uint32]*xpolicy.Policy{
+		1: {Stats: &xpolicy.Policy_Stats{UserUplink: true, UserDownlink: true}},
+		2: {Stats: &xpolicy.Policy_Stats{UserUplink: true, UserDownlink: true}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := xstats.NewManager(context.Background(), &xstats.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		email string
+		level uint32
+		up    string
+		down  string
+	}{{"alice", 1, "alice upload", "alice download"}, {"bob", 2, "bob upload upload", "bob download download"}} {
+		ctx := session.ContextWithInbound(context.Background(), &session.Inbound{User: &protocol.MemoryUser{Email: tc.email, Level: tc.level}})
+		ctx = requestContext(ctx)
+		upReader, upWriter := pipe.New()
+		downReader, downWriter := pipe.New()
+		link := xdispatcher.WrapLink(ctx, policy, manager, &transport.Link{Reader: upReader, Writer: downWriter})
+		writeDone := make(chan error, 1)
+		go func() { writeDone <- upWriter.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte(tc.up))}) }()
+		mb, err := link.Reader.ReadMultiBuffer()
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf.ReleaseMulti(mb)
+		if err := <-writeDone; err != nil {
+			t.Fatal(err)
+		}
+		go func() { writeDone <- link.Writer.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes([]byte(tc.down))}) }()
+		mb, err = downReader.ReadMultiBuffer()
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf.ReleaseMulti(mb)
+		if err := <-writeDone; err != nil {
+			t.Fatal(err)
+		}
+		upReader.Interrupt()
+		_ = upWriter.Close()
+		downReader.Interrupt()
+		_ = downWriter.Close()
+	}
+	for _, tc := range []struct {
+		email string
+		up    int64
+		down  int64
+	}{{"alice", int64(len("alice upload")), int64(len("alice download"))}, {"bob", int64(len("bob upload upload")), int64(len("bob download download"))}} {
+		for _, direction := range []struct {
+			name string
+			want int64
+		}{{"uplink", tc.up}, {"downlink", tc.down}} {
+			name := "user>>>" + tc.email + ">>>traffic>>>" + direction.name
+			counter := manager.GetCounter(name)
+			if counter == nil || counter.Value() != direction.want {
+				t.Fatalf("%s counter = %v, want %d", name, counter, direction.want)
+			}
+		}
 	}
 }
 
