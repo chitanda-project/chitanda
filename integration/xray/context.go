@@ -13,7 +13,6 @@ func requestContext(ctx context.Context) context.Context {
 	content := &session.Content{}
 	if previous := session.ContentFromContext(ctx); previous != nil {
 		content.SniffingRequest = previous.SniffingRequest
-		content.SniffingRequest.ExcludeForDomain = append([]string(nil), previous.SniffingRequest.ExcludeForDomain...)
 		content.SniffingRequest.OverrideDestinationForProtocol = append([]string(nil), previous.SniffingRequest.OverrideDestinationForProtocol...)
 		content.SkipDNSResolve = previous.SkipDNSResolve
 	}

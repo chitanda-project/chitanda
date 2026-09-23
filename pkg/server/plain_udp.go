@@ -396,6 +396,10 @@ func (c *PlainUDPCodec) DecodeClientPacket(packet []byte, now time.Time) (sessio
 	return c.codec.DecodePacket(packet, plainudp.DirClientToServer, now)
 }
 
+func (c *PlainUDPCodec) DecodeServerPacket(packet []byte, now time.Time) (sessionID uint64, targetAddr string, payload []byte, timestamp uint64, seq uint64, err error) {
+	return c.codec.DecodePacket(packet, plainudp.DirServerToClient, now)
+}
+
 func (c *PlainUDPCodec) EncodeServerPacket(sessionID uint64, targetAddr string, payload []byte, now time.Time) ([]byte, error) {
 	return c.codec.EncodePacket(nil, plainudp.DirServerToClient, sessionID, targetAddr, payload, now)
 }
@@ -403,6 +407,21 @@ func (c *PlainUDPCodec) EncodeServerPacket(sessionID uint64, targetAddr string, 
 func (c *PlainUDPCodec) EncodeClientPacket(sessionID uint64, targetAddr string, payload []byte, now time.Time) ([]byte, error) {
 	return c.codec.EncodePacket(nil, plainudp.DirClientToServer, sessionID, targetAddr, payload, now)
 }
+
+// DecodeClientPacketMulti decodes a client packet across multiple user codecs.
+func DecodeClientPacketMulti(codecs []*PlainUDPCodec, packet []byte, now time.Time) (matchedIndex int, sessionID uint64, targetAddr string, payload []byte, timestamp uint64, seq uint64, err error) {
+	for i, c := range codecs {
+		if c == nil || c.codec == nil {
+			continue
+		}
+		sID, tAddr, pLoad, ts, sNum, err := c.DecodeClientPacket(packet, now)
+		if err == nil {
+			return i, sID, tAddr, pLoad, ts, sNum, nil
+		}
+	}
+	return -1, 0, "", nil, 0, 0, plainudp.ErrDecryptionFailed
+}
+
 
 // UDPReplayWindow provides anti-replay window tracking for datagrams.
 type UDPReplayWindow struct {

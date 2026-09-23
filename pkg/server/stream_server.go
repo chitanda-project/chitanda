@@ -20,6 +20,8 @@ import (
 // It is hardened for IEPL/transit environments with zero Web footprint (probes receive instant RST/close).
 type StreamServer struct {
 	psk          []byte
+	users        []UserKey
+	pskList      [][]byte
 	serverID     string
 	dialTarget   func(ctx context.Context, network, address string) (net.Conn, error)
 	listenersMu  sync.Mutex
@@ -35,7 +37,7 @@ type StreamServer struct {
 	cancel       context.CancelFunc
 }
 
-// NewStreamServer creates a new StreamServer.
+// NewStreamServer creates a new StreamServer with a single PSK.
 func NewStreamServer(psk []byte, serverID string, replays *auth.ReplayCache, dialTarget func(ctx context.Context, network, address string) (net.Conn, error)) *StreamServer {
 	if dialTarget == nil {
 		dialTarget = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -46,7 +48,7 @@ func NewStreamServer(psk []byte, serverID string, replays *auth.ReplayCache, dia
 		replays = auth.NewReplayCache()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &StreamServer{
+	s := &StreamServer{
 		psk:          psk,
 		serverID:     serverID,
 		dialTarget:   dialTarget,
@@ -56,7 +58,46 @@ func NewStreamServer(psk []byte, serverID string, replays *auth.ReplayCache, dia
 		ctx:          ctx,
 		cancel:       cancel,
 	}
+	if len(psk) > 0 {
+		s.pskList = [][]byte{psk}
+		s.users = []UserKey{{PSK: psk}}
+	}
+	return s
 }
+
+// NewStreamServerWithUsers creates a new StreamServer supporting multiple users.
+func NewStreamServerWithUsers(users []UserKey, serverID string, replays *auth.ReplayCache, dialTarget func(ctx context.Context, network, address string) (net.Conn, error)) *StreamServer {
+	if dialTarget == nil {
+		dialTarget = func(ctx context.Context, network, address string) (net.Conn, error) {
+			return target.DialContext(ctx, address)
+		}
+	}
+	if replays == nil {
+		replays = auth.NewReplayCache()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &StreamServer{
+		users:        users,
+		serverID:     serverID,
+		dialTarget:   dialTarget,
+		replays:      replays,
+		maxConns:     10000,
+		handshakeSem: make(chan struct{}, 512),
+		ctx:          ctx,
+		cancel:       cancel,
+	}
+	s.pskList = make([][]byte, 0, len(users))
+	for _, u := range users {
+		if len(u.PSK) >= 32 {
+			s.pskList = append(s.pskList, u.PSK)
+		}
+	}
+	if len(users) == 1 {
+		s.psk = users[0].PSK
+	}
+	return s
+}
+
 
 // SetMaxConns sets the maximum number of concurrent connections (for testing or configuration).
 func (s *StreamServer) SetMaxConns(n int) {
@@ -224,11 +265,30 @@ func (s *StreamServer) handleConn(ctx context.Context, conn net.Conn) {
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 
 	// 1. Read and verify polymorphic ClientHello (49-113 bytes)
-	clientNonce, ts, err := rawstream.ReadAndVerifyPolymorphicClientHello(conn, s.psk, s.serverID, time.Now())
-	if err != nil {
-		// Authentication failed (e.g. GET / HTTP/1.1 sent by scanner, invalid padding, or mismatched serverID):
-		// Close immediately with 0 bytes response. Never speak HTTP.
-		return
+	var clientNonce [24]byte
+	var ts uint64
+	var matchedUser *UserKey
+
+	if len(s.psk) > 0 && len(s.users) <= 1 {
+		cNonce, tStamp, err := rawstream.ReadAndVerifyPolymorphicClientHello(conn, s.psk, s.serverID, time.Now())
+		if err != nil {
+			return
+		}
+		clientNonce = cNonce
+		ts = tStamp
+		if len(s.users) == 1 {
+			matchedUser = &s.users[0]
+		} else {
+			matchedUser = &UserKey{PSK: s.psk}
+		}
+	} else {
+		matchedIdx, cNonce, tStamp, err := rawstream.ReadAndMatchPolymorphicClientHello(conn, s.pskList, s.serverID, time.Now())
+		if err != nil || matchedIdx < 0 || matchedIdx >= len(s.users) {
+			return
+		}
+		clientNonce = cNonce
+		ts = tStamp
+		matchedUser = &s.users[matchedIdx]
 	}
 
 	// 2. Early non-mutating check in replay cache
@@ -255,7 +315,7 @@ func (s *StreamServer) handleConn(ctx context.Context, conn net.Conn) {
 	}
 
 	// 5. Derive 0-RTT key and decrypt open frame
-	k0RTT, err := rawstream.Derive0RTTKey(s.psk, s.serverID, ts, clientNonce)
+	k0RTT, err := rawstream.Derive0RTTKey(matchedUser.PSK, s.serverID, ts, clientNonce)
 	if err != nil {
 		return
 	}
@@ -281,7 +341,7 @@ func (s *StreamServer) handleConn(ctx context.Context, conn net.Conn) {
 	}
 
 	// 8. Generate polymorphic ServerHello (41-105 bytes)
-	serverHelloRecord, serverNonce, err := rawstream.CreatePolymorphicServerHello(s.psk, s.serverID, ts, clientNonce)
+	serverHelloRecord, serverNonce, err := rawstream.CreatePolymorphicServerHello(matchedUser.PSK, s.serverID, ts, clientNonce)
 	if err != nil {
 		return
 	}
@@ -292,7 +352,7 @@ func (s *StreamServer) handleConn(ctx context.Context, conn net.Conn) {
 	}
 
 	// 10. Derive bidirectional session keys
-	c2sKey, s2cKey, err := rawstream.DeriveSessionKeys(s.psk, s.serverID, ts, clientNonce, serverNonce)
+	c2sKey, s2cKey, err := rawstream.DeriveSessionKeys(matchedUser.PSK, s.serverID, ts, clientNonce, serverNonce)
 	if err != nil {
 		return
 	}
@@ -309,7 +369,7 @@ func (s *StreamServer) handleConn(ctx context.Context, conn net.Conn) {
 	if baseCtx == nil {
 		baseCtx = s.ctx
 	}
-	connCtx, connCancel := context.WithCancel(baseCtx)
+	connCtx, connCancel := context.WithCancel(ContextWithUser(baseCtx, matchedUser))
 	defer connCancel()
 
 	upstream, err := s.dialTarget(connCtx, "tcp", targetAddr)

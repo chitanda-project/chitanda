@@ -35,10 +35,38 @@ const (
 	headerFraming   = "X-Session-Framing"
 )
 
+// UserKey represents an authenticated multi-user key entry
+type UserKey struct {
+	Email string
+	PSK   []byte
+	Level int32
+}
+
+type userContextKey struct{}
+
+// UserFromContext retrieves the authenticated UserKey from request context.
+func UserFromContext(ctx context.Context) (*UserKey, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	u, ok := ctx.Value(userContextKey{}).(*UserKey)
+	return u, ok && u != nil
+}
+
+// ContextWithUser associates an authenticated UserKey with context.
+func ContextWithUser(ctx context.Context, user *UserKey) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, userContextKey{}, user)
+}
+
 // Server implements the my_xray inbound handler
 type Server struct {
 	path            string
 	psk             []byte
+	users           []UserKey
+	pskList         [][]byte
 	replays         *auth.ReplayCache
 	fallback        http.Handler
 	udpTargetBuffer int
@@ -46,9 +74,9 @@ type Server struct {
 	dialUDP         func(ctx context.Context, address string) (net.Conn, error)
 }
 
-// NewServer creates a new Server instance
+// NewServer creates a new Server instance with a single PSK.
 func NewServer(path string, psk []byte, replays *auth.ReplayCache, fallback http.Handler, udpTargetBuffer int) *Server {
-	return &Server{
+	s := &Server{
 		path:            path,
 		psk:             psk,
 		replays:         replays,
@@ -56,7 +84,35 @@ func NewServer(path string, psk []byte, replays *auth.ReplayCache, fallback http
 		udpTargetBuffer: udpTargetBuffer,
 		dialTarget:      target.DialContext,
 	}
+	if len(psk) > 0 {
+		s.pskList = [][]byte{psk}
+		s.users = []UserKey{{PSK: psk}}
+	}
+	return s
 }
+
+// NewServerWithUsers creates a new Server instance supporting multiple users.
+func NewServerWithUsers(path string, users []UserKey, replays *auth.ReplayCache, fallback http.Handler, udpTargetBuffer int) *Server {
+	s := &Server{
+		path:            path,
+		users:           users,
+		replays:         replays,
+		fallback:        fallback,
+		udpTargetBuffer: udpTargetBuffer,
+		dialTarget:      target.DialContext,
+	}
+	s.pskList = make([][]byte, 0, len(users))
+	for _, u := range users {
+		if len(u.PSK) >= 32 {
+			s.pskList = append(s.pskList, u.PSK)
+		}
+	}
+	if len(users) == 1 {
+		s.psk = users[0].PSK
+	}
+	return s
+}
+
 
 // SetDialTargetForTest allows overriding upstream dialer in tests (e.g. for loopback echo servers).
 func (s *Server) SetDialTargetForTest(fn func(ctx context.Context, address string) (net.Conn, error)) {
@@ -74,7 +130,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		timestamp := r.Header.Get(headerTimestamp)
 		nonce := r.Header.Get(headerNonce)
 		signature := r.Header.Get(headerSignature)
-		if err := s.authorize(r, "", timestamp, nonce, signature); err == nil {
+		if _, err := s.authorize(r, "", timestamp, nonce, signature); err == nil {
 			w.Header().Set("Cache-Control", "no-store")
 			w.Header().Set(headerSessionOK, "1")
 			w.WriteHeader(http.StatusNoContent)
@@ -100,7 +156,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	timestamp := r.Header.Get(headerTimestamp)
 	nonce := r.Header.Get(headerNonce)
 	signature := r.Header.Get(headerSignature)
-	if err := s.authorize(r, targetAddress, timestamp, nonce, signature); err != nil {
+	matchedUser, err := s.authorize(r, targetAddress, timestamp, nonce, signature)
+	if err != nil {
 		if errors.Is(err, errReplayDetected) {
 			// Fast-fail on replays to prevent DoS amplification (don't dial fallback)
 			// Returning standard HTTP error mimics proxy error or fallback error
@@ -111,6 +168,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveFallback(w, r)
 		return
 	}
+
+	reqCtx := ContextWithUser(r.Context(), matchedUser)
+	r = r.WithContext(reqCtx)
 
 	upstream, err := s.dialTarget(r.Context(), targetAddress)
 	if err != nil {
@@ -175,25 +235,55 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) authorize(r *http.Request, targetAddress, timestamp, nonce, signature string) error {
+func (s *Server) authorize(r *http.Request, targetAddress, timestamp, nonce, signature string) (*UserKey, error) {
 	mode := r.Header.Get(headerMode)
 	if mode == "" {
 		mode = modeTCPv2
 	}
 	now := time.Now()
-	if !auth.Verify(s.psk, mode, r.Method, r.URL.Path, targetAddress, timestamp, nonce, signature, now) {
-		return errInvalidSignature
+
+	// 1. Fast path: single user / legacy PSK
+	if len(s.psk) > 0 && len(s.users) <= 1 {
+		if !auth.Verify(s.psk, mode, r.Method, r.URL.Path, targetAddress, timestamp, nonce, signature, now) {
+			return nil, errInvalidSignature
+		}
+		if s.replays != nil {
+			accepted, err := s.replays.Accept(nonce, now)
+			if err != nil {
+				log.Printf("replay cache unavailable")
+			}
+			if !accepted || err != nil {
+				return nil, errReplayDetected
+			}
+		}
+		if len(s.users) == 1 {
+			return &s.users[0], nil
+		}
+		return &UserKey{PSK: s.psk}, nil
 	}
+
+	// 2. Multi-user path
+	var matchedUser *UserKey
+	for i := range s.users {
+		if auth.Verify(s.users[i].PSK, mode, r.Method, r.URL.Path, targetAddress, timestamp, nonce, signature, now) {
+			matchedUser = &s.users[i]
+			break
+		}
+	}
+	if matchedUser == nil {
+		return nil, errInvalidSignature
+	}
+
 	if s.replays != nil {
 		accepted, err := s.replays.Accept(nonce, now)
 		if err != nil {
 			log.Printf("replay cache unavailable")
 		}
 		if !accepted || err != nil {
-			return errReplayDetected
+			return nil, errReplayDetected
 		}
 	}
-	return nil
+	return matchedUser, nil
 }
 
 func (s *Server) servePlainH1(w http.ResponseWriter, r *http.Request) {
@@ -207,10 +297,32 @@ func (s *Server) servePlainH1(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
-	clientNonce, ts, err := h1session.VerifyClientHello(s.psk, clientHello[:], now)
-	if err != nil {
-		s.serveFallback(w, r)
-		return
+	var clientNonce [24]byte
+	var ts uint64
+	var matchedUser *UserKey
+
+	if len(s.psk) > 0 && len(s.users) <= 1 {
+		cNonce, tStamp, err := h1session.VerifyClientHello(s.psk, clientHello[:], now)
+		if err != nil {
+			s.serveFallback(w, r)
+			return
+		}
+		clientNonce = cNonce
+		ts = tStamp
+		if len(s.users) == 1 {
+			matchedUser = &s.users[0]
+		} else {
+			matchedUser = &UserKey{PSK: s.psk}
+		}
+	} else {
+		matchedIdx, cNonce, tStamp, err := h1session.MatchClientHello(s.pskList, clientHello[:], now)
+		if err != nil || matchedIdx < 0 || matchedIdx >= len(s.users) {
+			s.serveFallback(w, r)
+			return
+		}
+		clientNonce = cNonce
+		ts = tStamp
+		matchedUser = &s.users[matchedIdx]
 	}
 
 	nonceHex := hex.EncodeToString(clientNonce[:])
@@ -226,14 +338,14 @@ func (s *Server) servePlainH1(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. Derive 0-RTT key
-	k0RTT, err := h1session.Derive0RTTKey(s.psk, ts, clientNonce)
+	k0RTT, err := h1session.Derive0RTTKey(matchedUser.PSK, ts, clientNonce)
 	if err != nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
 	// 2. Derive 1-RTT keys and ServerHello
-	serverHello, clientKey, serverKey, err := h1session.CreateServerHello(s.psk, clientNonce)
+	serverHello, clientKey, serverKey, err := h1session.CreateServerHello(matchedUser.PSK, clientNonce)
 	if err != nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
@@ -249,6 +361,10 @@ func (s *Server) servePlainH1(w http.ResponseWriter, r *http.Request) {
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
+
+	reqCtx := ContextWithUser(r.Context(), matchedUser)
+	r = r.WithContext(reqCtx)
+
 
 	// 4. Read 0-RTT OPEN frame from Chunk 2
 	var wireLenBuf [2]byte

@@ -87,7 +87,8 @@ func (s *Server) serveHTTP3(w http.ResponseWriter, r *http.Request) {
 	signature := r.Header.Get(headerSignature)
 	switch {
 	case r.Method == http.MethodGet && r.Header.Get(headerMode) == modeTCPv2:
-		if err := s.authorize(r, targetAddress, timestamp, nonce, signature); err != nil {
+		matchedUser, err := s.authorize(r, targetAddress, timestamp, nonce, signature)
+		if err != nil {
 			if errors.Is(err, errReplayDetected) {
 				http.Error(w, "Bad Request", http.StatusBadRequest)
 				return
@@ -95,13 +96,15 @@ func (s *Server) serveHTTP3(w http.ResponseWriter, r *http.Request) {
 			s.serveFallback(w, r)
 			return
 		}
+		r = r.WithContext(ContextWithUser(r.Context(), matchedUser))
 		s.serveHTTP3TCP(w, r, targetAddress)
 	case r.Method == http.MethodConnect && r.Proto == "connect-udp" && r.Header.Get(headerMode) == modeUDPv2:
 		if targetAddress != udpAuthName {
 			s.serveFallback(w, r)
 			return
 		}
-		if err := s.authorize(r, targetAddress, timestamp, nonce, signature); err != nil {
+		matchedUser, err := s.authorize(r, targetAddress, timestamp, nonce, signature)
+		if err != nil {
 			if errors.Is(err, errReplayDetected) {
 				http.Error(w, "Bad Request", http.StatusBadRequest)
 				return
@@ -109,10 +112,12 @@ func (s *Server) serveHTTP3(w http.ResponseWriter, r *http.Request) {
 			s.serveFallback(w, r)
 			return
 		}
+		r = r.WithContext(ContextWithUser(r.Context(), matchedUser))
 		s.serveHTTP3UDP(w, r)
 	default:
 		s.serveFallback(w, r)
 	}
+
 }
 
 func (s *Server) serveHTTP3TCP(w http.ResponseWriter, r *http.Request, targetAddress string) {

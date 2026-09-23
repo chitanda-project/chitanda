@@ -52,16 +52,20 @@ func TestServerAuthorizationAndReplay(t *testing.T) {
 	req.Header.Set(headerSignature, sig)
 
 	// Authorize call
-	err := srv.authorize(req, target, ts, nonce, sig)
+	user, err := srv.authorize(req, target, ts, nonce, sig)
 	if err != nil {
 		t.Fatalf("expected authorization success, got: %v", err)
 	}
+	if user == nil {
+		t.Fatalf("expected non-nil user")
+	}
 
 	// 3. Test replay of same nonce -> should return errReplayDetected
-	err = srv.authorize(req, target, ts, nonce, sig)
+	_, err = srv.authorize(req, target, ts, nonce, sig)
 	if err != errReplayDetected {
 		t.Fatalf("expected errReplayDetected, got: %v", err)
 	}
+
 
 	// 4. Test replay in ServeHTTP -> should return 400 Bad Request directly without fallback
 	w = httptest.NewRecorder()

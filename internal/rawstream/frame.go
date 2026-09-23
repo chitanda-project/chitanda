@@ -240,59 +240,140 @@ func VerifyPolymorphicClientHello(psk []byte, serverID string, record []byte, no
 	return clientNonce, timestamp, nil
 }
 
+// MatchPolymorphicClientHelloHeader matches the fixed 49-byte authenticated header against multiple PSKs in memory.
+// It does not perform network I/O; header must be at least 49 bytes.
+// If matched, returns the index of the key in keys, padLen, clientNonce, timestamp, nil.
+// If no key matches, returns -1, 0, clientNonce, 0, ErrInvalidClientAuth.
+func MatchPolymorphicClientHelloHeader(header []byte, keys [][]byte, serverID string, now time.Time) (matchedIndex int, padLen int, clientNonce [24]byte, timestamp uint64, err error) {
+	if len(header) < 1+ClientHelloSize {
+		return -1, 0, clientNonce, 0, ErrInvalidRecordLen
+	}
+
+	copy(clientNonce[:], header[9:33])
+	clientTag := header[33:49]
+	nowSec := uint64(now.Unix())
+
+	if len(keys) == 1 {
+		psk := keys[0]
+		if len(psk) < 32 {
+			return -1, 0, clientNonce, 0, errors.New("rawstream: PSK must be at least 32 bytes")
+		}
+		clientMask, _ := DerivePolymorphicMasks(psk, serverID)
+		pLen := int(header[0] ^ clientMask)
+		if pLen > MaxPolymorphicPadding {
+			return -1, 0, clientNonce, 0, ErrInvalidPolymorphicPadding
+		}
+
+		tsMask := deriveTimestampMask(psk, clientNonce)
+		var tsBuf [8]byte
+		for j := 0; j < 8; j++ {
+			tsBuf[j] = header[1+j] ^ tsMask[j]
+		}
+		ts := binary.BigEndian.Uint64(tsBuf[:])
+
+		diff := int64(nowSec) - int64(ts)
+		if diff < -int64(MaxTimestampSkew/time.Second) || diff > int64(MaxTimestampSkew/time.Second) {
+			return -1, 0, clientNonce, 0, ErrTimestampExpired
+		}
+
+		mac := hmac.New(sha256.New, psk)
+		mac.Write([]byte(DomainClientHello))
+		if len(serverID) > 0 {
+			mac.Write([]byte(serverID))
+		}
+		mac.Write(tsBuf[:])
+		mac.Write(clientNonce[:])
+		mac.Write([]byte{byte(pLen)})
+		expectedFullTag := mac.Sum(nil)
+
+		if !hmac.Equal(clientTag, expectedFullTag[:16]) {
+			return -1, 0, clientNonce, 0, ErrInvalidClientAuth
+		}
+
+		return 0, pLen, clientNonce, ts, nil
+	}
+
+	expiredFound := false
+	for i, psk := range keys {
+		if len(psk) < 32 {
+			continue
+		}
+		clientMask, _ := DerivePolymorphicMasks(psk, serverID)
+		pLen := int(header[0] ^ clientMask)
+		if pLen > MaxPolymorphicPadding {
+			continue
+		}
+
+		tsMask := deriveTimestampMask(psk, clientNonce)
+		var tsBuf [8]byte
+		for j := 0; j < 8; j++ {
+			tsBuf[j] = header[1+j] ^ tsMask[j]
+		}
+		ts := binary.BigEndian.Uint64(tsBuf[:])
+
+		mac := hmac.New(sha256.New, psk)
+		mac.Write([]byte(DomainClientHello))
+		if len(serverID) > 0 {
+			mac.Write([]byte(serverID))
+		}
+		mac.Write(tsBuf[:])
+		mac.Write(clientNonce[:])
+		mac.Write([]byte{byte(pLen)})
+		expectedFullTag := mac.Sum(nil)
+
+		if hmac.Equal(clientTag, expectedFullTag[:16]) {
+			diff := int64(nowSec) - int64(ts)
+			if diff < -int64(MaxTimestampSkew/time.Second) || diff > int64(MaxTimestampSkew/time.Second) {
+				expiredFound = true
+				continue
+			}
+			return i, pLen, clientNonce, ts, nil
+		}
+	}
+
+	if expiredFound {
+		return -1, 0, clientNonce, 0, ErrTimestampExpired
+	}
+	return -1, 0, clientNonce, 0, ErrInvalidClientAuth
+}
+
+
+// ReadAndMatchPolymorphicClientHello reads the fixed 49-byte header from r, matches against multiple keys,
+// and if matched, reads the trailing padBytes (if padLen > 0).
+func ReadAndMatchPolymorphicClientHello(r io.Reader, keys [][]byte, serverID string, now time.Time) (matchedIndex int, clientNonce [24]byte, timestamp uint64, err error) {
+	var header [1 + ClientHelloSize]byte // 49 bytes
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return -1, clientNonce, 0, err
+	}
+
+	matchedIdx, padLen, cNonce, ts, err := MatchPolymorphicClientHelloHeader(header[:], keys, serverID, now)
+	if err != nil {
+		return -1, clientNonce, 0, err
+	}
+
+	if padLen > 0 {
+		padBytes := make([]byte, padLen)
+		if _, err := io.ReadFull(r, padBytes); err != nil {
+			return -1, clientNonce, 0, err
+		}
+	}
+
+	return matchedIdx, cNonce, ts, nil
+}
+
 // ReadAndVerifyPolymorphicClientHello reads the fixed 49-byte authenticated header first,
 // verifies the HMAC and freshness in constant time, and only reads padBytes if authenticated.
 func ReadAndVerifyPolymorphicClientHello(r io.Reader, psk []byte, serverID string, now time.Time) (clientNonce [24]byte, timestamp uint64, err error) {
 	if len(psk) < 32 {
 		return clientNonce, 0, errors.New("rawstream: PSK must be at least 32 bytes")
 	}
-	var header [1 + ClientHelloSize]byte // 49 bytes
-	if _, err := io.ReadFull(r, header[:]); err != nil {
-		return clientNonce, 0, err
+	matched, cNonce, ts, err := ReadAndMatchPolymorphicClientHello(r, [][]byte{psk}, serverID, now)
+	if err != nil || matched < 0 {
+		return cNonce, ts, err
 	}
-	clientMask, _ := DerivePolymorphicMasks(psk, serverID)
-	padLen := int(header[0] ^ clientMask)
-	if padLen > MaxPolymorphicPadding {
-		return clientNonce, 0, ErrInvalidPolymorphicPadding
-	}
-
-	copy(clientNonce[:], header[9:33])
-	tsMask := deriveTimestampMask(psk, clientNonce)
-	var tsBuf [8]byte
-	for i := 0; i < 8; i++ {
-		tsBuf[i] = header[1+i] ^ tsMask[i]
-	}
-	timestamp = binary.BigEndian.Uint64(tsBuf[:])
-
-	nowSec := uint64(now.Unix())
-	diff := int64(nowSec) - int64(timestamp)
-	if diff < -int64(MaxTimestampSkew/time.Second) || diff > int64(MaxTimestampSkew/time.Second) {
-		return clientNonce, 0, ErrTimestampExpired
-	}
-
-	mac := hmac.New(sha256.New, psk)
-	mac.Write([]byte(DomainClientHello))
-	if len(serverID) > 0 {
-		mac.Write([]byte(serverID))
-	}
-	mac.Write(tsBuf[:])
-	mac.Write(clientNonce[:])
-	mac.Write([]byte{byte(padLen)})
-	expectedFullTag := mac.Sum(nil)
-
-	if !hmac.Equal(header[33:49], expectedFullTag[:16]) {
-		return clientNonce, 0, ErrInvalidClientAuth
-	}
-
-	if padLen > 0 {
-		padBytes := make([]byte, padLen)
-		if _, err := io.ReadFull(r, padBytes); err != nil {
-			return clientNonce, 0, err
-		}
-	}
-
-	return clientNonce, timestamp, nil
+	return cNonce, ts, nil
 }
+
 
 // Derive0RTTKey derives a 16-byte key for AES-128-GCM 0-RTT frame encryption.
 func Derive0RTTKey(psk []byte, serverID string, timestamp uint64, clientNonce [24]byte) ([16]byte, error) {

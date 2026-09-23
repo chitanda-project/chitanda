@@ -17,8 +17,9 @@ const maxUDPRoutes = 64
 const udpRouteIdle = time.Minute
 
 type udpRouteKey struct {
-	session uint64
-	target  string
+	userIndex int
+	session   uint64
+	target    string
 }
 type udpRoute struct {
 	conn   *packetLinkConn
@@ -29,7 +30,7 @@ type udpRoutes struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	dispatcher routing.Dispatcher
-	codec      *server.PlainUDPCodec
+	codecs     []*server.PlainUDPCodec
 	outer      net.Conn
 	mu         sync.Mutex
 	writes     sync.Mutex
@@ -38,9 +39,9 @@ type udpRoutes struct {
 	wg         sync.WaitGroup
 }
 
-func newUDPRoutes(ctx context.Context, d routing.Dispatcher, codec *server.PlainUDPCodec, outer net.Conn) *udpRoutes {
+func newUDPRoutes(ctx context.Context, d routing.Dispatcher, codecs []*server.PlainUDPCodec, outer net.Conn) *udpRoutes {
 	ctx, cancel := context.WithCancel(ctx)
-	r := &udpRoutes{ctx: ctx, cancel: cancel, dispatcher: d, codec: codec, outer: outer, entries: make(map[udpRouteKey]*udpRoute)}
+	r := &udpRoutes{ctx: ctx, cancel: cancel, dispatcher: d, codecs: codecs, outer: outer, entries: make(map[udpRouteKey]*udpRoute)}
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
@@ -74,8 +75,8 @@ func (r *udpRoutes) expire(now time.Time) {
 	}
 }
 
-func (r *udpRoutes) Write(ctx context.Context, sid uint64, dest xnet.Destination, payload []byte) error {
-	key := udpRouteKey{sid, dest.NetAddr()}
+func (r *udpRoutes) Write(ctx context.Context, userIndex int, sid uint64, dest xnet.Destination, payload []byte) error {
+	key := udpRouteKey{userIndex, sid, dest.NetAddr()}
 	r.mu.Lock()
 	if r.closed || r.ctx.Err() != nil {
 		r.mu.Unlock()
@@ -124,13 +125,20 @@ func (r *udpRoutes) receive(key udpRouteKey, entry *udpRoute) {
 	defer r.wg.Done()
 	defer r.remove(key, entry)
 	buffer := make([]byte, 65535)
+	var codec *server.PlainUDPCodec
+	if key.userIndex >= 0 && key.userIndex < len(r.codecs) {
+		codec = r.codecs[key.userIndex]
+	}
+	if codec == nil {
+		return
+	}
 	for {
 		n, from, err := entry.conn.ReadFrom(buffer)
 		if err != nil {
 			return
 		}
 		entry.last.Store(time.Now().UnixNano())
-		encoded, err := r.codec.EncodeServerPacket(key.session, from.String(), buffer[:n], time.Now())
+		encoded, err := codec.EncodeServerPacket(key.session, from.String(), buffer[:n], time.Now())
 		if err != nil {
 			continue
 		}

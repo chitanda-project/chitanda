@@ -35,3 +35,74 @@ func TestChitandaTLSInheritanceAndDefaults(t *testing.T) {
 		t.Fatal("invalid transport accepted")
 	}
 }
+
+func TestChitandaMultiUserConfig(t *testing.T) {
+	// 1. Valid multi-user config
+	validCfg := ChitandaInboundConfig{
+		Transport: "h2",
+		Users: []*ChitandaUser{
+			{Email: "alice@chitanda.org", PSK: "alice-key-at-least-32-bytes-long!", Level: 1},
+			{Email: "bob@chitanda.org", PSK: "bob---key-at-least-32-bytes-long!", Level: 2},
+		},
+	}
+	m, err := validCfg.Build()
+	if err != nil {
+		t.Fatalf("valid multi-user build failed: %v", err)
+	}
+	cfg := m.(*chitanda.InboundConfig)
+	if len(cfg.Users) != 2 {
+		t.Fatalf("expected 2 users, got %d", len(cfg.Users))
+	}
+	if cfg.Users[0].Email != "alice@chitanda.org" || cfg.Users[0].Level != 1 {
+		t.Fatalf("alice config mismatch: %v", cfg.Users[0])
+	}
+	if cfg.Users[1].Email != "bob@chitanda.org" || cfg.Users[1].Level != 2 {
+		t.Fatalf("bob config mismatch: %v", cfg.Users[1])
+	}
+
+	// 2. Reject empty email
+	emptyEmailCfg := ChitandaInboundConfig{
+		Transport: "h2",
+		Users: []*ChitandaUser{
+			{Email: "   ", PSK: "alice-key-at-least-32-bytes-long!"},
+		},
+	}
+	if _, err := emptyEmailCfg.Build(); err == nil {
+		t.Fatal("expected error for empty email, got nil")
+	}
+
+	// 3. Reject duplicate email (case-insensitive)
+	dupEmailCfg := ChitandaInboundConfig{
+		Transport: "h2",
+		Users: []*ChitandaUser{
+			{Email: "alice@chitanda.org", PSK: "alice-key-at-least-32-bytes-long!"},
+			{Email: "ALICE@chitanda.org", PSK: "other-key-at-least-32-bytes-long!"},
+		},
+	}
+	if _, err := dupEmailCfg.Build(); err == nil {
+		t.Fatal("expected error for duplicate email, got nil")
+	}
+
+	// 4. Reject short PSK
+	shortPSKCfg := ChitandaInboundConfig{
+		Transport: "h2",
+		Users: []*ChitandaUser{
+			{Email: "bob@chitanda.org", PSK: "short-psk"},
+		},
+	}
+	if _, err := shortPSKCfg.Build(); err == nil {
+		t.Fatal("expected error for short PSK, got nil")
+	}
+
+	// 5. Reject duplicate PSK
+	dupPSKCfg := ChitandaInboundConfig{
+		Transport: "h2",
+		Users: []*ChitandaUser{
+			{Email: "alice@chitanda.org", PSK: "shared-key-at-least-32-bytes-long!"},
+			{Email: "bob@chitanda.org", PSK: "shared-key-at-least-32-bytes-long!"},
+		},
+	}
+	if _, err := dupPSKCfg.Build(); err == nil {
+		t.Fatal("expected error for duplicate PSK, got nil")
+	}
+}
