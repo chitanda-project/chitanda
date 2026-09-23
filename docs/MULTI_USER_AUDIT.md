@@ -5,8 +5,7 @@
 ## 已发现并修正
 
 - 独立 `StreamServer.AttachUDP` 在多用户模式仍用空的旧版单密钥，可能以空密钥创建可转发的 UDP 服务。改为按用户构造编解码器，并按 `(userIndex, sessionID)` 隔离会话与回包；新增双用户同会话号、空密钥拒绝的实际 UDP 回环回归。
-- 原构造函数会静默忽略无效密钥，直接 Protobuf 配置也可绕过 JSON 校验。现在拒绝空/短/重复密钥、重复身份、空多用户身份、混用顶层 `psk` 与 `users`、超出 128 用户，并复制调用方密钥。
-- 原 Xray UDP replay registry 扩容会复制包含锁的结构体。改为构造时定长初始化；恢复请求上下文中 `ExcludeForDomain` 切片的复制，避免多流共享可变数据。
+- 原 Xray UDP replay registry 扩容会复制包含锁的结构体，改为构造时定长初始化；修正请求上下文中切片复制，对 `OverrideDestinationForProtocol` 字符串切片进行防御性拷贝，并纠正此前对 `ExcludeForDomain` 的误切片（上游 Xray-core 中其为 `geodata.DomainMatcher` 接口，不可切片复制）。
 - 全栈 Xray 实测发现：原生 UDP 包级认证用户被连接级入站上下文覆盖，TCP 正常但 UDP 不记入用户计数器。现调整路由上下文的值优先级，保持连接生命周期的同时优先使用已认证包级身份；回归检查两个用户的 TCP 与 UDP 上下行精确归账。
 - 新增 Xray 策略和 Stats 计数器回归；用户计数仍依赖对应 `Level` 启用 `statsUserUplink`/`statsUserDownlink`。
 - **解耦 UDP 路径以消除试解密开销（方案 A 落地）**：用户确认生产部署（如 3X-UI / Xray 标准实践）中各入站端口均有独立确定的协议与 Transport，无需在同端口混跑 Stream 与 H3 UDP。因此在 `integration/xray/inbound.go` 中完成路径分立：
