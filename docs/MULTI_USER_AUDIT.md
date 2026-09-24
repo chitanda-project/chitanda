@@ -1,6 +1,6 @@
 # 多用户实现审计与验收状态
 
-基线：`main` 2dbb63f（之后的 2fcbd72 仅更新 Mihomo 发布记录）；送审：`dev` ca2ce56 及后续待提交修正。该审计覆盖 SDK、Xray 注入适配、构建与两台 Linux/ARM 节点的隔离端口性能；不代表 3X-UI 适配、正式服务部署或抗封锁效果验收。测试节点为 170.9.59.149 与 168.138.209.1，未触碰正式服务。
+基线：`main` 2dbb63f（之后的 2fcbd72 仅更新 Mihomo 发布记录）；送审：`dev` 3f8a14b。该审计覆盖 SDK、Xray 注入适配、构建与两台 Linux/ARM 节点的隔离端口性能；不代表 3X-UI 适配、正式服务部署或抗封锁效果验收。测试节点为 170.9.59.149 与 168.138.209.1，未触碰正式服务。
 
 ## 已发现并修正
 
@@ -15,11 +15,12 @@
 
 ## 已运行的门禁
 
-- `go test -mod=mod ./internal/... ./pkg/... -count=1 -timeout=180s`：通过；dev 专用 Linux Actions 在 ca2ce56 上的 SDK 与注入 Xray `-race`、构建工作流均通过（[运行记录](https://github.com/chitanda-project/chitanda/actions/runs/35837632086)）。本轮未提交变动仍须重跑同一门禁。
+- `go test -mod=mod ./internal/... ./pkg/... -count=1 -timeout=180s`：通过；dev 专用 Linux Actions 在 3f8a14b 上的 SDK 与注入 Xray `-race`、vendor 补丁及构建工作流均通过（[运行记录](https://github.com/chitanda-project/chitanda/actions/runs/35943421376)）。
 - 注入 Xray 后 `go test -mod=mod ./proxy/chitanda -count=1 -timeout=180s`：通过（40+ 项测试全绿）；新增真实 H3/auto 双用户分别连通及同一入站并发身份测试、分 Transport UDP 路由回归测试。
 - 真实 Xray JSON 入站 + Freedom 出站 + Policy/Stats 全栈回环：两个用户的 Stream TCP 与原生 UDP 上下行计数精确归属，本地重复运行 10 次通过。
 - `go test -mod=mod ./infra/conf -run Chitanda -count=1 -timeout=120s`：通过。
 - `go vet`（SDK、Xray 适配与配置包）及 `go build -mod=mod ./main`（注入 Xray）：通过。
+- 发布流程实际采用的 Xray 最新 release 标签 `v26.3.27` 与审计工作流固定的 `v1.260327.0` 不是同一提交。另在已授权 ARM64 测试机的隔离目录，基于 `v26.3.27` 和 dev 3f8a14b 完成注入、Xray 根模块 vendor 补丁、QUIC/HTTP3 测试、Chitanda 适配与配置 `-race`、`go build -mod=vendor ./main`，全部通过；构建 SHA-256 为 `94a46508d4066c192e817492e9033dfbda8063def599f5b72dd6f58384dca8c0`。
 - 全量 `./infra/conf` 有非 Chitanda 用例 `TestToCidrList` 因验证副本缺少 `geoip.dat` 失败；不能记为全量通过。
 - 仓库根目录的 `go test ./...` 不适用于当前注入式集成布局：`integration/xray`、`integration/mihomo*` 依赖各自上游源码中的类型；应以 SDK 测试和注入后的上游包测试作为门禁。
 
@@ -32,10 +33,10 @@
 - 独立构建的 `main` 单用户 H3 UDP 也复现高丢包（50 Mbps 约 46 Mbps、6.4%；100 Mbps 某轮约 32.6 Mbps、67%）。`dev` 单用户在相近测试中 100 Mbps 接收范围约 19–45 Mbps，不能从高波动样本推断 dev 相比 main 有确定的吞吐变化。H3 瓶颈是原有路径问题，不是多用户试解密回归。
 - Xray 根模块原发布流程未使用 Chitanda 的 QUIC vendor 性能补丁。隔离构建修正后，两端同一产物的 H3 UDP 在 100 Mbps 两轮实收 77.4/97.1 Mbps；200 Mbps 两轮均约 68 Mbps、约 65% 丢包。数值来自保留的 iperf3 原始 JSON；**这是部分改善，不是 200 Mbps 验收通过**。详情见 `docs/UDP_AUDIT_2026-09-24.md`。
 
-## 尚未通过的合入门禁
+## 合入判断与保留事项
 
-1. 本轮 H2 窗口、Auto 探测、Xray 根模块 vendor 构建变更须提交 `dev` 并通过 Linux SDK/Xray `-race`、注入构建与 JSON 入/出站门禁；不能用前一提交的绿灯代替。
-2. H2 15 MiB 接收窗口应记录并发连接下的内存上界；尚无正式服务长时间压力与故障恢复数据。
+1. 多用户功能、Xray 注入及发布构建的已定义门禁通过；`dev` 3f8a14b 与当前 `main` 2fcbd72 的 Git 合并预检无冲突。此处不等于正式环境部署验收。
+2. H2 接收流控窗口为每连接及每流 15 MiB，用来保持约 100 ms RTT 下的单流速率。若大量未认证连接并发填满窗口，内存暴露面会扩大；尚无正式服务长时间压力与故障恢复数据，部署时须限制入站并发、监控 RSS 与连接数。
 3. H3 UDP 200 Mbps 仍有约 65% 丢包；反向高负载、尾延迟及不同节点复测未完成。若本次合入仅以“多用户不回归”为范围，必须在发布说明显著保留该已知限制；不得宣称 UDP 速率目标已完成。
 
-结论：目标机的多用户吞吐未显示出明确的单用户回归，但构建门禁与 H3 UDP 已知限制仍需按上文处理；在所有必需门禁完成前保持 `dev`，不合入 `main`。
+结论：以“多用户及 Xray 接入无明确回归”为本次合入范围，当前 `dev` 可进入合入 `main` 的决策；H3 UDP 200 Mbps 与正式生产内存压力并未验收。未经用户明确指示，不执行合并。
