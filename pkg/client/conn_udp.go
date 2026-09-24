@@ -142,6 +142,11 @@ func (m *h3TransportManager) ensureUDP(ctx context.Context) (*h3Connection, erro
 	return m.ensureConnection(ctx, &m.currentUDP)
 }
 
+func (m *h3TransportManager) prewarm(ctx context.Context) error {
+	_, err := m.ensureUDP(ctx)
+	return err
+}
+
 func (m *h3TransportManager) invalidate(c *h3Connection) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

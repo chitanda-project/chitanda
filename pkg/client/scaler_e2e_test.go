@@ -2,44 +2,41 @@ package client_test
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/violetaini/chitanda/pkg/client"
 	"github.com/violetaini/chitanda/pkg/plugin/autoscaler"
+	"github.com/violetaini/chitanda/pkg/server"
+	"golang.org/x/net/http2"
 )
 
-func TestClient_AutoscalerE2E(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
+func startE2EH2Server(t *testing.T, psk []byte) (*httptest.Server, func()) {
+	srvHandler := server.NewServer("/e2e", psk, nil, nil, 1024)
+	srvHandler.SetDialTargetForTest(func(ctx context.Context, address string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", address)
+	})
+	ts := httptest.NewUnstartedServer(srvHandler)
+	if err := http2.ConfigureServer(ts.Config, &http2.Server{}); err != nil {
+		t.Fatalf("ConfigureServer: %v", err)
 	}
-	defer ln.Close()
+	ts.TLS = &tls.Config{NextProtos: []string{"h2"}}
+	ts.StartTLS()
+	return ts, func() { ts.Close() }
+}
 
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				buf := make([]byte, 2048)
-				for {
-					_, err := c.Read(buf)
-					if err != nil {
-						return
-					}
-				}
-			}(conn)
-		}
-	}()
-
+func TestClient_AutoscalerE2E(t *testing.T) {
 	testPSK := make([]byte, 32)
 	for i := range testPSK {
 		testPSK[i] = 0x55
 	}
+
+	ts, cleanup := startE2EH2Server(t, testPSK)
+	defer cleanup()
 
 	scaler := autoscaler.New(autoscaler.Config{
 		MaxCarriers:      4,
@@ -50,18 +47,15 @@ func TestClient_AutoscalerE2E(t *testing.T) {
 	})
 
 	cli, err := client.New(client.Config{
-		Server:       ln.Addr().String(),
-		ServerName:   "localhost",
-		Path:         "/e2e",
-		PSK:          testPSK,
-		TCPTransport: client.TCPTransportH2,
-		TCPPoolSize:  2,
-		MaxPoolSize:  4,
-		Autoscaler:   scaler,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "tcp", ln.Addr().String())
-		},
+		Server:             ts.Listener.Addr().String(),
+		ServerName:         "localhost",
+		Path:               "/e2e",
+		PSK:                testPSK,
+		TCPTransport:       client.TCPTransportH2,
+		TCPPoolSize:        2,
+		MaxPoolSize:        4,
+		InsecureSkipVerify: true,
+		Autoscaler:         scaler,
 	})
 	if err != nil {
 		t.Fatalf("New client error: %v", err)
@@ -73,15 +67,11 @@ func TestClient_AutoscalerE2E(t *testing.T) {
 	if stats.TotalCarriers != 2 {
 		t.Fatalf("expected 2 initial carriers, got %d", stats.TotalCarriers)
 	}
-
-	// 2. Simulate Load: Artificially record 2 streams per carrier by calling Stats check or pickBest
-	// Under threshold=2, calling pickBest twice on 2 carriers gives activeStreams=0 initially
-	// Let's verify stats are working
-	if stats.MinActiveStreams != 0 {
-		t.Fatalf("expected 0 active streams initially, got %d", stats.MinActiveStreams)
+	if stats.BaseCarriers != 2 {
+		t.Fatalf("expected 2 base carriers, got %d", stats.BaseCarriers)
 	}
 
-	// Directly trigger AddCarrier through pool controller to verify scaler works with client
+	// 2. Verified Physical AddCarrier
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -93,8 +83,11 @@ func TestClient_AutoscalerE2E(t *testing.T) {
 	if stats.TotalCarriers != 3 {
 		t.Fatalf("expected 3 carriers after AddCarrier, got %d", stats.TotalCarriers)
 	}
+	if stats.DynamicCarriers != 1 {
+		t.Fatalf("expected 1 dynamic carrier, got %d", stats.DynamicCarriers)
+	}
 
-	// Wait for idle duration (50ms) and trigger sweep
+	// 3. Wait for idle duration (50ms) and trigger sweep
 	time.Sleep(100 * time.Millisecond)
 	scaler.TriggerSweep()
 

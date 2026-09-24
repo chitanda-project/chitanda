@@ -73,21 +73,23 @@ type Config struct {
 
 // Client is the MyXray core client engine.
 type Client struct {
-	cfg          Config
-	rootURL      string
-	requestURL   string
-	carrierMu    sync.RWMutex
-	scaleMu      sync.Mutex
-	h2Clients    []*h2TransportClient
-	nextH2Idx    atomic.Uint64
-	h3Managers   []*h3TransportManager
-	nextH3Idx    atomic.Uint64
-	sessionCache *sessioncache.Cache
-	prober       *h2Prober
-	autoscaler   AutoscalerPlugin
-	maxCarriers  int
-	mu           sync.Mutex
-	closed       bool
+	cfg            Config
+	rootURL        string
+	requestURL     string
+	carrierMu      sync.RWMutex
+	scaleMu        sync.Mutex
+	h2Clients      []*h2TransportClient
+	baseH2Carriers int
+	nextH2Idx      atomic.Uint64
+	h3Managers     []*h3TransportManager
+	baseH3Carriers int
+	nextH3Idx      atomic.Uint64
+	sessionCache   *sessioncache.Cache
+	prober         *h2Prober
+	autoscaler     AutoscalerPlugin
+	maxCarriers    int
+	mu             sync.Mutex
+	closed         bool
 }
 
 func (c *Client) dialRaw(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -205,14 +207,16 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	c := &Client{
-		cfg:          cfg,
-		rootURL:      rootURL,
-		requestURL:   requestURL,
-		h2Clients:    h2Clients,
-		h3Managers:   h3Managers,
-		sessionCache: cache,
-		maxCarriers:  maxCarriers,
-		autoscaler:   cfg.Autoscaler,
+		cfg:            cfg,
+		rootURL:        rootURL,
+		requestURL:     requestURL,
+		h2Clients:      h2Clients,
+		baseH2Carriers: len(h2Clients),
+		h3Managers:     h3Managers,
+		baseH3Carriers: len(h3Managers),
+		sessionCache:   cache,
+		maxCarriers:    maxCarriers,
+		autoscaler:     cfg.Autoscaler,
 	}
 	if cfg.TCPTransport == TCPTransportAuto {
 		c.prober = newH2Prober(c)

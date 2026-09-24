@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/violetaini/chitanda/pkg/client"
+	"github.com/violetaini/chitanda/pkg/plugin/autoscaler"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -78,6 +79,17 @@ func NewOutboundHandler(ctx context.Context, config *OutboundConfig) (*OutboundH
 		poolSize = 4
 	}
 
+	var scaler client.AutoscalerPlugin
+	if config.AutoScale || (config.MaxPoolSize > 0 && config.MaxPoolSize > poolSize) {
+		maxCarriers := int(config.MaxPoolSize)
+		if maxCarriers <= 0 {
+			maxCarriers = 8
+		}
+		scaler = autoscaler.New(autoscaler.Config{
+			MaxCarriers: maxCarriers,
+		})
+	}
+
 	cli, err := client.New(client.Config{
 		Server:             config.Server,
 		ServerName:         config.ServerName,
@@ -87,6 +99,8 @@ func NewOutboundHandler(ctx context.Context, config *OutboundConfig) (*OutboundH
 		TCPTransport:       transportMode,
 		TCPPoolSize:        int(poolSize),
 		UDPPoolSize:        int(poolSize),
+		MaxPoolSize:        int(config.MaxPoolSize),
+		Autoscaler:         scaler,
 		InsecureSkipVerify: config.AllowInsecure,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			dest, err := xnet.ParseDestination(network + ":" + addr)

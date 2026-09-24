@@ -34,5 +34,7 @@ message OutboundConfig {
   int32 pool_size = 6;
   string server_id = 7;
   bool allow_insecure = 8;
+  bool auto_scale = 9;
+  int32 max_pool_size = 10;
 }
 

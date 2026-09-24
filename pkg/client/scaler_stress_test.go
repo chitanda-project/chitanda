@@ -2,7 +2,9 @@ package client_test
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
+	"net/http/httptest"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -11,56 +13,37 @@ import (
 
 	"github.com/violetaini/chitanda/pkg/client"
 	"github.com/violetaini/chitanda/pkg/plugin/autoscaler"
+	"github.com/violetaini/chitanda/pkg/server"
+	"golang.org/x/net/http2"
 )
 
-// startDuplexLoopbackServer creates a raw TCP echo listener for client stress testing.
-func startDuplexLoopbackServer(t *testing.T) (net.Listener, func()) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to create stress listener: %v", err)
+// startStressH2Server creates a real H2 TLS server for client stress testing.
+func startStressH2Server(t *testing.T, psk []byte) (*httptest.Server, func()) {
+	srvHandler := server.NewServer("/stress", psk, nil, nil, 1024)
+	srvHandler.SetDialTargetForTest(func(ctx context.Context, address string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", address)
+	})
+	ts := httptest.NewUnstartedServer(srvHandler)
+	if err := http2.ConfigureServer(ts.Config, &http2.Server{}); err != nil {
+		t.Fatalf("ConfigureServer: %v", err)
 	}
-
-	stopCh := make(chan struct{})
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				buf := make([]byte, 4096)
-				for {
-					n, err := c.Read(buf)
-					if err != nil {
-						return
-					}
-					// Echo back
-					if _, err := c.Write(buf[:n]); err != nil {
-						return
-					}
-				}
-			}(conn)
-		}
-	}()
-
-	return ln, func() {
-		close(stopCh)
-		_ = ln.Close()
-	}
+	ts.TLS = &tls.Config{NextProtos: []string{"h2"}}
+	ts.StartTLS()
+	return ts, func() { ts.Close() }
 }
 
 // -----------------------------------------------------------------------------
 // 1. Extreme Concurrency on Real Client: 200 Workers + Active Scaling
 // -----------------------------------------------------------------------------
 func TestClient_Stress_MassiveParallelScaling(t *testing.T) {
-	ln, cleanup := startDuplexLoopbackServer(t)
-	defer cleanup()
-
 	testPSK := make([]byte, 32)
 	for i := range testPSK {
 		testPSK[i] = 0x77
 	}
+
+	ts, cleanup := startStressH2Server(t, testPSK)
+	defer cleanup()
 
 	scaler := autoscaler.New(autoscaler.Config{
 		MaxCarriers:      6,
@@ -71,18 +54,15 @@ func TestClient_Stress_MassiveParallelScaling(t *testing.T) {
 	})
 
 	cli, err := client.New(client.Config{
-		Server:       ln.Addr().String(),
-		ServerName:   "localhost",
-		Path:         "/stress",
-		PSK:          testPSK,
-		TCPTransport: client.TCPTransportH2,
-		TCPPoolSize:  2,
-		MaxPoolSize:  6,
-		Autoscaler:   scaler,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "tcp", ln.Addr().String())
-		},
+		Server:             ts.Listener.Addr().String(),
+		ServerName:         "localhost",
+		Path:               "/stress",
+		PSK:                testPSK,
+		TCPTransport:       client.TCPTransportH2,
+		TCPPoolSize:        2,
+		MaxPoolSize:        6,
+		InsecureSkipVerify: true,
+		Autoscaler:         scaler,
 	})
 	if err != nil {
 		t.Fatalf("New client failed: %v", err)
@@ -104,14 +84,12 @@ func TestClient_Stress_MassiveParallelScaling(t *testing.T) {
 			<-startSignal
 
 			for j := 0; j < 50; j++ {
-				// Query stats
 				stats := cli.Stats("h2")
 				if stats.TotalCarriers < 2 || stats.TotalCarriers > 6 {
 					failedOps.Add(1)
 					return
 				}
 
-				// Trigger expansion check
 				if j%10 == 0 {
 					scaler.OnActivity("h2", 10, stats.TotalCarriers)
 				}
@@ -140,26 +118,23 @@ func TestClient_Stress_MassiveParallelScaling(t *testing.T) {
 // 2. High-Contention Race: Concurrent AddCarrier vs RemoveIdleCarrier
 // -----------------------------------------------------------------------------
 func TestClient_Stress_AddRemoveCollisionRace(t *testing.T) {
-	ln, cleanup := startDuplexLoopbackServer(t)
-	defer cleanup()
-
 	testPSK := make([]byte, 32)
 	for i := range testPSK {
 		testPSK[i] = 0xAA
 	}
 
+	ts, cleanup := startStressH2Server(t, testPSK)
+	defer cleanup()
+
 	cli, err := client.New(client.Config{
-		Server:       ln.Addr().String(),
-		ServerName:   "localhost",
-		Path:         "/collision",
-		PSK:          testPSK,
-		TCPTransport: client.TCPTransportH2,
-		TCPPoolSize:  2,
-		MaxPoolSize:  8,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "tcp", ln.Addr().String())
-		},
+		Server:             ts.Listener.Addr().String(),
+		ServerName:         "localhost",
+		Path:               "/stress",
+		PSK:                testPSK,
+		TCPTransport:       client.TCPTransportH2,
+		TCPPoolSize:        2,
+		MaxPoolSize:        8,
+		InsecureSkipVerify: true,
 	})
 	if err != nil {
 		t.Fatalf("New client failed: %v", err)
@@ -225,8 +200,7 @@ func TestClient_Stress_AddRemoveCollisionRace(t *testing.T) {
 		}()
 	}
 
-	// Let the collision race run full blast for 500ms
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 	close(stop)
 	wg.Wait()
 
@@ -241,13 +215,13 @@ func TestClient_Stress_AddRemoveCollisionRace(t *testing.T) {
 // 3. Client Lifecycle Zero-Leak Benchmark
 // -----------------------------------------------------------------------------
 func TestClient_Stress_ZeroLeakLifecycle(t *testing.T) {
-	ln, cleanup := startDuplexLoopbackServer(t)
-	defer cleanup()
-
 	testPSK := make([]byte, 32)
 	for i := range testPSK {
 		testPSK[i] = 0x88
 	}
+
+	ts, cleanup := startStressH2Server(t, testPSK)
+	defer cleanup()
 
 	initialGR := runtime.NumGoroutine()
 
@@ -260,24 +234,20 @@ func TestClient_Stress_ZeroLeakLifecycle(t *testing.T) {
 		})
 
 		cli, err := client.New(client.Config{
-			Server:       ln.Addr().String(),
-			ServerName:   "localhost",
-			Path:         "/leak",
-			PSK:          testPSK,
-			TCPTransport: client.TCPTransportH2,
-			TCPPoolSize:  2,
-			MaxPoolSize:  6,
-			Autoscaler:   scaler,
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, "tcp", ln.Addr().String())
-			},
+			Server:             ts.Listener.Addr().String(),
+			ServerName:         "localhost",
+			Path:               "/stress",
+			PSK:                testPSK,
+			TCPTransport:       client.TCPTransportH2,
+			TCPPoolSize:        2,
+			MaxPoolSize:        6,
+			InsecureSkipVerify: true,
+			Autoscaler:         scaler,
 		})
 		if err != nil {
 			t.Fatalf("New client error: %v", err)
 		}
 
-		// Fire rapid scale-up
 		ctx := context.Background()
 		_ = cli.AddCarrier(ctx, "h2")
 		_ = cli.AddCarrier(ctx, "h2")

@@ -2,10 +2,16 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"net"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/violetaini/chitanda/pkg/server"
+	"golang.org/x/net/http2"
 )
 
 type dummyAutoscaler struct {
@@ -29,63 +35,43 @@ func (d *dummyAutoscaler) Close() error {
 	return nil
 }
 
-func startMockListener(t *testing.T) (net.Listener, func()) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to create listener: %v", err)
+func startMockH2Server(t *testing.T, psk []byte) (*httptest.Server, func()) {
+	srvHandler := server.NewServer("/test", psk, nil, nil, 1024)
+	srvHandler.SetDialTargetForTest(func(ctx context.Context, address string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", address)
+	})
+	ts := httptest.NewUnstartedServer(srvHandler)
+	if err := http2.ConfigureServer(ts.Config, &http2.Server{}); err != nil {
+		t.Fatalf("ConfigureServer: %v", err)
 	}
-
-	stopCh := make(chan struct{})
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				buf := make([]byte, 2048)
-				for {
-					_, err := c.Read(buf)
-					if err != nil {
-						return
-					}
-				}
-			}(conn)
-		}
-	}()
-
-	cleanup := func() {
-		close(stopCh)
-		_ = ln.Close()
-	}
-	return ln, cleanup
+	ts.TLS = &tls.Config{NextProtos: []string{"h2"}}
+	ts.StartTLS()
+	return ts, func() { ts.Close() }
 }
 
 func TestClient_ScalerPoolController(t *testing.T) {
-	ln, cleanup := startMockListener(t)
-	defer cleanup()
-
-	dummyScaler := &dummyAutoscaler{}
 	testPSK := make([]byte, 32)
 	for i := range testPSK {
 		testPSK[i] = 0x42
 	}
 
+	ts, cleanup := startMockH2Server(t, testPSK)
+	defer cleanup()
+
+	dummyScaler := &dummyAutoscaler{}
+
 	cli, err := New(Config{
-		Server:       ln.Addr().String(),
-		ServerName:   "localhost",
-		Path:         "/test",
-		PSK:          testPSK,
-		TCPTransport: TCPTransportH2,
-		TCPPoolSize:  2,
-		UDPPoolSize:  2,
-		MaxPoolSize:  5,
-		Autoscaler:   dummyScaler,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "tcp", ln.Addr().String())
-		},
+		Server:             ts.Listener.Addr().String(),
+		ServerName:         "localhost",
+		Path:               "/test",
+		PSK:                testPSK,
+		TCPTransport:       TCPTransportH2,
+		TCPPoolSize:        2,
+		UDPPoolSize:        2,
+		MaxPoolSize:        5,
+		InsecureSkipVerify: true,
+		Autoscaler:         dummyScaler,
 	})
 	if err != nil {
 		t.Fatalf("New client error: %v", err)
@@ -168,26 +154,23 @@ func TestClient_ScalerPoolController(t *testing.T) {
 }
 
 func TestClient_ScalerConcurrentSafety(t *testing.T) {
-	ln, cleanup := startMockListener(t)
-	defer cleanup()
-
 	testPSK := make([]byte, 32)
 	for i := range testPSK {
 		testPSK[i] = 0x99
 	}
 
+	ts, cleanup := startMockH2Server(t, testPSK)
+	defer cleanup()
+
 	cli, err := New(Config{
-		Server:       ln.Addr().String(),
-		ServerName:   "localhost",
-		Path:         "/concurrent",
-		PSK:          testPSK,
-		TCPTransport: TCPTransportH2,
-		TCPPoolSize:  2,
-		MaxPoolSize:  6,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "tcp", ln.Addr().String())
-		},
+		Server:             ts.Listener.Addr().String(),
+		ServerName:         "localhost",
+		Path:               "/test",
+		PSK:                testPSK,
+		TCPTransport:       TCPTransportH2,
+		TCPPoolSize:        2,
+		MaxPoolSize:        6,
+		InsecureSkipVerify: true,
 	})
 	if err != nil {
 		t.Fatalf("New client error: %v", err)
@@ -239,4 +222,102 @@ func TestClient_ScalerConcurrentSafety(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+// TestClient_BaseCarriersPreservedUnderAutoMode verifies Codex bug #2:
+// Under Auto mode with TCPPoolSize: 4, UDPPoolSize: 2, 4 H3 managers are initialized as base channels.
+// They must NOT be misclassified as dynamic channels or evicted on idle sweep!
+func TestClient_BaseCarriersPreservedUnderAutoMode(t *testing.T) {
+	testPSK := make([]byte, 32)
+	for i := range testPSK {
+		testPSK[i] = 0x33
+	}
+
+	cli, err := New(Config{
+		Server:       "127.0.0.1:443",
+		ServerName:   "localhost",
+		Path:         "/auto-test",
+		PSK:          testPSK,
+		TCPTransport: TCPTransportAuto,
+		TCPPoolSize:  4,
+		UDPPoolSize:  2,
+		MaxPoolSize:  8,
+	})
+	if err != nil {
+		t.Fatalf("New client error: %v", err)
+	}
+	defer cli.Close()
+
+	// Under Auto mode with TCP=4, UDP=2:
+	// H2 base count is 4.
+	// H3 base count is max(4, 2) = 4 (for failover).
+	h3Stats := cli.Stats("h3")
+	if h3Stats.BaseCarriers != 4 {
+		t.Fatalf("expected 4 base H3 carriers, got %d", h3Stats.BaseCarriers)
+	}
+	if h3Stats.DynamicCarriers != 0 {
+		t.Fatalf("expected 0 dynamic H3 carriers initially, got %d", h3Stats.DynamicCarriers)
+	}
+
+	// Try to remove idle carrier: MUST return false and not evict any of the 4 initial H3 carriers
+	removed, err := cli.RemoveIdleCarrier("h3", 0)
+	if err != nil {
+		t.Fatalf("RemoveIdleCarrier failed: %v", err)
+	}
+	if removed {
+		t.Fatalf("CRITICAL BUG REPRODUCED: initial H3 base carrier was wrongly evicted!")
+	}
+
+	h3Stats = cli.Stats("h3")
+	if h3Stats.TotalCarriers != 4 {
+		t.Fatalf("expected pool to retain all 4 base carriers, got %d", h3Stats.TotalCarriers)
+	}
+}
+
+// TestClient_AddCarrier_FailsOnCanceledContextOrUnreachableServer verifies Codex bug #3:
+// AddCarrier must NOT return success if the context is canceled or the server is unreachable.
+func TestClient_AddCarrier_FailsOnCanceledContextOrUnreachableServer(t *testing.T) {
+	testPSK := make([]byte, 32)
+	for i := range testPSK {
+		testPSK[i] = 0x22
+	}
+
+	cli, err := New(Config{
+		Server:       "127.0.0.1:59999", // Unreachable port
+		ServerName:   "localhost",
+		Path:         "/probe-fail",
+		PSK:          testPSK,
+		TCPTransport: TCPTransportH2,
+		TCPPoolSize:  2,
+		MaxPoolSize:  6,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return nil, errors.New("connection refused by mock")
+		},
+	})
+	if err != nil {
+		t.Fatalf("New client error: %v", err)
+	}
+	defer cli.Close()
+
+	// 1. Context already canceled
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = cli.AddCarrier(canceledCtx, "h2")
+	if err == nil {
+		t.Fatalf("expected AddCarrier to fail with canceled context, got nil")
+	}
+
+	// 2. Server unreachable (probe fails)
+	validCtx, cancelValid := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancelValid()
+	err = cli.AddCarrier(validCtx, "h2")
+	if err == nil {
+		t.Fatalf("CRITICAL BUG REPRODUCED: AddCarrier returned success on unreachable server!")
+	}
+
+	// Pool should NOT have expanded
+	stats := cli.Stats("h2")
+	if stats.TotalCarriers != 2 {
+		t.Fatalf("expected pool to remain at 2, got %d", stats.TotalCarriers)
+	}
 }

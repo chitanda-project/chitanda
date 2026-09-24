@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/violetaini/chitanda/pkg/client"
+	"github.com/violetaini/chitanda/pkg/plugin/autoscaler"
 
 	C "github.com/metacubex/mihomo/constant"
 )
@@ -26,6 +27,8 @@ type ChitandaOption struct {
 	ServerID       string `proxy:"server-id,omitempty"`
 	PoolSize       int    `proxy:"pool-size,omitempty"`
 	UDPPoolSize    int    `proxy:"udp-pool-size,omitempty"`
+	MaxPoolSize    int    `proxy:"max-pool-size,omitempty"`
+	AutoScale      *bool  `proxy:"auto-scale,omitempty"`
 	UDP            *bool  `proxy:"udp,omitempty"`
 	SkipCertVerify bool   `proxy:"skip-cert-verify,omitempty"`
 }
@@ -108,6 +111,23 @@ func (c *Chitanda) getClient() (*client.Client, error) {
 		sni = c.option.Server
 	}
 
+	var scaler client.AutoscalerPlugin
+	autoScaleEnabled := false
+	if c.option.AutoScale != nil && *c.option.AutoScale {
+		autoScaleEnabled = true
+	} else if c.option.MaxPoolSize > c.option.PoolSize && c.option.MaxPoolSize > 0 {
+		autoScaleEnabled = true
+	}
+	if autoScaleEnabled {
+		maxCarriers := c.option.MaxPoolSize
+		if maxCarriers <= 0 {
+			maxCarriers = 8
+		}
+		scaler = autoscaler.New(autoscaler.Config{
+			MaxCarriers: maxCarriers,
+		})
+	}
+
 	cli, err := client.New(client.Config{
 		Server:             serverAddr,
 		ServerName:         sni,
@@ -117,6 +137,8 @@ func (c *Chitanda) getClient() (*client.Client, error) {
 		TCPTransport:       c.option.Transport,
 		TCPPoolSize:        c.option.PoolSize,
 		UDPPoolSize:        c.option.UDPPoolSize,
+		MaxPoolSize:        c.option.MaxPoolSize,
+		Autoscaler:         scaler,
 		InsecureSkipVerify: c.option.SkipCertVerify,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return c.dialer.DialContext(ctx, network, addr)

@@ -59,8 +59,8 @@ type Autoscaler struct {
 	scaleUpCount   atomic.Int64
 	scaleDownCount atomic.Int64
 
-	initOnce sync.Once
-	closed   atomic.Bool
+	initialized atomic.Bool
+	closed      atomic.Bool
 }
 
 // New creates an Autoscaler plugin with the specified configuration.
@@ -98,31 +98,24 @@ func Default() *Autoscaler {
 
 // Init binds the autoscaler to a Client's PoolController and launches the background controller loop.
 func (a *Autoscaler) Init(controller client.PoolController) error {
-	var err error
-	a.initOnce.Do(func() {
-		if controller == nil {
-			err = errors.New("autoscaler: nil pool controller")
-			return
-		}
-		a.controller = controller
-
-		if max := controller.MaxPoolSize(); max > 0 && max < a.cfg.MaxCarriers {
-			a.cfg.MaxCarriers = max
-		}
-
-		ctx, cancel := context.WithCancel(context.Background())
-		a.ctx = ctx
-		a.cancel = cancel
-
-		a.wg.Add(1)
-		go a.runLoop()
-	})
-	if err != nil {
-		return err
+	if controller == nil {
+		return errors.New("autoscaler: nil pool controller")
 	}
-	if a.controller == nil {
+	if !a.initialized.CompareAndSwap(false, true) {
 		return ErrAlreadyInitialized
 	}
+	a.controller = controller
+
+	if max := controller.MaxPoolSize(); max > 0 && max < a.cfg.MaxCarriers {
+		a.cfg.MaxCarriers = max
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	a.ctx = ctx
+	a.cancel = cancel
+
+	a.wg.Add(1)
+	go a.runLoop()
 	return nil
 }
 

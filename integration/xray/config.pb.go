@@ -207,6 +207,8 @@ type OutboundConfig struct {
 	PoolSize      int32                  `protobuf:"varint,6,opt,name=pool_size,json=poolSize,proto3" json:"pool_size,omitempty"`
 	ServerId      string                 `protobuf:"bytes,7,opt,name=server_id,json=serverId,proto3" json:"server_id,omitempty"`
 	AllowInsecure bool                   `protobuf:"varint,8,opt,name=allow_insecure,json=allowInsecure,proto3" json:"allow_insecure,omitempty"`
+	AutoScale     bool                   `protobuf:"varint,9,opt,name=auto_scale,json=autoScale,proto3" json:"auto_scale,omitempty"`
+	MaxPoolSize   int32                  `protobuf:"varint,10,opt,name=max_pool_size,json=maxPoolSize,proto3" json:"max_pool_size,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -295,6 +297,20 @@ func (x *OutboundConfig) GetAllowInsecure() bool {
 		return x.AllowInsecure
 	}
 	return false
+}
+
+func (x *OutboundConfig) GetAutoScale() bool {
+	if x != nil {
+		return x.AutoScale
+	}
+	return false
+}
+
+func (x *OutboundConfig) GetMaxPoolSize() int32 {
+	if x != nil {
+		return x.MaxPoolSize
+	}
+	return 0
 }
 
 var File_integration_xray_config_proto protoreflect.FileDescriptor

@@ -46,9 +46,9 @@ type AutoscalerPlugin interface {
 // BasePoolSize returns the statically configured minimum base carriers for the given transport.
 func (c *Client) BasePoolSize(transport string) int {
 	if transport == "h3" {
-		return c.cfg.UDPPoolSize
+		return c.baseH3Carriers
 	}
-	return c.cfg.TCPPoolSize
+	return c.baseH2Carriers
 }
 
 // MaxPoolSize returns the upper bound limit for total carriers.
@@ -63,7 +63,7 @@ func (c *Client) Stats(transport string) PoolStats {
 
 	if transport == "h2" {
 		total := len(c.h2Clients)
-		base := c.cfg.TCPPoolSize
+		base := c.baseH2Carriers
 		if base > total {
 			base = total
 		}
@@ -97,7 +97,7 @@ func (c *Client) Stats(transport string) PoolStats {
 		return stats
 	} else if transport == "h3" {
 		total := len(c.h3Managers)
-		base := c.cfg.UDPPoolSize
+		base := c.baseH3Carriers
 		if base > total {
 			base = total
 		}
@@ -134,7 +134,12 @@ func (c *Client) Stats(transport string) PoolStats {
 }
 
 // AddCarrier dynamically creates, handshakes, and registers a new carrier into the pool.
+// It verifies context deadlines and probes physical connectivity before accepting the carrier.
 func (c *Client) AddCarrier(ctx context.Context, transport string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -156,6 +161,16 @@ func (c *Client) AddCarrier(ctx context.Context, transport string) error {
 		if err != nil {
 			return fmt.Errorf("create h2 carrier: %w", err)
 		}
+
+		// Verify physical connectivity and context cancellation
+		probeCtx, cancelProbe := context.WithTimeout(ctx, 3*time.Second)
+		err = h2Cli.prewarm(probeCtx)
+		cancelProbe()
+		if err != nil {
+			h2Cli.close()
+			return fmt.Errorf("probe h2 carrier failed: %w", err)
+		}
+
 		h2Cli.isDynamic = true
 		h2Cli.idleSince = now
 
@@ -182,6 +197,16 @@ func (c *Client) AddCarrier(ctx context.Context, transport string) error {
 		mgr := newH3TransportManager(
 			c.cfg.Server, c.cfg.ServerName, c.rootURL, c.requestURL, c.cfg.Path, c.cfg.PSK, c.sessionCache, c.cfg.QUICInitialPacketSize, c.cfg.InsecureSkipVerify, c.cfg.ListenPacket, c.cfg.ResolveUDP, c.cfg.DialPacket,
 		)
+
+		// Verify physical connectivity and context cancellation
+		probeCtx, cancelProbe := context.WithTimeout(ctx, 3*time.Second)
+		err := mgr.prewarm(probeCtx)
+		cancelProbe()
+		if err != nil {
+			mgr.close()
+			return fmt.Errorf("probe h3 carrier failed: %w", err)
+		}
+
 		mgr.isDynamic = true
 		mgr.idleSince = now
 
@@ -214,7 +239,7 @@ func (c *Client) RemoveIdleCarrier(transport string, minIdle time.Duration) (boo
 
 	if transport == "h2" {
 		c.carrierMu.Lock()
-		base := c.cfg.TCPPoolSize
+		base := c.baseH2Carriers
 		if len(c.h2Clients) <= base {
 			c.carrierMu.Unlock()
 			return false, nil
@@ -249,7 +274,7 @@ func (c *Client) RemoveIdleCarrier(transport string, minIdle time.Duration) (boo
 		return true, nil
 	} else if transport == "h3" {
 		c.carrierMu.Lock()
-		base := c.cfg.UDPPoolSize
+		base := c.baseH3Carriers
 		if len(c.h3Managers) <= base {
 			c.carrierMu.Unlock()
 			return false, nil

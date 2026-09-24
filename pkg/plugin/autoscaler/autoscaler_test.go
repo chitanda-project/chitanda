@@ -2,6 +2,7 @@ package autoscaler
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -283,5 +284,25 @@ func TestAutoscaler_NonBlockingLatency(t *testing.T) {
 	// 1000 OnActivity calls should complete in under 5 milliseconds (well under 5 microseconds each)
 	if elapsed > 10*time.Millisecond {
 		t.Errorf("OnActivity took too long: %v for 1000 calls", elapsed)
+	}
+}
+
+func TestAutoscaler_RebindError(t *testing.T) {
+	mock1 := newMockController(4, 4, 8)
+	mock2 := newMockController(4, 4, 8)
+
+	a := Default()
+	if err := a.Init(mock1); err != nil {
+		t.Fatalf("first Init failed: %v", err)
+	}
+	defer a.Close()
+
+	// Second Init with another controller MUST fail
+	err := a.Init(mock2)
+	if err == nil {
+		t.Fatalf("expected second Init to fail with ErrAlreadyInitialized, got nil")
+	}
+	if !errors.Is(err, ErrAlreadyInitialized) {
+		t.Fatalf("expected ErrAlreadyInitialized, got %v", err)
 	}
 }
