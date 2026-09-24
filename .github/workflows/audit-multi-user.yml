@@ -26,9 +26,17 @@ jobs:
         with:
           go-version-file: go.mod
       - run: python3 -m unittest discover -s scripts -p test_inject_xray.py
-      - name: Inject into pinned upstream Xray
+      - name: Resolve latest released Xray tag
+        id: upstream
         run: |
-          git clone --depth 1 --branch v1.260327.0 https://github.com/XTLS/Xray-core.git upstream_src
+          tag=$(curl -fsSL --retry 3 --retry-all-errors https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -er '.tag_name')
+          test -n "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Inject into latest released Xray
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          git clone --depth 1 --branch "$UPSTREAM_TAG" https://github.com/XTLS/Xray-core.git upstream_src
           python3 scripts/inject-xray.py upstream_src "$GITHUB_WORKSPACE"
           cd upstream_src
           go mod edit -replace="github.com/violetaini/chitanda=$GITHUB_WORKSPACE"

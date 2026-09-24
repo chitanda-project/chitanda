@@ -20,7 +20,7 @@
 - 真实 Xray JSON 入站 + Freedom 出站 + Policy/Stats 全栈回环：两个用户的 Stream TCP 与原生 UDP 上下行计数精确归属，本地重复运行 10 次通过。
 - `go test -mod=mod ./infra/conf -run Chitanda -count=1 -timeout=120s`：通过。
 - `go vet`（SDK、Xray 适配与配置包）及 `go build -mod=mod ./main`（注入 Xray）：通过。
-- 发布流程实际采用的 Xray 最新 release 标签 `v26.3.27` 与审计工作流固定的 `v1.260327.0` 不是同一提交。另在已授权 ARM64 测试机的隔离目录，基于 `v26.3.27` 和 dev 3f8a14b 完成注入、Xray 根模块 vendor 补丁、QUIC/HTTP3 测试、Chitanda 适配与配置 `-race`、`go build -mod=vendor ./main`，全部通过；构建 SHA-256 为 `94a46508d4066c192e817492e9033dfbda8063def599f5b72dd6f58384dca8c0`。
+- 发布流程实际采用的 Xray 最新 release 标签 `v26.3.27` 与原审计工作流固定的 `v1.260327.0` 不是同一提交；现已将 dev 审计门禁改为动态解析发布标签，避免日后只测试过时上游。另在已授权 ARM64 测试机的隔离目录，基于 `v26.3.27` 和 dev 3f8a14b 完成注入、Xray 根模块 vendor 补丁、QUIC/HTTP3 测试、Chitanda 适配与配置 `-race`、`go build -mod=vendor ./main`，全部通过；构建 SHA-256 为 `94a46508d4066c192e817492e9033dfbda8063def599f5b72dd6f58384dca8c0`。
 - 全量 `./infra/conf` 有非 Chitanda 用例 `TestToCidrList` 因验证副本缺少 `geoip.dat` 失败；不能记为全量通过。
 - 仓库根目录的 `go test ./...` 不适用于当前注入式集成布局：`integration/xray`、`integration/mihomo*` 依赖各自上游源码中的类型；应以 SDK 测试和注入后的上游包测试作为门禁。
 
