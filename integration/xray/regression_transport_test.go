@@ -14,6 +14,18 @@ import (
 	"time"
 )
 
+func TestInboundH2FlowControlWindow(t *testing.T) {
+	s := newInboundH2Server()
+	const wantWindow = 15 * 1024 * 1024
+	if s.MaxUploadBufferPerConnection != wantWindow || s.MaxUploadBufferPerStream != wantWindow {
+		t.Fatalf("Xray H2 upload windows are %d/%d, want %d; the default window throttles a single stream over WAN RTT",
+			s.MaxUploadBufferPerConnection, s.MaxUploadBufferPerStream, wantWindow)
+	}
+	if s.MaxReadFrameSize != 1<<20 || s.IdleTimeout != 3*time.Minute {
+		t.Fatalf("Xray H2 frame/idle settings drifted from the standalone server: %d/%s", s.MaxReadFrameSize, s.IdleTimeout)
+	}
+}
+
 type reviewUDPBridge struct {
 	*net.UDPConn
 	remote net.Addr

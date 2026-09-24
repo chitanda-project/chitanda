@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,17 @@ import (
 
 	"github.com/violetaini/chitanda/internal/auth"
 )
+
+// ErrCarrierNotReady lets an embedding proxy defer health accounting until its
+// own dialer is installed. It is not a network failure or a reason to fail over.
+var ErrCarrierNotReady = errors.New("chitanda: carrier dialer not ready")
+
+func classifyH2Probe(rtt time.Duration, err error) (skip, failed bool) {
+	if errors.Is(err, ErrCarrierNotReady) {
+		return true, false
+	}
+	return false, err != nil || rtt > 2500*time.Millisecond
+}
 
 type h2Prober struct {
 	client     *Client
@@ -46,7 +58,13 @@ func (p *h2Prober) loop() {
 			return
 		case <-ticker.C:
 			rtt, err := p.pingH2()
-			if err != nil || rtt > 2500*time.Millisecond {
+			skip, failed := classifyH2Probe(rtt, err)
+			if skip {
+				consecutiveFails = 0
+				consecutiveSuccesses = 0
+				continue
+			}
+			if failed {
 				consecutiveFails++
 				consecutiveSuccesses = 0
 				if consecutiveFails >= 2 && !p.h2Degraded.Load() {

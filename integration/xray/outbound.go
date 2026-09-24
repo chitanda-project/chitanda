@@ -59,7 +59,7 @@ func NewOutboundHandler(ctx context.Context, config *OutboundConfig) (*OutboundH
 			h.initMu.Unlock()
 		}
 		if d == nil {
-			return nil, fmt.Errorf("chitanda: Xray outbound dialer not ready")
+			return nil, fmt.Errorf("chitanda: Xray outbound dialer not ready: %w", client.ErrCarrierNotReady)
 		}
 		// Background carrier probes have no application outbound session. Xray's
 		// sendThrough path requires one; never reuse a previous flow's Conn state.

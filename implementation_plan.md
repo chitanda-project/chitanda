@@ -1,6 +1,6 @@
 # Chitanda 协议多用户服务端开发计划 (v2 修订版)
 
-> 状态（审计中）：以下 Proposed Changes 保留原始施工计划，并非已验收事实。当前代码已覆盖多用户身份与原生 UDP；H3/auto 同一入站双用户并发身份与真实 Xray 中 Stream TCP/原生 UDP 按用户计费均已在本地回归。30 用户最坏位置握手匹配经预计算优化，在 Windows/Hygon 上由约 56.7 µs 降为 19.8 µs；ad77d01 的 Linux race/构建通过。`auto` 同端口 H3/Plain-UDP 混合识别在 30 用户下非 Plain-UDP 报文约 45 µs/包，性能与兼容性取舍尚待决定，目标机器性能未测。详见 `docs/MULTI_USER_AUDIT.md`。
+> 状态（2026-09-24，待合入）：以下 Proposed Changes 保留原始施工计划，不等于全部性能目标已达成。`dev` 已将 `h2`/`h3`/`auto` 入站 UDP 直通 H3，`stream`/`h1` 入站使用 Plain-UDP；不再在 `auto` 的 H3 报文上试解密。多用户身份、Xray 计费及 Linux/ARM 目标机的隔离端口测试结果见 `docs/MULTI_USER_AUDIT.md`。H3 UDP 高速率丢包在 `main` 基线也存在，不能归咎于多用户改造，也不能宣称已解决。
 
 本文档记录 Chitanda 服务端多用户识别与 Xray 按用户计费的实施设计。此次改动不更改客户端线格式；旧客户端在其 PSK 仍被服务端配置保留时可继续使用。抗审查性与性能需通过独立抓包和基准测试评估，不能由线格式不变直接推断。
 
@@ -26,7 +26,7 @@
 
 ## Open Questions
 
-上线前仍需验证真实 Linux/Xray 环境下的双用户计费、UDP 丢包与吞吐；Windows 本地自动化测试不能代替这些实测。
+真实 Linux/Xray 双用户计费已在全栈回归中覆盖，目标机 TCP/UDP 吞吐已有隔离端口实测。合入前仍需确认最新上游 Xray 注入与发布构建、H2 接收窗口的并发内存成本，并完成最终 Linux race/构建门禁。H3 UDP 100–200 Mbps 的高丢包是独立性能缺陷；需要将其记录为已知限制或另立修复验收，不得用低速档结果掩盖。
 
 ---
 

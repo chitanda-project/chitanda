@@ -7,6 +7,8 @@ def patch_once(path, marker, changes):
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
     if marker in content:
+        if any(content.count(after) != 1 for _, after in changes):
+            raise RuntimeError(f"Incomplete prior integration in {path}")
         return
     for before, after in changes:
         if content.count(before) != 1:
@@ -14,6 +16,15 @@ def patch_once(path, marker, changes):
         content = content.replace(before, after, 1)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
+
+def replace_unique(content, before, after, description):
+    if after in content:
+        if content.count(after) != 1 or content.count(before) != 1:
+            raise RuntimeError(f"Duplicate {description} registration")
+        return content
+    if content.count(before) != 1:
+        raise RuntimeError(f"Upstream {description} anchor changed; refusing incomplete integration")
+    return content.replace(before, after, 1)
 
 def inject_udp_packet_size(xray_dir):
     # Opt-in only: normal upstream protocols retain their existing allocation
@@ -56,57 +67,53 @@ def inject_xray(xray_dir, chitanda_dir):
     
     # 3. Patch infra/conf/xray.go
     xray_conf_go = os.path.join(conf_dir, "xray.go")
-    if os.path.exists(xray_conf_go):
-        with open(xray_conf_go, "r", encoding="utf-8") as f:
-            content = f.read()
-        if 'chitandaConfig.InheritTLS(c.StreamSetting)' not in content:
-            anchor = '\tif dokodemoConfig, ok := rawConfig.(*DokodemoConfig); ok {'
-            if content.count(anchor) != 1:
-                raise RuntimeError("Xray inbound build anchor changed; refusing incomplete integration")
-            content = content.replace(anchor, '\tif chitandaConfig, ok := rawConfig.(*ChitandaInboundConfig); ok {\n\t\tchitandaConfig.InheritTLS(c.StreamSetting)\n\t}\n' + anchor, 1)
-            with open(xray_conf_go, "w", encoding="utf-8") as f:
-                f.write(content)
-        if '"chitanda"' not in content:
-            content = content.replace(
-                '"vless":         func() interface{} { return new(VLessInboundConfig) },',
-                '"chitanda":      func() interface{} { return new(ChitandaInboundConfig) },\n\t\t"vless":         func() interface{} { return new(VLessInboundConfig) },',
-                1
-            )
-            content = content.replace(
-                '"vless":       func() interface{} { return new(VLessOutboundConfig) },',
-                '"chitanda":    func() interface{} { return new(ChitandaOutboundConfig) },\n\t\t"vless":       func() interface{} { return new(VLessOutboundConfig) },',
-                1
-            )
-            with open(xray_conf_go, "w", encoding="utf-8") as f:
-                f.write(content)
-            print(f"  [+] Patched {xray_conf_go} with chitanda inbound/outbound JSON loaders")
+    if not os.path.isfile(xray_conf_go):
+        raise RuntimeError(f"Missing Xray configuration registry: {xray_conf_go}")
+    with open(xray_conf_go, "r", encoding="utf-8") as f:
+        content = f.read()
+    tls_anchor = '\tif dokodemoConfig, ok := rawConfig.(*DokodemoConfig); ok {'
+    tls_registration = '\tif chitandaConfig, ok := rawConfig.(*ChitandaInboundConfig); ok {\n\t\tchitandaConfig.InheritTLS(c.StreamSetting)\n\t}\n'
+    content = replace_unique(content, tls_anchor, tls_registration + tls_anchor, "Chitanda TLS inheritance")
+    inbound_anchor = '"vless":         func() interface{} { return new(VLessInboundConfig) },'
+    inbound_registration = '"chitanda":      func() interface{} { return new(ChitandaInboundConfig) },\n\t\t'
+    content = replace_unique(content, inbound_anchor, inbound_registration + inbound_anchor, "Chitanda inbound JSON")
+    outbound_anchor = '"vless":       func() interface{} { return new(VLessOutboundConfig) },'
+    outbound_registration = '"chitanda":    func() interface{} { return new(ChitandaOutboundConfig) },\n\t\t'
+    content = replace_unique(content, outbound_anchor, outbound_registration + outbound_anchor, "Chitanda outbound JSON")
+    with open(xray_conf_go, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"  [+] Verified {xray_conf_go} inbound/outbound JSON loaders")
 
     # 4. Patch main/distro/all/all.go
     all_go = os.path.join(xray_dir, "main", "distro", "all", "all.go")
-    if os.path.exists(all_go):
-        with open(all_go, "r", encoding="utf-8") as f:
-            content = f.read()
-        if 'proxy/chitanda' not in content:
-            target_import = '_ "github.com/xtls/xray-core/proxy/vless/outbound"'
-            new_import = '_ "github.com/xtls/xray-core/proxy/chitanda"\n\t' + target_import
-            content = content.replace(target_import, new_import, 1)
-            with open(all_go, "w", encoding="utf-8") as f:
-                f.write(content)
-            print(f"  [+] Patched {all_go} with proxy/chitanda registration")
+    if not os.path.isfile(all_go):
+        raise RuntimeError(f"Missing Xray distro registry: {all_go}")
+    with open(all_go, "r", encoding="utf-8") as f:
+        content = f.read()
+    target_import = '_ "github.com/xtls/xray-core/proxy/vless/outbound"'
+    new_import = '_ "github.com/xtls/xray-core/proxy/chitanda"\n\t' + target_import
+    content = replace_unique(content, target_import, new_import, "Chitanda distro")
+    with open(all_go, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"  [+] Verified {all_go} Chitanda distro registration")
 
     # 5. Patch go.mod
     go_mod = os.path.join(xray_dir, "go.mod")
-    if os.path.exists(go_mod):
-        with open(go_mod, "r", encoding="utf-8") as f:
-            content = f.read()
-        module_name = 'github.com/violetaini/chitanda'
-        if module_name not in content:
-            abs_chitanda = os.path.abspath(chitanda_dir).replace('\\', '/')
-            content += f"\nreplace {module_name} => {abs_chitanda}\n"
-            content += f"\nrequire (\n\t{module_name} v0.0.0-unpublished\n\tgithub.com/quic-go/quic-go v0.59.0\n)\n"
-            with open(go_mod, "w", encoding="utf-8") as f:
-                f.write(content)
-            print(f"  [+] Patched {go_mod} with replace {module_name} => {abs_chitanda}")
+    if not os.path.isfile(go_mod):
+        raise RuntimeError(f"Missing Xray module: {go_mod}")
+    with open(go_mod, "r", encoding="utf-8") as f:
+        content = f.read()
+    module_name = 'github.com/violetaini/chitanda'
+    abs_chitanda = os.path.abspath(chitanda_dir).replace('\\', '/')
+    replacement = f"replace {module_name} => {abs_chitanda}"
+    requirement = f"{module_name} v0.0.0-unpublished"
+    if replacement not in content and module_name not in content:
+        content += f"\n{replacement}\n"
+        content += f"\nrequire (\n\t{requirement}\n\tgithub.com/quic-go/quic-go v0.59.0\n)\n"
+    elif content.count(replacement) != 1 or content.count(requirement) != 1:
+        raise RuntimeError("Incomplete or conflicting Chitanda go.mod integration")
+    with open(go_mod, "w", encoding="utf-8") as f:
+        f.write(content)
 
     print("[*] Injection into Xray-core completed successfully!")
 

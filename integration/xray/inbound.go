@@ -331,7 +331,7 @@ func (h *InboundHandler) Process(ctx context.Context, network xnet.Network, conn
 
 	if string(prefix) == "PRI " {
 		// HTTP/2 Connection Preface
-		h2Server := &http2.Server{}
+		h2Server := newInboundH2Server()
 		h2Server.ServeConn(bconn, &http2.ServeConnOpts{
 			Handler: h.server,
 			Context: ctx,
@@ -360,6 +360,17 @@ func (h *InboundHandler) Process(ctx context.Context, network xnet.Network, conn
 	}()
 
 	return httpServer.Serve(sl)
+}
+
+func newInboundH2Server() *http2.Server {
+	// Match the standalone server's flow-control budget. The default
+	// stream window caps a single upload to roughly one window per RTT.
+	return &http2.Server{
+		MaxUploadBufferPerConnection: 15 * 1024 * 1024,
+		MaxUploadBufferPerStream:     15 * 1024 * 1024,
+		MaxReadFrameSize:             1 << 20,
+		IdleTimeout:                  3 * time.Minute,
+	}
 }
 
 func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
