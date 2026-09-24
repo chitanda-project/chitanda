@@ -56,6 +56,7 @@ type Config struct {
 	Path                  string // e.g. "/your-private-path"
 	TCPTransport          string // "h2" (default), "auto", "h3", or "h1" (alias: "plain-h1")
 	TCPPoolSize           int    // Number of independent physical TCP carriers (H2 or H3, default 4)
+	UDPPoolSize           int    // Number of independent physical UDP carriers (H3, default TCPPoolSize or 4)
 	SessionCacheFile      string // optional persistent session cache path
 	QUICInitialPacketSize uint16 // 1200 - 1452, default 1452
 	InsecureSkipVerify    bool   // skip TLS certificate verification
@@ -76,6 +77,7 @@ type Client struct {
 	h2Clients    []*h2TransportClient
 	nextH2Idx    atomic.Uint64
 	h3Managers   []*h3TransportManager
+	nextH3Idx    atomic.Uint64
 	sessionCache *sessioncache.Cache
 	prober       *h2Prober
 	mu           sync.Mutex
@@ -126,6 +128,12 @@ func New(cfg Config) (*Client, error) {
 	if cfg.TCPPoolSize > 16 {
 		cfg.TCPPoolSize = 16
 	}
+	if cfg.UDPPoolSize <= 0 {
+		cfg.UDPPoolSize = cfg.TCPPoolSize
+	}
+	if cfg.UDPPoolSize > 16 {
+		cfg.UDPPoolSize = 16
+	}
 	if cfg.QUICInitialPacketSize == 0 {
 		cfg.QUICInitialPacketSize = quicconfig.DefaultInitialPacketSize
 	}
@@ -163,11 +171,11 @@ func New(cfg Config) (*Client, error) {
 			h2Clients = append(h2Clients, h2Cli)
 		}
 
-		h3Count := 1
-		if cfg.TCPTransport == TCPTransportH3 {
-			h3Count = cfg.TCPPoolSize
-		} else if cfg.TCPTransport == TCPTransportAuto {
-			h3Count = cfg.TCPPoolSize
+		h3Count := cfg.UDPPoolSize
+		if cfg.TCPTransport == TCPTransportH3 || cfg.TCPTransport == TCPTransportAuto {
+			if cfg.TCPPoolSize > h3Count {
+				h3Count = cfg.TCPPoolSize
+			}
 		}
 		for i := 0; i < h3Count; i++ {
 			h3Managers = append(h3Managers, newH3TransportManager(
@@ -244,17 +252,21 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 }
 
 func (c *Client) pickBestH2Client() *h2TransportClient {
-	if len(c.h2Clients) == 0 {
+	n := len(c.h2Clients)
+	if n == 0 {
 		return nil
 	}
-	if len(c.h2Clients) == 1 {
+	if n == 1 {
 		return c.h2Clients[0]
 	}
 
-	best := c.h2Clients[0]
+	start := int(c.nextH2Idx.Add(1) % uint64(n))
+	best := c.h2Clients[start]
 	minActive := best.activeStreams.Load()
 
-	for _, cli := range c.h2Clients[1:] {
+	for i := 1; i < n; i++ {
+		idx := (start + i) % n
+		cli := c.h2Clients[idx]
 		active := cli.activeStreams.Load()
 		if active < minActive {
 			minActive = active
@@ -265,12 +277,21 @@ func (c *Client) pickBestH2Client() *h2TransportClient {
 }
 
 func (c *Client) pickBestH3Manager() *h3TransportManager {
-	if len(c.h3Managers) == 0 {
+	n := len(c.h3Managers)
+	if n == 0 {
 		return nil
 	}
-	best := c.h3Managers[0]
+	if n == 1 {
+		return c.h3Managers[0]
+	}
+
+	start := int(c.nextH3Idx.Add(1) % uint64(n))
+	best := c.h3Managers[start]
 	minActive := best.activeStreams.Load()
-	for _, manager := range c.h3Managers[1:] {
+
+	for i := 1; i < n; i++ {
+		idx := (start + i) % n
+		manager := c.h3Managers[idx]
 		active := manager.activeStreams.Load()
 		if active < minActive {
 			minActive = active

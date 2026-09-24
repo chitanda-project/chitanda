@@ -86,6 +86,7 @@ func NewOutboundHandler(ctx context.Context, config *OutboundConfig) (*OutboundH
 		Path:               config.Path,
 		TCPTransport:       transportMode,
 		TCPPoolSize:        int(poolSize),
+		UDPPoolSize:        int(poolSize),
 		InsecureSkipVerify: config.AllowInsecure,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			dest, err := xnet.ParseDestination(network + ":" + addr)

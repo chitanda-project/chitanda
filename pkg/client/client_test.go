@@ -71,12 +71,14 @@ func TestSignRequest(t *testing.T) {
 func TestH3PoolSizingAndReservation(t *testing.T) {
 	psk := []byte("01234567890123456789012345678901")
 	tests := []struct {
-		name      string
-		transport string
-		poolSize  int
-		wantH3    int
+		name        string
+		transport   string
+		poolSize    int
+		udpPoolSize int
+		wantH3      int
 	}{
-		{name: "h2 keeps one H3 manager for UDP", transport: TCPTransportH2, poolSize: 3, wantH3: 1},
+		{name: "h2 uses configured pool for UDP by default", transport: TCPTransportH2, poolSize: 3, wantH3: 3},
+		{name: "h2 respects explicit udp pool size", transport: TCPTransportH2, poolSize: 4, udpPoolSize: 2, wantH3: 2},
 		{name: "h3 uses configured pool", transport: TCPTransportH3, poolSize: 3, wantH3: 3},
 		{name: "auto prepares H3 fallback pool", transport: TCPTransportAuto, poolSize: 3, wantH3: 3},
 	}
@@ -90,6 +92,7 @@ func TestH3PoolSizingAndReservation(t *testing.T) {
 				PSK:          psk,
 				TCPTransport: tt.transport,
 				TCPPoolSize:  tt.poolSize,
+				UDPPoolSize:  tt.udpPoolSize,
 			})
 			if err != nil {
 				t.Fatalf("New() error: %v", err)
