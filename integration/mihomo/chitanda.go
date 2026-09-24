@@ -25,6 +25,7 @@ type ChitandaOption struct {
 	SNI            string `proxy:"sni,omitempty"`
 	ServerID       string `proxy:"server-id,omitempty"`
 	PoolSize       int    `proxy:"pool-size,omitempty"`
+	UDPPoolSize    int    `proxy:"udp-pool-size,omitempty"`
 	UDP            *bool  `proxy:"udp,omitempty"`
 	SkipCertVerify bool   `proxy:"skip-cert-verify,omitempty"`
 }
@@ -115,6 +116,7 @@ func (c *Chitanda) getClient() (*client.Client, error) {
 		Path:               c.option.Path,
 		TCPTransport:       c.option.Transport,
 		TCPPoolSize:        c.option.PoolSize,
+		UDPPoolSize:        c.option.UDPPoolSize,
 		InsecureSkipVerify: c.option.SkipCertVerify,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return c.dialer.DialContext(ctx, network, addr)

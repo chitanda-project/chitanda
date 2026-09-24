@@ -33,6 +33,7 @@
 | `server-id` | String | いいえ | - | サーバーノード識別子 (ノード身元バインド、`stream` 専用線モードでクロスノードリプレイ攻撃を防御) |
 | `skip-cert-verify`| Boolean| いいえ | `false` | TLS 証明書の検証をスキップするかどうか (本番環境では `false` を推奨) |
 | `pool-size` | Integer | いいえ | `4` | TCP コネクションプールのサイズ (`h2` モードのスループットおよびバースト耐性を最適化) |
+| `udp-pool-size` | Integer | いいえ | (`pool-size` と同一) | UDP コネクションプールのサイズ (H3 QUIC 独立キャリア数。ゲーム・DNS などの多重化および QoS 物理分離用) |
 | `udp` | Boolean | いいえ | `true` | UDP パケット転送を有効にするかどうか |
 | `interface-name` | String | いいえ | - | アウトバウンドにバインドする NIC 名 (マルチインターフェース・ポリシールーティングに対応) |
 | `routing-mark` | Integer | いいえ | `0` | Linux アウトバウンドトラフィックの `fwmark` ルーティングマーク |
