@@ -458,6 +458,9 @@ func (r *udpRelay) target(address string) (*udpTarget, error) {
 }
 
 func (t *udpTarget) writeBatch(payloads [][]byte) error {
+	if bw, ok := t.conn.(interface{ WriteBatch([][]byte) error }); ok && len(payloads) > 1 {
+		return bw.WriteBatch(payloads)
+	}
 	if t.batch == nil || len(payloads) == 1 {
 		for _, payload := range payloads {
 			if _, err := t.conn.Write(payload); err != nil {
@@ -466,6 +469,7 @@ func (t *udpTarget) writeBatch(payloads [][]byte) error {
 		}
 		return nil
 	}
+
 	for i, payload := range payloads {
 		t.messages[i].Buffers[0] = payload
 	}

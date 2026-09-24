@@ -628,7 +628,7 @@ type virtualPacketConn struct {
 
 func newVirtualPacketConn() *virtualPacketConn {
 	c := &virtualPacketConn{
-		recvCh:          make(chan *packetItem, 2048),
+		recvCh:          make(chan *packetItem, 8192),
 		closeCh:         make(chan struct{}),
 		localAddr:       &net.UDPAddr{IP: net.IPv4zero, Port: 0},
 		writers:         make(map[string]stat.Connection),

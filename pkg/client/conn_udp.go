@@ -567,6 +567,52 @@ func (c *quicPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	return len(p), nil
 }
 
+func (c *quicPacketConn) WriteBatch(payloads [][]byte, addrs []net.Addr) error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return errors.New("use of closed network connection")
+	}
+	if !c.writeDeadline.IsZero() && time.Now().After(c.writeDeadline) {
+		c.mu.Unlock()
+		return context.DeadlineExceeded
+	}
+	c.mu.Unlock()
+
+	if len(payloads) == 0 {
+		return nil
+	}
+	if len(payloads) == 1 {
+		address := addrs[0].String()
+		packet, err := frame.EncodeDatagram(c.sequence.Add(1), address, payloads[0])
+		if err != nil {
+			return err
+		}
+		return c.stream.SendDatagram(packet)
+	}
+
+	frames := make([][]byte, len(payloads))
+	for i, p := range payloads {
+		address := addrs[i].String()
+		packet, err := frame.EncodeDatagram(c.sequence.Add(1), address, p)
+		if err != nil {
+			return err
+		}
+		frames[i] = packet
+	}
+	if sender, ok := any(c.stream).(interface{ SendDatagrams([][]byte) error }); ok {
+		return sender.SendDatagrams(frames)
+	}
+	for _, f := range frames {
+		if err := c.stream.SendDatagram(f); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+
+
 func (c *quicPacketConn) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

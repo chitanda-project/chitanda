@@ -273,16 +273,37 @@ func (h *OutboundHandler) processUDP(ctx context.Context, link *transport.Link, 
 	uploadDone := make(chan error, 1)
 	go func() {
 		defer pconn.Close() // An ended uplink must wake the blocked downlink.
+		batchConn, hasBatch := pconn.(interface {
+			WriteBatch([][]byte, []net.Addr) error
+		})
 		for {
 			mb, readErr := link.Reader.ReadMultiBuffer()
 			var writeErr error
-			for _, b := range mb {
-				addr := target
-				if b.UDP != nil && b.UDP.IsValid() {
-					addr = packetAddress(b.UDP.NetAddr())
+			if hasBatch && len(mb) > 1 {
+				payloads := make([][]byte, 0, len(mb))
+				addrs := make([]net.Addr, 0, len(mb))
+				for _, b := range mb {
+					if !b.IsEmpty() {
+						addr := target
+						if b.UDP != nil && b.UDP.IsValid() {
+							addr = packetAddress(b.UDP.NetAddr())
+						}
+						payloads = append(payloads, b.Bytes())
+						addrs = append(addrs, addr)
+					}
 				}
-				if _, writeErr = pconn.WriteTo(b.Bytes(), addr); writeErr != nil {
-					break
+				if len(payloads) > 0 {
+					writeErr = batchConn.WriteBatch(payloads, addrs)
+				}
+			} else {
+				for _, b := range mb {
+					addr := target
+					if b.UDP != nil && b.UDP.IsValid() {
+						addr = packetAddress(b.UDP.NetAddr())
+					}
+					if _, writeErr = pconn.WriteTo(b.Bytes(), addr); writeErr != nil {
+						break
+					}
 				}
 			}
 			buf.ReleaseMulti(mb)
@@ -296,6 +317,7 @@ func (h *OutboundHandler) processUDP(ctx context.Context, link *transport.Link, 
 			}
 		}
 	}()
+
 	recvBuf := make([]byte, 65535)
 	var downloadErr error
 	for {

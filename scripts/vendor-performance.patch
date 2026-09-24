@@ -785,7 +785,7 @@ index 40655de..d1a0181 100644
  )
  
 -const defaultNumConnections = 1
-+const defaultNumConnections = 4
++const defaultNumConnections = 8
  
  // Default Cubic backoff factor
  const beta float32 = 0.7
@@ -799,11 +799,24 @@ index e5457dd..1a1b091 100644
  	renoBeta                   = 0.7 // Reno backoff factor.
 -	minCongestionWindowPackets = 2
 -	initialCongestionWindow    = 32
-+	minCongestionWindowPackets = 64
-+	initialCongestionWindow    = 128
++	minCongestionWindowPackets = 1536
++	initialCongestionWindow    = 4096
  )
  
  type cubicSender struct {
+diff --git a/vendor/github.com/quic-go/quic-go/internal/congestion/hybrid_slow_start.go b/vendor/github.com/quic-go/quic-go/internal/congestion/hybrid_slow_start.go
+index 9679d9e..5eafa0a 100644
+--- a/vendor/github.com/quic-go/quic-go/internal/congestion/hybrid_slow_start.go
++++ b/vendor/github.com/quic-go/quic-go/internal/congestion/hybrid_slow_start.go
+@@ -18,7 +18,7 @@ const hybridStartDelayFactorExp = 3 // 2^3 = 8
+ // The original paper specifies 2 and 8ms, but those have changed over time.
+ const (
+ 	hybridStartDelayMinThresholdUs = int64(4000)
+-	hybridStartDelayMaxThresholdUs = int64(16000)
++	hybridStartDelayMaxThresholdUs = int64(40000)
+ )
+ 
+ // HybridSlowStart implements the TCP hybrid slow start algorithm
 diff --git a/vendor/github.com/quic-go/quic-go/internal/protocol/protocol.go b/vendor/github.com/quic-go/quic-go/internal/protocol/protocol.go
 index b1109ff..5d949ba 100644
 --- a/vendor/github.com/quic-go/quic-go/internal/protocol/protocol.go

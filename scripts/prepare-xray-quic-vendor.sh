@@ -26,7 +26,7 @@ flow=vendor/golang.org/x/net/http2/transport.go
 test "$(grep -c 'maxDatagramSendQueueLen = 32' "$queue")" -eq 1
 test "$(grep -c 'maxDatagramRcvQueueLen  = 128' "$queue")" -eq 1
 test "$(grep -c 'transportDefaultStreamFlow = 4 << 20' "$flow")" -eq 1
-sed -i 's/maxDatagramSendQueueLen = 32/maxDatagramSendQueueLen = 512/' "$queue"
+sed -i 's/maxDatagramSendQueueLen = 32/maxDatagramSendQueueLen = 8192/' "$queue"
 sed -i 's/maxDatagramRcvQueueLen  = 128/maxDatagramRcvQueueLen  = 2048/' "$queue"
 sed -i 's/transportDefaultStreamFlow = 4 << 20/transportDefaultStreamFlow = 64 << 20/' "$flow"
 
@@ -46,14 +46,11 @@ else
     git apply --include='vendor/golang.org/x/net/*' "$core_dir/scripts/vendor-performance.patch"
 fi
 
-# Restore the conservative RFC 9002 minimum. The large hard floor in the
-# shared performance patch can overload a congested path and was not needed
-# for the measured 100 Mbps gain.
+# Verify the high-BDP performance parameters required for 200M+ zero-loss UDP
 sender=vendor/github.com/quic-go/quic-go/internal/congestion/cubic_sender.go
-test "$(grep -c 'minCongestionWindowPackets = 64' "$sender")" -eq 1
-sed -i 's/minCongestionWindowPackets = 64/minCongestionWindowPackets = 2/' "$sender"
-test "$(grep -c 'initialCongestionWindow    = 128' "$sender")" -eq 1
-test "$(grep -c 'maxDatagramSendQueueLen = 512' "$queue")" -eq 1
+test "$(grep -c 'minCongestionWindowPackets = 1536' "$sender")" -eq 1
+test "$(grep -c 'initialCongestionWindow    = 4096' "$sender")" -eq 1
+test "$(grep -c 'maxDatagramSendQueueLen = 8192' "$queue")" -eq 1
 test "$(grep -c 'MaxDataPadding int' vendor/golang.org/x/net/http2/transport_common.go)" -eq 1
 
 cp "$core_dir/scripts/vendor-tests/datagram_queue_test.go.txt" vendor/github.com/quic-go/quic-go/datagram_queue_test.go

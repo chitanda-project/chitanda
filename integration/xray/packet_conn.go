@@ -46,6 +46,7 @@ func (r *fullPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 // MergeBytes, which intentionally flatten/split TCP streams).
 type packetLinkConn struct {
 	packetReader buf.Reader
+	packetWriter buf.Writer
 	readMu       sync.Mutex
 	pending      buf.MultiBuffer
 	readErr      error
@@ -55,7 +56,7 @@ type packetLinkConn struct {
 }
 
 func newPacketLinkConn(r buf.Reader, w buf.Writer, remote net.Addr) *packetLinkConn {
-	c := &packetLinkConn{packetReader: r, remote: remote}
+	c := &packetLinkConn{packetReader: r, packetWriter: w, remote: remote}
 	c.packetReads = connio.NewReader(func() ([]byte, net.Addr, error) {
 		b := make([]byte, 65535)
 		n, a, err := c.readPacket(b)
@@ -69,6 +70,18 @@ func newPacketLinkConn(r buf.Reader, w buf.Writer, remote net.Addr) *packetLinkC
 	}, func() error { return common.Close(w) }, func() error { _ = common.Interrupt(w); return common.Close(w) })
 	return c
 }
+
+func (c *packetLinkConn) WriteBatch(payloads [][]byte) error {
+	if len(payloads) == 0 {
+		return nil
+	}
+	mb := make(buf.MultiBuffer, 0, len(payloads))
+	for _, p := range payloads {
+		mb = append(mb, ownedDatagram(p))
+	}
+	return c.packetWriter.WriteMultiBuffer(mb)
+}
+
 
 func (c *packetLinkConn) Read(p []byte) (int, error) {
 	n, _, err := c.ReadFrom(p)

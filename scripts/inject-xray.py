@@ -40,7 +40,10 @@ def inject_udp_packet_size(xray_dir):
     patch_once(worker, "UDPPacketBufferSize()", [
         ("h, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, udp.HubCapacity(256))",
          "opts := []udp.HubOption{udp.HubCapacity(256)}\n\tif sized, ok := w.proxy.(interface{ UDPPacketBufferSize() int32 }); ok {\n\t\topts = append(opts, udp.HubPacketSize(sized.UDPPacketBufferSize()))\n\t}\n\th, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, opts...)"),
+        ("pReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(16*1024))",
+         "pReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(4*1024*1024))"),
     ])
+
 
 def inject_xray(xray_dir, chitanda_dir):
     print(f"[*] Injecting Chitanda protocol into Xray-core: {xray_dir}")

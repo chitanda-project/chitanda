@@ -16,8 +16,8 @@ const (
 	initialMaxDatagramSize     = protocol.ByteCount(protocol.InitialPacketSize)
 	maxBurstPackets            = 3
 	renoBeta                   = 0.7 // Reno backoff factor.
-	minCongestionWindowPackets = 64
-	initialCongestionWindow    = 128
+	minCongestionWindowPackets = 1536
+	initialCongestionWindow    = 4096
 )
 
 type cubicSender struct {

@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	maxDatagramSendQueueLen = 512
+	maxDatagramSendQueueLen = 8192
 	maxDatagramRcvQueueLen  = 2048
 )
 
