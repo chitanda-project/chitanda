@@ -123,7 +123,28 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 				final_clients = append(final_clients, interface{}(c))
 			}
 
-			settings["clients"] = final_clients
+			if inbound.Protocol == "chitanda" {
+				var chitandaUsers []map[string]interface{}
+				for _, client := range final_clients {
+					c := client.(map[string]interface{})
+					psk, _ := c["password"].(string)
+					email, _ := c["email"].(string)
+					if len(psk) >= 32 {
+						chitandaUsers = append(chitandaUsers, map[string]interface{}{
+							"email": email,
+							"psk":   psk,
+							"level": 0,
+						})
+					}
+				}
+				delete(settings, "clients")
+				if len(chitandaUsers) > 0 {
+					delete(settings, "psk")
+					settings["users"] = chitandaUsers
+				}
+			} else {
+				settings["clients"] = final_clients
+			}
 			modifiedSettings, err := json.MarshalIndent(settings, "", "  ")
 			if err != nil {
 				return nil, err

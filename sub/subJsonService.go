@@ -182,6 +182,8 @@ func (s *SubJsonService) getConfig(inbound *model.Inbound, client model.Client, 
 			newOutbounds = append(newOutbounds, s.genVnext(inbound, streamSettings, client))
 		case "trojan", "shadowsocks":
 			newOutbounds = append(newOutbounds, s.genServer(inbound, streamSettings, client))
+		case "chitanda":
+			newOutbounds = append(newOutbounds, s.genChitanda(inbound, streamSettings, client))
 		}
 
 		newOutbounds = append(newOutbounds, s.defaultOutbounds...)
@@ -347,13 +349,76 @@ func (s *SubJsonService) genServer(inbound *model.Inbound, streamSettings json_u
 	return result
 }
 
+func (s *SubJsonService) genChitanda(inbound *model.Inbound, streamSettings json_util.RawMessage, client model.Client) json_util.RawMessage {
+	outbound := Outbound{}
+	var inboundSettings map[string]interface{}
+	json.Unmarshal([]byte(inbound.Settings), &inboundSettings)
+
+	path, _ := inboundSettings["path"].(string)
+	transport, _ := inboundSettings["transport"].(string)
+	serverID, _ := inboundSettings["server_id"].(string)
+	if transport == "" {
+		transport = "h2"
+	}
+	if path == "" {
+		path = "/api/v1/sync"
+	}
+
+	serverName := ""
+	var stream map[string]interface{}
+	json.Unmarshal([]byte(inbound.StreamSettings), &stream)
+	if stream != nil {
+		if tlsSetting, ok := stream["tlsSettings"].(map[string]interface{}); ok {
+			if sn, ok := tlsSetting["serverName"].(string); ok {
+				serverName = sn
+			}
+		}
+	}
+
+	psk := client.Password
+	if psk == "" {
+		psk, _ = inboundSettings["psk"].(string)
+	}
+
+	chitandaSetting := ChitandaOutboundSetting{
+		Server:     fmt.Sprintf("%s:%d", inbound.Listen, inbound.Port),
+		ServerName: serverName,
+		ServerID:   serverID,
+		PSK:        psk,
+		Transport:  transport,
+	}
+	if transport != "stream" {
+		chitandaSetting.Path = path
+	}
+
+	outbound.Protocol = "chitanda"
+	outbound.Tag = "proxy"
+	outbound.StreamSettings = streamSettings
+	outbound.Settings = chitandaSetting
+
+	result, _ := json.MarshalIndent(outbound, "", "  ")
+	return result
+}
+
 type Outbound struct {
 	Protocol       string                 `json:"protocol"`
 	Tag            string                 `json:"tag"`
-	StreamSettings json_util.RawMessage   `json:"streamSettings"`
+	StreamSettings json_util.RawMessage   `json:"streamSettings,omitempty"`
 	Mux            json_util.RawMessage   `json:"mux,omitempty"`
 	ProxySettings  map[string]interface{} `json:"proxySettings,omitempty"`
-	Settings       OutboundSettings       `json:"settings,omitempty"`
+	Settings       interface{}            `json:"settings,omitempty"`
+}
+
+type ChitandaOutboundSetting struct {
+	Server      string `json:"server"`
+	ServerName  string `json:"server_name,omitempty"`
+	ServerID    string `json:"server_id,omitempty"`
+	PSK         string `json:"psk"`
+	Path        string `json:"path,omitempty"`
+	Transport   string `json:"transport,omitempty"`
+	PoolSize    int    `json:"pool_size,omitempty"`
+	AutoScale   bool   `json:"auto_scale,omitempty"`
+	MaxPoolSize int    `json:"max_pool_size,omitempty"`
 }
 
 type OutboundSettings struct {

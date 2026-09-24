@@ -665,6 +665,9 @@ class Outbound extends CommonClass {
             const serverName = url.searchParams.get('sni') || url.searchParams.get('server_name') || '';
             const serverId = url.searchParams.get('server-id') || url.searchParams.get('server_id') || '';
             const allowInsecure = url.searchParams.get('allow_insecure') === '1' || url.searchParams.get('allowInsecure') === 'true';
+            const poolSize = parseInt(url.searchParams.get('pool_size') || url.searchParams.get('pool-size') || '4');
+            const autoScale = url.searchParams.get('auto_scale') === 'true' || url.searchParams.get('auto-scale') === 'true';
+            const maxPoolSize = parseInt(url.searchParams.get('max_pool_size') || url.searchParams.get('max-pool-size') || '8');
             let remark = decodeURIComponent(url.hash ? url.hash.substring(1) : '');
             if (!remark) {
                 remark = 'out-chitanda-' + (url.port || '443');
@@ -676,8 +679,10 @@ class Outbound extends CommonClass {
                 psk,
                 path,
                 transport,
-                4,
-                allowInsecure
+                poolSize,
+                allowInsecure,
+                autoScale,
+                maxPoolSize
             );
             return new Outbound(remark, Protocols.Chitanda, settings);
         } catch (e) {
@@ -1200,7 +1205,7 @@ Outbound.WireguardSettings.Peer = class extends CommonClass {
 };
 
 Outbound.ChitandaSettings = class extends CommonClass {
-    constructor(server='', server_name='', server_id='', psk='', path='/api/v1/sync', transport='h2', pool_size=4, allow_insecure=false) {
+    constructor(server='', server_name='', server_id='', psk='', path='/api/v1/sync', transport='h2', pool_size=4, allow_insecure=false, auto_scale=false, max_pool_size=8) {
         super();
         this.server = server;
         this.server_name = server_name;
@@ -1210,6 +1215,8 @@ Outbound.ChitandaSettings = class extends CommonClass {
         this.transport = transport;
         this.pool_size = pool_size;
         this.allow_insecure = allow_insecure;
+        this.auto_scale = auto_scale;
+        this.max_pool_size = max_pool_size;
     }
 
     static fromJson(json={}) {
@@ -1221,7 +1228,9 @@ Outbound.ChitandaSettings = class extends CommonClass {
             json.path ?? '/api/v1/sync',
             json.transport ?? 'h2',
             json.pool_size ?? json.poolSize ?? 4,
-            json.allow_insecure ?? json.allowInsecure ?? false
+            json.allow_insecure ?? json.allowInsecure ?? false,
+            json.auto_scale ?? json.autoScale ?? false,
+            json.max_pool_size ?? json.maxPoolSize ?? 8
         );
     }
 
@@ -1235,6 +1244,8 @@ Outbound.ChitandaSettings = class extends CommonClass {
             transport: this.transport,
             pool_size: (this.transport === 'stream' || this.transport === 'h1') ? undefined : (this.pool_size ? Number(this.pool_size) : undefined),
             allow_insecure: (this.transport !== 'stream' && this.transport !== 'h1') ? (this.allow_insecure ? true : undefined) : undefined,
+            auto_scale: (this.transport !== 'stream' && this.transport !== 'h1') ? (this.auto_scale ? true : undefined) : undefined,
+            max_pool_size: (this.transport !== 'stream' && this.transport !== 'h1' && this.auto_scale) ? (this.max_pool_size ? Number(this.max_pool_size) : undefined) : undefined,
         };
     }
 };

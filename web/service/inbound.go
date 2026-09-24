@@ -85,6 +85,20 @@ func (s *InboundService) GetClients(inbound *model.Inbound) ([]model.Client, err
 
 	clients := settings["clients"]
 	if clients == nil {
+		if inbound.Protocol == "chitanda" {
+			var rawSettings map[string]interface{}
+			if err := json.Unmarshal([]byte(inbound.Settings), &rawSettings); err == nil {
+				if psk, ok := rawSettings["psk"].(string); ok && psk != "" {
+					return []model.Client{
+						{
+							Password: psk,
+							Email:    inbound.Remark,
+							Enable:   true,
+						},
+					}, nil
+				}
+			}
+		}
 		return nil, nil
 	}
 	return clients, nil
@@ -181,7 +195,7 @@ func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, boo
 
 	// Secure client ID
 	for _, client := range clients {
-		if inbound.Protocol == "trojan" {
+		if inbound.Protocol == "trojan" || inbound.Protocol == "chitanda" {
 			if client.Password == "" {
 				return inbound, false, common.NewError("empty client ID")
 			}
@@ -439,7 +453,7 @@ func (s *InboundService) AddInboundClient(data *model.Inbound) (bool, error) {
 
 	// Secure client ID
 	for _, client := range clients {
-		if oldInbound.Protocol == "trojan" {
+		if oldInbound.Protocol == "trojan" || oldInbound.Protocol == "chitanda" {
 			if client.Password == "" {
 				return false, common.NewError("empty client ID")
 			}
@@ -530,7 +544,7 @@ func (s *InboundService) DelInboundClient(inboundId int, clientId string) (bool,
 
 	email := ""
 	client_key := "id"
-	if oldInbound.Protocol == "trojan" {
+	if oldInbound.Protocol == "trojan" || oldInbound.Protocol == "chitanda" {
 		client_key = "password"
 	}
 	if oldInbound.Protocol == "shadowsocks" {
@@ -554,6 +568,13 @@ func (s *InboundService) DelInboundClient(inboundId int, clientId string) (bool,
 	}
 
 	settings["clients"] = newClients
+	if oldInbound.Protocol == "chitanda" && len(newClients) > 0 {
+		if firstClient, ok := newClients[0].(map[string]interface{}); ok {
+			if firstPsk, ok := firstClient["password"].(string); ok && firstPsk != "" {
+				settings["psk"] = firstPsk
+			}
+		}
+	}
 	newSettings, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return false, err
@@ -618,7 +639,7 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 	clientIndex := -1
 	for index, oldClient := range oldClients {
 		oldClientId := ""
-		if oldInbound.Protocol == "trojan" {
+		if oldInbound.Protocol == "trojan" || oldInbound.Protocol == "chitanda" {
 			oldClientId = oldClient.Password
 			newClientId = clients[0].Password
 		} else if oldInbound.Protocol == "shadowsocks" {
@@ -658,6 +679,9 @@ func (s *InboundService) UpdateInboundClient(data *model.Inbound, clientId strin
 	settingsClients := oldSettings["clients"].([]interface{})
 	settingsClients[clientIndex] = interfaceClients[0]
 	oldSettings["clients"] = settingsClients
+	if oldInbound.Protocol == "chitanda" && clientIndex == 0 {
+		oldSettings["psk"] = clients[0].Password
+	}
 
 	newSettings, err := json.MarshalIndent(oldSettings, "", "  ")
 	if err != nil {
@@ -1216,7 +1240,7 @@ func (s *InboundService) SetClientTelegramUserID(trafficId int, tgId int64) (boo
 
 	for _, oldClient := range oldClients {
 		if oldClient.Email == clientEmail {
-			if inbound.Protocol == "trojan" {
+			if inbound.Protocol == "trojan" || inbound.Protocol == "chitanda" {
 				clientId = oldClient.Password
 			} else if inbound.Protocol == "shadowsocks" {
 				clientId = oldClient.Email
@@ -1300,7 +1324,7 @@ func (s *InboundService) ToggleClientEnableByEmail(clientEmail string) (bool, bo
 
 	for _, oldClient := range oldClients {
 		if oldClient.Email == clientEmail {
-			if inbound.Protocol == "trojan" {
+			if inbound.Protocol == "trojan" || inbound.Protocol == "chitanda" {
 				clientId = oldClient.Password
 			} else if inbound.Protocol == "shadowsocks" {
 				clientId = oldClient.Email
@@ -1363,7 +1387,7 @@ func (s *InboundService) ResetClientIpLimitByEmail(clientEmail string, count int
 
 	for _, oldClient := range oldClients {
 		if oldClient.Email == clientEmail {
-			if inbound.Protocol == "trojan" {
+			if inbound.Protocol == "trojan" || inbound.Protocol == "chitanda" {
 				clientId = oldClient.Password
 			} else if inbound.Protocol == "shadowsocks" {
 				clientId = oldClient.Email
@@ -1420,7 +1444,7 @@ func (s *InboundService) ResetClientExpiryTimeByEmail(clientEmail string, expiry
 
 	for _, oldClient := range oldClients {
 		if oldClient.Email == clientEmail {
-			if inbound.Protocol == "trojan" {
+			if inbound.Protocol == "trojan" || inbound.Protocol == "chitanda" {
 				clientId = oldClient.Password
 			} else if inbound.Protocol == "shadowsocks" {
 				clientId = oldClient.Email
@@ -1480,7 +1504,7 @@ func (s *InboundService) ResetClientTrafficLimitByEmail(clientEmail string, tota
 
 	for _, oldClient := range oldClients {
 		if oldClient.Email == clientEmail {
-			if inbound.Protocol == "trojan" {
+			if inbound.Protocol == "trojan" || inbound.Protocol == "chitanda" {
 				clientId = oldClient.Password
 			} else if inbound.Protocol == "shadowsocks" {
 				clientId = oldClient.Email
@@ -1874,7 +1898,7 @@ func (s *InboundService) MigrationRequirements() {
 
 	// Fix inbounds based problems
 	var inbounds []*model.Inbound
-	err = tx.Model(model.Inbound{}).Where("protocol IN (?)", []string{"vmess", "vless", "trojan"}).Find(&inbounds).Error
+	err = tx.Model(model.Inbound{}).Where("protocol IN (?)", []string{"vmess", "vless", "trojan", "chitanda"}).Find(&inbounds).Error
 	if err != nil && err != gorm.ErrRecordNotFound {
 		return
 	}

@@ -164,15 +164,14 @@ func (s *SubService) getLink(inbound *model.Inbound, email string) string {
 	case "shadowsocks":
 		return s.genShadowsocksLink(inbound, email)
 	case "chitanda":
-		return s.genChitandaLink(inbound)
+		return s.genChitandaLink(inbound, email)
 	}
 	return ""
 }
 
-func (s *SubService) genChitandaLink(inbound *model.Inbound) string {
+func (s *SubService) genChitandaLink(inbound *model.Inbound, email string) string {
 	settings := map[string]interface{}{}
 	json.Unmarshal([]byte(inbound.Settings), &settings)
-	psk, _ := settings["psk"].(string)
 	path, _ := settings["path"].(string)
 	transport, _ := settings["transport"].(string)
 	serverID, _ := settings["server_id"].(string)
@@ -182,6 +181,25 @@ func (s *SubService) genChitandaLink(inbound *model.Inbound) string {
 	if path == "" {
 		path = "/api/v1/sync"
 	}
+
+	psk := ""
+	clients, _ := s.inboundService.GetClients(inbound)
+	clientIndex := -1
+	for i, client := range clients {
+		if client.Email == email {
+			clientIndex = i
+			break
+		}
+	}
+	if clientIndex >= 0 {
+		psk = clients[clientIndex].Password
+	} else if len(clients) > 0 {
+		psk = clients[0].Password
+	}
+	if psk == "" {
+		psk, _ = settings["psk"].(string)
+	}
+
 	sni := ""
 	var stream map[string]interface{}
 	json.Unmarshal([]byte(inbound.StreamSettings), &stream)
@@ -192,9 +210,12 @@ func (s *SubService) genChitandaLink(inbound *model.Inbound) string {
 			}
 		}
 	}
-	remark := inbound.Remark
+	remark := s.genRemark(inbound, email, "")
 	if remark == "" {
-		remark = "Chitanda"
+		remark = inbound.Remark
+		if remark == "" {
+			remark = "Chitanda"
+		}
 	}
 	link := fmt.Sprintf("chitanda://%s@%s:%d?transport=%s",
 		url.QueryEscape(psk), s.address, inbound.Port, url.QueryEscape(transport))

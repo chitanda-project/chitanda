@@ -15,18 +15,20 @@
         </template>
         <a-input v-model.trim="client.email"></a-input>
     </a-form-item>
-    <a-form-item v-if="inbound.protocol === Protocols.TROJAN || inbound.protocol === Protocols.SHADOWSOCKS">
+    <a-form-item v-if="inbound.protocol === Protocols.TROJAN || inbound.protocol === Protocols.SHADOWSOCKS || inbound.protocol === Protocols.CHITANDA">
         <template slot="label">
             <a-tooltip>
                 <template slot="title">
                     <span>{{ i18n "reset" }}</span>
                 </template>
-                {{ i18n "password" }}
+                <span v-if="inbound.protocol === Protocols.CHITANDA">PSK</span>
+                <span v-else>{{ i18n "password" }}</span>
                 <a-icon v-if="inbound.protocol === Protocols.SHADOWSOCKS"@click="client.password = RandomUtil.randomShadowsocksPassword()" type="sync"></a-icon>
                 <a-icon v-if="inbound.protocol === Protocols.TROJAN" @click="client.password = RandomUtil.randomSeq(10)"type="sync"> </a-icon>
+                <a-icon v-if="inbound.protocol === Protocols.CHITANDA" @click="client.password = RandomUtil.randomSeq(32)" type="sync"></a-icon>
             </a-tooltip>
         </template>
-        <a-input v-model.trim="client.password"></a-input>
+        <a-input v-model.trim="client.password" :placeholder="inbound.protocol === Protocols.CHITANDA ? 'PSK (>= 32 chars)' : ''"></a-input>
     </a-form-item>
     <a-form-item v-if="inbound.protocol === Protocols.VMESS || inbound.protocol === Protocols.VLESS">
         <template slot="label">

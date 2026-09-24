@@ -1199,6 +1199,7 @@ class Inbound extends XrayCommonClass {
             case Protocols.VLESS: return this.settings.vlesses;
             case Protocols.TROJAN: return this.settings.trojans;
             case Protocols.SHADOWSOCKS: return this.isSSMultiUser ? this.settings.shadowsockses : null;
+            case Protocols.CHITANDA: return this.settings ? this.settings.chitandas : null;
             default: return null;
         }
     }
@@ -1828,12 +1829,20 @@ class Inbound extends XrayCommonClass {
         return txt;
     }
 
-    genChitandaLink(address='', port=this.port, remark='') {
-        const psk = encodeURIComponent(this.settings.psk || '');
-        const transport = this.settings.transport || 'h2';
-        const path = (transport !== 'stream') ? encodeURIComponent(this.settings.path || '/api/v1/sync') : '';
+    genChitandaLink(address='', port=this.port, remark='', clientPsk='') {
+        let pskVal = clientPsk;
+        if (!pskVal && this.settings) {
+            if (this.settings.chitandas && this.settings.chitandas[0] && this.settings.chitandas[0].password) {
+                pskVal = this.settings.chitandas[0].password;
+            } else if (this.settings.psk) {
+                pskVal = this.settings.psk;
+            }
+        }
+        const psk = encodeURIComponent(pskVal || '');
+        const transport = (this.settings && this.settings.transport) || 'h2';
+        const path = (transport !== 'stream') ? encodeURIComponent((this.settings && this.settings.path) || '/api/v1/sync') : '';
         const sni = (this.stream && this.stream.isTls) ? encodeURIComponent(this.stream.tls.serverName || address) : '';
-        const serverId = this.settings.server_id ? `&server-id=${encodeURIComponent(this.settings.server_id)}` : '';
+        const serverId = (this.settings && this.settings.server_id) ? `&server-id=${encodeURIComponent(this.settings.server_id)}` : '';
         const name = encodeURIComponent(remark || 'Chitanda');
         let link = `chitanda://${psk}@${address}:${port}?transport=${transport}`;
         if (path) link += `&path=${path}`;
@@ -1853,7 +1862,7 @@ class Inbound extends XrayCommonClass {
             case Protocols.TROJAN:
                 return this.genTrojanLink(address, port, forceTls, remark, client.password);
             case Protocols.CHITANDA:
-                return this.genChitandaLink(address, port, remark);
+                return this.genChitandaLink(address, port, remark, client ? client.password : '');
             default: return '';
         }
     }
@@ -1993,7 +2002,8 @@ Inbound.Settings = class extends XrayCommonClass {
 
 Inbound.ChitandaSettings = class extends Inbound.Settings {
     constructor(protocol,
-                psk=RandomUtil.randomSeq(32),
+                chitandas=[new Inbound.ChitandaSettings.Client()],
+                psk='',
                 path='/api/v1/sync',
                 transport='h2',
                 strict_sni='',
@@ -2001,7 +2011,8 @@ Inbound.ChitandaSettings = class extends Inbound.Settings {
                 server_id='',
                 replay_file='') {
         super(protocol);
-        this.psk = psk;
+        this.chitandas = chitandas;
+        this.psk = psk || (this.chitandas && this.chitandas[0] ? this.chitandas[0].password : RandomUtil.randomSeq(32));
         this.path = path;
         this.transport = transport;
         this.strict_sni = strict_sni;
@@ -2010,10 +2021,40 @@ Inbound.ChitandaSettings = class extends Inbound.Settings {
         this.replay_file = replay_file;
     }
 
+    indexOfClientById(id) {
+        return this.chitandas.findIndex(client => client.password === id || client.email === id || client.id === id);
+    }
+
+    addClient(client) {
+        if (this.indexOfClientById(client.password) >= 0) {
+            return false;
+        }
+        this.chitandas.push(client);
+    }
+
+    delClient(client) {
+        const i = this.indexOfClientById(client.password);
+        if (i >= 0) {
+            this.chitandas.splice(i, 1);
+        }
+    }
+
     static fromJson(json = {}) {
+        let clients = [];
+        if (json.clients && Array.isArray(json.clients) && json.clients.length > 0) {
+            clients = json.clients.map(client => Inbound.ChitandaSettings.Client.fromJson(client));
+        } else if (json.users && Array.isArray(json.users) && json.users.length > 0) {
+            clients = json.users.map(user => Inbound.ChitandaSettings.Client.fromJson({
+                password: user.psk || user.password,
+                email: user.email,
+            }));
+        } else {
+            clients = [new Inbound.ChitandaSettings.Client(json.psk || RandomUtil.randomSeq(32))];
+        }
         return new Inbound.ChitandaSettings(
             Protocols.CHITANDA,
-            json.psk || RandomUtil.randomSeq(32),
+            clients,
+            json.psk || (clients[0] ? clients[0].password : ''),
             json.path || '/api/v1/sync',
             json.transport || 'h2',
             json.strict_sni || '',
@@ -2025,7 +2066,8 @@ Inbound.ChitandaSettings = class extends Inbound.Settings {
 
     toJson() {
         return {
-            psk: this.psk,
+            clients: Inbound.ChitandaSettings.toJsonArray(this.chitandas),
+            psk: (this.chitandas && this.chitandas[0]) ? this.chitandas[0].password : (this.psk || ''),
             path: this.path,
             transport: this.transport,
             strict_sni: this.strict_sni,
@@ -2033,6 +2075,84 @@ Inbound.ChitandaSettings = class extends Inbound.Settings {
             server_id: this.server_id,
             replay_file: this.replay_file,
         };
+    }
+};
+
+Inbound.ChitandaSettings.Client = class extends XrayCommonClass {
+    constructor(password=RandomUtil.randomSeq(32), flow='', email=RandomUtil.randomLowerAndNum(8), limitIp=0, totalGB=0, expiryTime=0, enable=true, tgId='', subId=RandomUtil.randomLowerAndNum(16), reset=0) {
+        super();
+        this.id = RandomUtil.randomUUID();
+        this.password = password;
+        this.flow = flow;
+        this.email = email;
+        this.limitIp = limitIp;
+        this.totalGB = totalGB;
+        this.expiryTime = expiryTime;
+        this.enable = enable;
+        this.tgId = tgId;
+        this.subId = subId;
+        this.reset = reset;
+    }
+
+    toJson() {
+        return {
+            id: this.id,
+            password: this.password,
+            flow: this.flow,
+            email: this.email,
+            limitIp: this.limitIp,
+            totalGB: this.totalGB,
+            expiryTime: this.expiryTime,
+            enable: this.enable,
+            tgId: this.tgId,
+            subId: this.subId,
+            reset: this.reset,
+        };
+    }
+
+    static fromJson(json = {}) {
+        const client = new Inbound.ChitandaSettings.Client(
+            json.password || json.psk || RandomUtil.randomSeq(32),
+            json.flow || '',
+            json.email || RandomUtil.randomLowerAndNum(8),
+            json.limitIp || 0,
+            json.totalGB || 0,
+            json.expiryTime || 0,
+            json.enable ?? true,
+            json.tgId || '',
+            json.subId || RandomUtil.randomLowerAndNum(16),
+            json.reset || 0,
+        );
+        if (json.id) {
+            client.id = json.id;
+        }
+        return client;
+    }
+
+    get _expiryTime() {
+        if (this.expiryTime === 0 || this.expiryTime === "") {
+            return null;
+        }
+        if (this.expiryTime < 0){
+            return this.expiryTime / -86400000;
+        }
+        return moment(this.expiryTime);
+    }
+
+    set _expiryTime(t) {
+        if (t == null || t === "") {
+            this.expiryTime = 0;
+        } else {
+            this.expiryTime = t.valueOf();
+        }
+    }
+
+    get _totalGB() {
+        return toFixed(this.totalGB / ONE_GB, 2);
+    }
+
+    set _totalGB(gb) {
+        this.totalGB = toFixed(gb * ONE_GB, 0);
     }
 };
 

@@ -252,29 +252,33 @@ func (s *ServerService) GetStatus(lastStatus *Status) *Status {
 }
 
 func (s *ServerService) GetXrayVersions() ([]string, error) {
-	url := "https://api.github.com/repos/violetaini/chitanda/releases"
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return []string{"v26.3.27"}, nil
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (3x-ui)")
+	repos := []string{"chitanda-project/chitanda", "violetaini/chitanda"}
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return []string{"v26.3.27"}, nil
-	}
-	defer resp.Body.Close()
+	var releases []Release
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return []string{"v26.3.27"}, nil
+	for _, repo := range repos {
+		url := fmt.Sprintf("https://api.github.com/repos/%s/releases", repo)
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (3x-ui)")
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		var r []Release
+		if err := json.Unmarshal(body, &r); err == nil && len(r) > 0 {
+			releases = r
+			break
+		}
 	}
 
-	releases := make([]Release, 0)
-	err = json.Unmarshal(body, &releases)
-	if err != nil {
-		return []string{"v26.3.27"}, nil
-	}
 	var versions []string
 	for _, release := range releases {
 		hasXray := false
@@ -343,19 +347,22 @@ func (s *ServerService) downloadXRay(version string) (string, error) {
 	}
 
 	fileName := fmt.Sprintf("Xray-%s-%s.zip", osName, arch)
-	rawUrl := fmt.Sprintf("https://github.com/violetaini/chitanda/releases/download/%s/%s", version, fileName)
+	rawUrl := fmt.Sprintf("https://github.com/chitanda-project/chitanda/releases/download/%s/%s", version, fileName)
+	fallbackUrl := fmt.Sprintf("https://github.com/violetaini/chitanda/releases/download/%s/%s", version, fileName)
 
 	// Check if user set custom mirror in environment
 	customMirror := os.Getenv("XUI_MIRROR")
 	urls := []string{}
 	if customMirror != "" {
 		customMirror = strings.TrimSuffix(customMirror, "/")
-		urls = append(urls, customMirror+"/"+rawUrl)
+		urls = append(urls, customMirror+"/"+rawUrl, customMirror+"/"+fallbackUrl)
 	}
 	// Direct GitHub first (fastest for international servers), then reliable mirrors for mainland China
 	urls = append(urls,
 		rawUrl,
+		fallbackUrl,
 		"https://ghfast.top/"+rawUrl,
+		"https://ghfast.top/"+fallbackUrl,
 		"https://github.boki.moe/"+rawUrl,
 	)
 

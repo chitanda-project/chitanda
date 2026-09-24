@@ -215,6 +215,7 @@
                 case Protocols.VLESS: return new Inbound.VLESSSettings.VLESS();
                 case Protocols.TROJAN: return new Inbound.TrojanSettings.Trojan();
                 case Protocols.SHADOWSOCKS: return new Inbound.ShadowsocksSettings.Shadowsocks(clientsBulkModal.inbound.settings.shadowsockses[0].method);
+                case Protocols.CHITANDA: return new Inbound.ChitandaSettings.Client();
                 default: return null;
             }
         },

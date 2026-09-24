@@ -275,7 +275,7 @@
                       <a-icon type="edit"></a-icon>
                       {{ i18n "edit" }}
                     </a-menu-item>
-                    <a-menu-item key="qrcode" v-if="(dbInbound.isSS && !dbInbound.toInbound().isSSMultiUser) || dbInbound.isWireguard || dbInbound.isChitanda">
+                    <a-menu-item key="qrcode" v-if="(dbInbound.isSS && !dbInbound.toInbound().isSSMultiUser) || dbInbound.isWireguard">
                       <a-icon type="qrcode"></a-icon>
                       {{ i18n "qrCode" }}
                     </a-menu-item>
@@ -1054,6 +1054,7 @@
                 switch (protocol) {
                     case Protocols.TROJAN:
                     case Protocols.SHADOWSOCKS:
+                    case Protocols.CHITANDA:
                         return clients.findIndex(item => item.password === client.password && item.email === client.email);
                     default: return clients.findIndex(item => item.id === client.id && item.email === client.email);
                 }
@@ -1117,6 +1118,7 @@
             getClientId(protocol, client) {
                 switch (protocol) {
                     case Protocols.TROJAN: return client.password;
+                    case Protocols.CHITANDA: return client.password;
                     case Protocols.SHADOWSOCKS: return client.email;
                     default: return client.id;
                 }

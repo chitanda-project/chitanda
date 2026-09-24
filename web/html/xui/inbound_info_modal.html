@@ -194,7 +194,7 @@
           </td>
         </tr>
         <tr v-if="infoModal.clientSettings.password">
-          <td>{{ i18n "password" }}</td>
+          <td><span v-if="dbInbound.isChitanda">PSK</span><span v-else>{{ i18n "password" }}</span></td>
           <td>
             <a-tooltip :title="[[ infoModal.clientSettings.password  ]]">
               <a-tag class="info-large-tag">[[ infoModal.clientSettings.password ]]</a-tag>
@@ -447,7 +447,7 @@
       <table v-if="dbInbound.isChitanda" class="tr-info-table">
         <tr class="client-table-odd-row">
           <td>PSK 密钥</td>
-          <td>[[ inbound.settings.psk ]]</td>
+          <td>[[ inbound.settings.psk || (inbound.settings.chitandas && inbound.settings.chitandas[0] ? inbound.settings.chitandas[0].password : '') ]]</td>
         </tr>
         <tr>
           <td>传输模式 (Transport)</td>

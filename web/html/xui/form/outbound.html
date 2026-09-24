@@ -185,7 +185,13 @@
         </a-form-item>
         <template v-if="outbound.settings.transport !== 'stream' && outbound.settings.transport !== 'h1'">
           <a-form-item label='连接池大小 (Pool Size)'>
-            <a-input-number v-model.number="outbound.settings.pool_size" :min="1" :max="32"></a-input-number>
+            <a-input-number v-model.number="outbound.settings.pool_size" :min="1" :max="16"></a-input-number>
+          </a-form-item>
+          <a-form-item label='动态连接池扩容 (Auto Scale)'>
+            <a-switch v-model="outbound.settings.auto_scale"></a-switch>
+          </a-form-item>
+          <a-form-item v-if="outbound.settings.auto_scale" label='扩容最大上限 (Max Pool Size)'>
+            <a-input-number v-model.number="outbound.settings.max_pool_size" :min="1" :max="16"></a-input-number>
           </a-form-item>
           <a-form-item label='Allow Insecure'>
             <a-switch v-model="outbound.settings.allow_insecure"></a-switch>
