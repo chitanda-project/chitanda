@@ -150,7 +150,7 @@ update() {
         fi
         return 0
     fi
-    bash <(curl -Ls https://raw.githubusercontent.com/violetaini/chitanda/3x-ui/install.sh)
+    bash <(curl -Ls https://raw.githubusercontent.com/chitanda-project/chitanda/3x-ui/install.sh || curl -Ls https://raw.githubusercontent.com/violetaini/chitanda/3x-ui/install.sh)
     if [[ $? == 0 ]]; then
         LOGI "Update is complete, Panel has automatically restarted "
         exit 0
@@ -168,7 +168,7 @@ update_menu() {
         return 0
     fi
     
-    wget --no-check-certificate -O /usr/bin/x-ui https://raw.githubusercontent.com/violetaini/chitanda/3x-ui/x-ui.sh
+    wget --no-check-certificate -O /usr/bin/x-ui https://raw.githubusercontent.com/chitanda-project/chitanda/3x-ui/x-ui.sh || wget --no-check-certificate -O /usr/bin/x-ui https://raw.githubusercontent.com/violetaini/chitanda/3x-ui/x-ui.sh
     chmod +x /usr/local/x-ui/x-ui.sh
     chmod +x /usr/bin/x-ui
     

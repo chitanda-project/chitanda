@@ -184,21 +184,25 @@ install_x-ui() {
     fi
 
     if [ $# == 0 ]; then
-        last_version=$(curl -Ls "https://api.github.com/repos/violetaini/chitanda/releases/tags/3x-ui-v2.3.11" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        last_version=$(curl -Ls "https://api.github.com/repos/chitanda-project/chitanda/releases/tags/3x-ui-v2.3.11" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        if [[ -z "$last_version" ]]; then
+            last_version=$(curl -Ls "https://api.github.com/repos/violetaini/chitanda/releases/tags/3x-ui-v2.3.11" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        fi
         if [[ -z "$last_version" ]]; then
             last_version="3x-ui-v2.3.11"
         fi
         echo -e "Target x-ui version: ${last_version}, beginning the installation..."
-        wget -N --no-check-certificate -O /usr/local/x-ui-linux-$(arch).tar.gz https://github.com/violetaini/chitanda/releases/download/3x-ui-v2.3.11/x-ui-linux-$(arch).tar.gz || wget -N --no-check-certificate -O /usr/local/x-ui-linux-$(arch).tar.gz https://github.com/violetaini/chitanda/releases/download/v2.3.11/x-ui-linux-$(arch).tar.gz
+        wget -N --no-check-certificate -O /usr/local/x-ui-linux-$(arch).tar.gz https://github.com/chitanda-project/chitanda/releases/download/3x-ui-v2.3.11/x-ui-linux-$(arch).tar.gz || wget -N --no-check-certificate -O /usr/local/x-ui-linux-$(arch).tar.gz https://github.com/violetaini/chitanda/releases/download/3x-ui-v2.3.11/x-ui-linux-$(arch).tar.gz
         if [[ $? -ne 0 ]]; then
             echo -e "${red}Downloading x-ui failed, please be sure that your server can access Github ${plain}"
             exit 1
         fi
     else
         last_version=$1
-        url="https://github.com/violetaini/chitanda/releases/download/${last_version}/x-ui-linux-$(arch).tar.gz"
+        url="https://github.com/chitanda-project/chitanda/releases/download/${last_version}/x-ui-linux-$(arch).tar.gz"
+        fallback_url="https://github.com/violetaini/chitanda/releases/download/${last_version}/x-ui-linux-$(arch).tar.gz"
         echo -e "Beginning to install x-ui $1"
-        wget -N --no-check-certificate -O /usr/local/x-ui-linux-$(arch).tar.gz ${url}
+        wget -N --no-check-certificate -O /usr/local/x-ui-linux-$(arch).tar.gz ${url} || wget -N --no-check-certificate -O /usr/local/x-ui-linux-$(arch).tar.gz ${fallback_url}
         if [[ $? -ne 0 ]]; then
             echo -e "${red}Download x-ui $1 failed,please check the version exists ${plain}"
             exit 1

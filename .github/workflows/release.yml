@@ -58,7 +58,7 @@ jobs:
           cp x-ui.sh x-ui/
           
           # Download Chitanda Xray-core
-          curl -fL -o x-ui/bin/xray.zip https://github.com/violetaini/chitanda/releases/download/v26.3.27/Xray-linux-${{ matrix.xray_pkg }}.zip
+          curl -fL -o x-ui/bin/xray.zip https://github.com/chitanda-project/chitanda/releases/download/v26.3.27/Xray-linux-${{ matrix.xray_pkg }}.zip || curl -fL -o x-ui/bin/xray.zip https://github.com/violetaini/chitanda/releases/download/v26.3.27/Xray-linux-${{ matrix.xray_pkg }}.zip
           unzip -o x-ui/bin/xray.zip -d x-ui/bin/
           rm -f x-ui/bin/xray.zip
           mv x-ui/bin/xray x-ui/bin/xray-linux-${{ matrix.arch_name }}
