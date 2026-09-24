@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
@@ -99,6 +100,7 @@ func TestClient_ScalerPoolController(t *testing.T) {
 	if h2Cli == nil {
 		t.Fatal("pickBestH2Client returned nil")
 	}
+	defer h2Cli.activeStreams.Add(-1)
 	dummyScaler.mu.Lock()
 	actCount := dummyScaler.activityN
 	dummyScaler.mu.Unlock()
@@ -121,6 +123,19 @@ func TestClient_ScalerPoolController(t *testing.T) {
 	if stats.DynamicCarriers != 1 {
 		t.Fatalf("expected 1 dynamic carrier after scale-up, got %d", stats.DynamicCarriers)
 	}
+	// A selected carrier must be reserved before the idle sweeper can evict it.
+	cli.h2Clients[0].activeStreams.Add(100)
+	cli.h2Clients[1].activeStreams.Add(100)
+	selected := cli.pickBestH2Client()
+	if selected != cli.h2Clients[2] || selected.activeStreams.Load() != 1 {
+		t.Fatal("dynamic H2 carrier was not reserved during selection")
+	}
+	if removed, err := cli.RemoveIdleCarrier("h2", 0); err != nil || removed {
+		t.Fatalf("reserved H2 carrier was evicted: removed=%v err=%v", removed, err)
+	}
+	selected.activeStreams.Add(-1)
+	cli.h2Clients[0].activeStreams.Add(-100)
+	cli.h2Clients[1].activeStreams.Add(-100)
 
 	// 4. Remove Dynamic Idle Carrier
 	removed, err := cli.RemoveIdleCarrier("h2", 0)
@@ -150,6 +165,39 @@ func TestClient_ScalerPoolController(t *testing.T) {
 	stats = cli.Stats("h2")
 	if stats.TotalCarriers != 2 {
 		t.Fatalf("expected pool to stay at 2 base carriers, got %d", stats.TotalCarriers)
+	}
+}
+
+func TestClient_H3CarrierProbeConfirmsHandshake(t *testing.T) {
+	cli, cleanup := reviewH3(t, http.NotFoundHandler())
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := cli.AddCarrier(ctx, "h3"); err != nil {
+		t.Fatalf("H3 carrier handshake probe failed: %v", err)
+	}
+	if stats := cli.Stats("h3"); stats.TotalCarriers != 2 || stats.DynamicCarriers != 1 {
+		t.Fatalf("H3 carrier was not added after handshake: %+v", stats)
+	}
+}
+
+func TestClient_H3CarrierProbeRejectsUnreachablePeer(t *testing.T) {
+	cli, err := New(Config{
+		Server: "127.0.0.1:59999", ServerName: "localhost", Path: "/probe-fail",
+		PSK: []byte("test-only-key-that-is-at-least-32-bytes"), TCPTransport: TCPTransportH3,
+		TCPPoolSize: 1, MaxPoolSize: 2, InsecureSkipVerify: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if err := cli.AddCarrier(ctx, "h3"); err == nil {
+		t.Fatal("unreachable H3 carrier was accepted")
+	}
+	if stats := cli.Stats("h3"); stats.TotalCarriers != 1 {
+		t.Fatalf("failed H3 probe expanded pool: %+v", stats)
 	}
 }
 
@@ -188,7 +236,6 @@ func TestClient_ScalerConcurrentSafety(t *testing.T) {
 			for range 50 {
 				c := cli.pickBestH2Client()
 				if c != nil {
-					c.activeStreams.Add(1)
 					time.Sleep(10 * time.Microsecond)
 					c.activeStreams.Add(-1)
 				}

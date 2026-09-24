@@ -160,6 +160,8 @@ type ChitandaOutboundConfig struct {
 	Path               string `json:"path"`
 	Transport          string `json:"transport"`
 	PoolSize           int32  `json:"pool_size"`
+	AutoScale          bool   `json:"auto_scale"`
+	MaxPoolSize        int32  `json:"max_pool_size"`
 	ServerID           string `json:"server_id"`
 	ServerId           string `json:"serverId"`
 	ServerHyphen       string `json:"server-id"`
@@ -198,6 +200,8 @@ func (c *ChitandaOutboundConfig) Build() (proto.Message, error) {
 		Path:          c.Path,
 		Transport:     c.Transport,
 		PoolSize:      c.PoolSize,
+		AutoScale:     c.AutoScale,
+		MaxPoolSize:   c.MaxPoolSize,
 		ServerId:      sid,
 		AllowInsecure: c.AllowInsecure || c.AllowInsecureCamel,
 	}, nil

@@ -174,17 +174,28 @@ func (c *Client) AddCarrier(ctx context.Context, transport string) error {
 		h2Cli.isDynamic = true
 		h2Cli.idleSince = now
 
+		// Close also acquires c.mu before carrierMu. Hold both locks while
+		// registering so Close cannot drain the pool between the check and append.
+		c.mu.Lock()
 		c.carrierMu.Lock()
-		if c.closed || len(c.h2Clients) >= c.maxCarriers {
-			c.carrierMu.Unlock()
+		closed := c.closed
+		ctxErr := ctx.Err()
+		atCapacity := len(c.h2Clients) >= c.maxCarriers
+		if !closed && ctxErr == nil && !atCapacity {
+			c.h2Clients = append(c.h2Clients, h2Cli)
+		}
+		c.carrierMu.Unlock()
+		c.mu.Unlock()
+		if closed || ctxErr != nil || atCapacity {
 			h2Cli.close()
-			if c.closed {
+			if closed {
 				return errors.New("client closed")
+			}
+			if ctxErr != nil {
+				return ctxErr
 			}
 			return ErrPoolAtCapacity
 		}
-		c.h2Clients = append(c.h2Clients, h2Cli)
-		c.carrierMu.Unlock()
 		return nil
 	} else if transport == "h3" {
 		c.carrierMu.RLock()
@@ -210,17 +221,26 @@ func (c *Client) AddCarrier(ctx context.Context, transport string) error {
 		mgr.isDynamic = true
 		mgr.idleSince = now
 
+		c.mu.Lock()
 		c.carrierMu.Lock()
-		if c.closed || len(c.h3Managers) >= c.maxCarriers {
-			c.carrierMu.Unlock()
+		closed := c.closed
+		ctxErr := ctx.Err()
+		atCapacity := len(c.h3Managers) >= c.maxCarriers
+		if !closed && ctxErr == nil && !atCapacity {
+			c.h3Managers = append(c.h3Managers, mgr)
+		}
+		c.carrierMu.Unlock()
+		c.mu.Unlock()
+		if closed || ctxErr != nil || atCapacity {
 			mgr.close()
-			if c.closed {
+			if closed {
 				return errors.New("client closed")
+			}
+			if ctxErr != nil {
+				return ctxErr
 			}
 			return ErrPoolAtCapacity
 		}
-		c.h3Managers = append(c.h3Managers, mgr)
-		c.carrierMu.Unlock()
 		return nil
 	}
 	return ErrUnsupportedTransport

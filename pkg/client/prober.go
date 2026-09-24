@@ -88,6 +88,7 @@ func (p *h2Prober) pingH2() (time.Duration, error) {
 	if h2Cli == nil {
 		return 0, io.EOF
 	}
+	defer h2Cli.activeStreams.Add(-1)
 	probeCtx, cancel := context.WithTimeout(p.ctx, 2500*time.Millisecond)
 	defer cancel()
 

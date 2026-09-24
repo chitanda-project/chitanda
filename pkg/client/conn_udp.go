@@ -143,8 +143,23 @@ func (m *h3TransportManager) ensureUDP(ctx context.Context) (*h3Connection, erro
 }
 
 func (m *h3TransportManager) prewarm(ctx context.Context) error {
-	_, err := m.ensureUDP(ctx)
-	return err
+	conn, err := m.ensureUDP(ctx)
+	if err != nil {
+		return err
+	}
+	// DialEarly can return as soon as 0-RTT data may be sent. A scaler probe
+	// must not register the carrier until the server has completed the handshake.
+	select {
+	case <-conn.quic.HandshakeComplete():
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return conn.quic.Context().Err()
+	case <-conn.quic.Context().Done():
+		return context.Cause(conn.quic.Context())
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (m *h3TransportManager) invalidate(c *h3Connection) {
@@ -618,8 +633,6 @@ func (c *quicPacketConn) WriteBatch(payloads [][]byte, addrs []net.Addr) error {
 	}
 	return nil
 }
-
-
 
 func (c *quicPacketConn) Close() error {
 	c.mu.Lock()

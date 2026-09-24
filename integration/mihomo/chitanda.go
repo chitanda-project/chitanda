@@ -112,13 +112,7 @@ func (c *Chitanda) getClient() (*client.Client, error) {
 	}
 
 	var scaler client.AutoscalerPlugin
-	autoScaleEnabled := false
-	if c.option.AutoScale != nil && *c.option.AutoScale {
-		autoScaleEnabled = true
-	} else if c.option.MaxPoolSize > c.option.PoolSize && c.option.MaxPoolSize > 0 {
-		autoScaleEnabled = true
-	}
-	if autoScaleEnabled {
+	if shouldAutoScale(c.option) {
 		maxCarriers := c.option.MaxPoolSize
 		if maxCarriers <= 0 {
 			maxCarriers = 8
@@ -156,6 +150,13 @@ func (c *Chitanda) getClient() (*client.Client, error) {
 
 	c.client = cli
 	return c.client, nil
+}
+
+func shouldAutoScale(option *ChitandaOption) bool {
+	if option.AutoScale != nil {
+		return *option.AutoScale
+	}
+	return option.MaxPoolSize > option.PoolSize && option.MaxPoolSize > 0
 }
 
 func (c *Chitanda) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {

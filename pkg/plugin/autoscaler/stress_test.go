@@ -74,7 +74,10 @@ func (c *chaosMockController) AddCarrier(ctx context.Context, transport string) 
 	}
 
 	// Chaos injection: random failure
-	if c.failRate > 0 && rand.Float64() < c.failRate {
+	c.mu.Lock()
+	failRate := c.failRate
+	c.mu.Unlock()
+	if failRate > 0 && rand.Float64() < failRate {
 		c.failedAdds.Add(1)
 		return errors.New("chaos injected: network connection reset or handshake timeout")
 	}

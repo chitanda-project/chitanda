@@ -34,6 +34,8 @@
 | `skip-cert-verify`| Boolean| いいえ | `false` | TLS 証明書の検証をスキップするかどうか (本番環境では `false` を推奨) |
 | `pool-size` | Integer | いいえ | `4` | TCP コネクションプールのサイズ (`h2` モードのスループットおよびバースト耐性を最適化) |
 | `udp-pool-size` | Integer | いいえ | (`pool-size` と同一) | UDP コネクションプールのサイズ (H3 QUIC 独立キャリア数。ゲーム・DNS などの多重化および QoS 物理分離用) |
+| `auto-scale` | Boolean | いいえ | `false` | 動的プール拡張。明示的な `false` は `max-pool-size` による暗黙の有効化より優先 |
+| `max-pool-size` | Integer | いいえ | `8` | 動的拡張時のキャリア上限（最大 `16`）。初期プールより大きい値を単独指定した場合も拡張を有効化 |
 | `udp` | Boolean | いいえ | `true` | UDP パケット転送を有効にするかどうか |
 | `interface-name` | String | いいえ | - | アウトバウンドにバインドする NIC 名 (マルチインターフェース・ポリシールーティングに対応) |
 | `routing-mark` | Integer | いいえ | `0` | Linux アウトバウンドトラフィックの `fwmark` ルーティングマーク |
@@ -406,6 +408,8 @@ Xray-core において、`chitanda` は **Inbound (サーバーインバウン�
 | `path` | String | いいえ | `/api/v1/sync` | 偽装リクエストパス |
 | `transport` | String | いいえ | `h2` | キャリアモード (`h2` / `h3` / `auto` / `stream` / `h1`) |
 | `pool_size` | Integer | いいえ | `4` | TCP 物理コネクションプールサイズ (`h2` / `auto` モードで有効) |
+| `auto_scale` | Boolean | いいえ | `false` | 動的キャリア拡張を有効化 |
+| `max_pool_size` | Integer | いいえ | `8` | 拡張時のキャリア上限（最大 `16`）。初期プールより大きい値を単独指定した場合も拡張を有効化 |
 | `server_id` | String | いいえ | - | サーバー識別子バインド (`stream` モード専用、クロスノードリプレイ防御) |
 | `allow_insecure` | Boolean | いいえ | `false` | TLS 証明書検証をスキップするかどうか (デフォルト `false`、自己署名証明書テスト用) |
 

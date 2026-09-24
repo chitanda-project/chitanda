@@ -211,6 +211,8 @@ proxies:
     transport: "h2"
     sni: "jp.example.com"
     pool-size: 4
+    auto-scale: true
+    max-pool-size: 8
     udp: true
 
   # モード 2: Stream 専用線高スループットモード (RawStream TCP + AES-128-GCM + 動的難読化) - 専用線推奨
@@ -327,6 +329,8 @@ proxies:
         "path": "/api/v1/sync",
         "transport": "h2",
         "pool_size": 4,
+        "auto_scale": true,
+        "max_pool_size": 8,
         "allow_insecure": false
       }
     },
@@ -390,6 +394,7 @@ Chitanda 在客户端（Mihomo / Xray）原生支持多物理载波连接池。�
 #### 1) 通道参数定义与运作原则
 - **`pool-size` (TCP 物理通道数)**：控制客户端与服务端之间维护的独立 TLS 1.3 / H2 物理长连接数量（默认 `4`）。用于分散内网大量设备的 TCP 逻辑流，避免单一物理连接丢包引发队头阻塞。
 - **`udp-pool-size` (UDP 物理通道数)**：控制客户端与服务端之间独立的 H3 / QUIC 物理通道数量（默认与 `pool-size` 相同，即 `4`）。不同 UDP 逻辑会话（游戏、DNS、语音）会自动按最小活跃流负载均衡分配至不同管道，实现 QoS 物理硬隔离。
+- **动态扩容（可选）**：Mihomo 设置 `auto-scale: true`、`max-pool-size: 8`；Xray 出站 `settings` 使用 `auto_scale: true`、`max_pool_size: 8`。`max-pool-size` 是每类载体池的上限，不保证实际吞吐提升；Mihomo 显式 `auto-scale: false` 会覆盖上限设置。
 - **开箱即用零配置**：日常个人设备使用时，**完全无需在配置中指定 `pool-size` 或 `udp-pool-size`**，内核默认自动建立 `4 TCP + 4 UDP` 独立通道池。
 
 #### 2) 软路由硬件与通道推荐配置档位

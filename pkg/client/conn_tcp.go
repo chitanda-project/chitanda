@@ -190,7 +190,6 @@ func (c *h2TransportClient) dialH2TCPOnce(ctx context.Context, target string) (n
 		return nil, errors.New("missing session confirmation header")
 	}
 
-	c.activeStreams.Add(1)
 	var body io.ReadCloser = response.Body
 	if response.Header.Get("X-Session-Framing") == "1" {
 		body = &framedResponseBody{Reader: frame.NewStreamReader(body), Closer: body}

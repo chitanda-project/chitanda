@@ -1,10 +1,27 @@
 package conf
 
 import (
+	"encoding/json"
 	"github.com/violetaini/chitanda/pkg/server"
 	"github.com/xtls/xray-core/proxy/chitanda"
 	"testing"
 )
+
+func TestChitandaOutboundScalerJSON(t *testing.T) {
+	var cfg ChitandaOutboundConfig
+	data := []byte(`{"server":"example.com:443","psk":"test-only-key-that-is-at-least-32-bytes","transport":"h3","pool_size":2,"auto_scale":true,"max_pool_size":8}`)
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	message, err := cfg.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbound := message.(*chitanda.OutboundConfig)
+	if !outbound.AutoScale || outbound.MaxPoolSize != 8 {
+		t.Fatalf("JSON scaler settings were lost: auto_scale=%v max_pool_size=%d", outbound.AutoScale, outbound.MaxPoolSize)
+	}
+}
 
 func TestChitandaTLSInheritanceAndDefaults(t *testing.T) {
 	c := ChitandaInboundConfig{PSK: "test-only-key-that-is-at-least-32-bytes", Transport: "h3"}

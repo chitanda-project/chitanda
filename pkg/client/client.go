@@ -65,10 +65,10 @@ type Config struct {
 	ListenPacket          func(ctx context.Context, network, addr string) (net.PacketConn, error)
 	// DialPacket optionally opens a packet socket to the resolved tunnel peer.
 	// Embedding cores can route this through their own UDP dispatcher.
-	DialPacket func(ctx context.Context, remote *net.UDPAddr) (net.PacketConn, error)
-	ResolveUDP func(ctx context.Context, network, addr string) (*net.UDPAddr, error)
-	Autoscaler AutoscalerPlugin // optional dynamic auto-scaling plugin
-	MaxPoolSize int // max allowed carriers under scaling (default 8, max 16)
+	DialPacket  func(ctx context.Context, remote *net.UDPAddr) (net.PacketConn, error)
+	ResolveUDP  func(ctx context.Context, network, addr string) (*net.UDPAddr, error)
+	Autoscaler  AutoscalerPlugin // optional dynamic auto-scaling plugin
+	MaxPoolSize int              // max allowed carriers under scaling (default 8, max 16)
 }
 
 // Client is the MyXray core client engine.
@@ -262,6 +262,7 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 			if err == nil {
 				return conn, nil
 			}
+			h2Cli.activeStreams.Add(-1)
 			if c.cfg.TCPTransport == TCPTransportH2 {
 				return nil, fmt.Errorf("h2 tcp dial failed: %w", err)
 			}
@@ -292,9 +293,10 @@ func (c *Client) pickBestH2Client() *h2TransportClient {
 	}
 	if n == 1 {
 		cli := c.h2Clients[0]
+		active := cli.activeStreams.Add(1)
 		c.carrierMu.RUnlock()
 		if c.autoscaler != nil {
-			c.autoscaler.OnActivity("h2", cli.activeStreams.Load(), 1)
+			c.autoscaler.OnActivity("h2", active, 1)
 		}
 		return cli
 	}
@@ -312,10 +314,11 @@ func (c *Client) pickBestH2Client() *h2TransportClient {
 			best = cli
 		}
 	}
+	best.activeStreams.Add(1)
 	c.carrierMu.RUnlock()
 
 	if c.autoscaler != nil {
-		c.autoscaler.OnActivity("h2", minActive, n)
+		c.autoscaler.OnActivity("h2", minActive+1, n)
 	}
 	return best
 }
