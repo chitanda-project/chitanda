@@ -67,6 +67,8 @@ type Config struct {
 	// Embedding cores can route this through their own UDP dispatcher.
 	DialPacket func(ctx context.Context, remote *net.UDPAddr) (net.PacketConn, error)
 	ResolveUDP func(ctx context.Context, network, addr string) (*net.UDPAddr, error)
+	Autoscaler AutoscalerPlugin // optional dynamic auto-scaling plugin
+	MaxPoolSize int // max allowed carriers under scaling (default 8, max 16)
 }
 
 // Client is the MyXray core client engine.
@@ -74,12 +76,16 @@ type Client struct {
 	cfg          Config
 	rootURL      string
 	requestURL   string
+	carrierMu    sync.RWMutex
+	scaleMu      sync.Mutex
 	h2Clients    []*h2TransportClient
 	nextH2Idx    atomic.Uint64
 	h3Managers   []*h3TransportManager
 	nextH3Idx    atomic.Uint64
 	sessionCache *sessioncache.Cache
 	prober       *h2Prober
+	autoscaler   AutoscalerPlugin
+	maxCarriers  int
 	mu           sync.Mutex
 	closed       bool
 }
@@ -184,6 +190,20 @@ func New(cfg Config) (*Client, error) {
 		}
 	}
 
+	maxCarriers := cfg.MaxPoolSize
+	if maxCarriers <= 0 {
+		maxCarriers = 8
+	}
+	if maxCarriers > 16 {
+		maxCarriers = 16
+	}
+	if maxCarriers < cfg.TCPPoolSize {
+		maxCarriers = cfg.TCPPoolSize
+	}
+	if maxCarriers < cfg.UDPPoolSize {
+		maxCarriers = cfg.UDPPoolSize
+	}
+
 	c := &Client{
 		cfg:          cfg,
 		rootURL:      rootURL,
@@ -191,9 +211,17 @@ func New(cfg Config) (*Client, error) {
 		h2Clients:    h2Clients,
 		h3Managers:   h3Managers,
 		sessionCache: cache,
+		maxCarriers:  maxCarriers,
+		autoscaler:   cfg.Autoscaler,
 	}
 	if cfg.TCPTransport == TCPTransportAuto {
 		c.prober = newH2Prober(c)
+	}
+	if c.autoscaler != nil {
+		if err := c.autoscaler.Init(c); err != nil {
+			c.Close()
+			return nil, fmt.Errorf("init autoscaler plugin: %w", err)
+		}
 	}
 	return c, nil
 }
@@ -252,12 +280,19 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 }
 
 func (c *Client) pickBestH2Client() *h2TransportClient {
+	c.carrierMu.RLock()
 	n := len(c.h2Clients)
 	if n == 0 {
+		c.carrierMu.RUnlock()
 		return nil
 	}
 	if n == 1 {
-		return c.h2Clients[0]
+		cli := c.h2Clients[0]
+		c.carrierMu.RUnlock()
+		if c.autoscaler != nil {
+			c.autoscaler.OnActivity("h2", cli.activeStreams.Load(), 1)
+		}
+		return cli
 	}
 
 	start := int(c.nextH2Idx.Add(1) % uint64(n))
@@ -273,16 +308,28 @@ func (c *Client) pickBestH2Client() *h2TransportClient {
 			best = cli
 		}
 	}
+	c.carrierMu.RUnlock()
+
+	if c.autoscaler != nil {
+		c.autoscaler.OnActivity("h2", minActive, n)
+	}
 	return best
 }
 
 func (c *Client) pickBestH3Manager() *h3TransportManager {
+	c.carrierMu.RLock()
 	n := len(c.h3Managers)
 	if n == 0 {
+		c.carrierMu.RUnlock()
 		return nil
 	}
 	if n == 1 {
-		return c.h3Managers[0]
+		mgr := c.h3Managers[0]
+		c.carrierMu.RUnlock()
+		if c.autoscaler != nil {
+			c.autoscaler.OnActivity("h3", mgr.activeStreams.Load(), 1)
+		}
+		return mgr
 	}
 
 	start := int(c.nextH3Idx.Add(1) % uint64(n))
@@ -297,6 +344,11 @@ func (c *Client) pickBestH3Manager() *h3TransportManager {
 			minActive = active
 			best = manager
 		}
+	}
+	c.carrierMu.RUnlock()
+
+	if c.autoscaler != nil {
+		c.autoscaler.OnActivity("h3", minActive, n)
 	}
 	return best
 }
@@ -349,8 +401,13 @@ func (c *Client) Prewarm(ctx context.Context) error {
 	prewarmCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
+	c.carrierMu.RLock()
+	clients := make([]*h2TransportClient, len(c.h2Clients))
+	copy(clients, c.h2Clients)
+	c.carrierMu.RUnlock()
+
 	var wg sync.WaitGroup
-	for _, cli := range c.h2Clients {
+	for _, cli := range clients {
 		wg.Add(1)
 		go func(h *h2TransportClient) {
 			defer wg.Done()
@@ -371,14 +428,25 @@ func (c *Client) Close() {
 	c.closed = true
 	c.mu.Unlock()
 
+	if c.autoscaler != nil {
+		_ = c.autoscaler.Close()
+	}
+
 	if c.prober != nil {
 		c.prober.Close()
 	}
 
-	for _, cli := range c.h2Clients {
+	c.carrierMu.Lock()
+	h2List := c.h2Clients
+	c.h2Clients = nil
+	h3List := c.h3Managers
+	c.h3Managers = nil
+	c.carrierMu.Unlock()
+
+	for _, cli := range h2List {
 		cli.close()
 	}
-	for _, manager := range c.h3Managers {
+	for _, manager := range h3List {
 		manager.close()
 	}
 }

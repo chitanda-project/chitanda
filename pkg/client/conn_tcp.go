@@ -27,6 +27,8 @@ type h2TransportClient struct {
 	client        *http.Client
 	transport     *http.Transport
 	activeStreams atomic.Int64
+	isDynamic     bool
+	idleSince     time.Time
 }
 
 func newH2TransportClient(server, serverName, rootURL, requestURL, path string, psk []byte, insecureSkipVerify bool, dialRaw func(ctx context.Context, network, addr string) (net.Conn, error)) (*h2TransportClient, error) {

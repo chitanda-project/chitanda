@@ -46,6 +46,9 @@ type h3TransportManager struct {
 	// Separate physical connections for TCP and UDP
 	currentTCP *h3Connection
 	currentUDP *h3Connection
+
+	isDynamic bool
+	idleSince time.Time
 }
 
 func newH3TransportManager(
