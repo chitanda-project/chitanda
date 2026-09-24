@@ -18,7 +18,7 @@ const hybridStartDelayFactorExp = 3 // 2^3 = 8
 // The original paper specifies 2 and 8ms, but those have changed over time.
 const (
 	hybridStartDelayMinThresholdUs = int64(4000)
-	hybridStartDelayMaxThresholdUs = int64(16000)
+	hybridStartDelayMaxThresholdUs = int64(40000)
 )
 
 // HybridSlowStart implements the TCP hybrid slow start algorithm

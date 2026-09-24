@@ -6,6 +6,11 @@ on:
     paths:
       - 'integration/xray/**'
       - 'scripts/inject-xray.py'
+      - 'scripts/test_inject_xray.py'
+      - 'scripts/prepare-xray-quic-vendor.sh'
+      - 'scripts/patch-vendor.go'
+      - 'scripts/vendor-performance.patch'
+      - 'scripts/vendor-tests/**'
       - 'pkg/**'
       - 'internal/**'
       - 'go.mod'
@@ -82,18 +87,27 @@ jobs:
         run: |
           git clone --depth 1 --branch ${{ steps.upstream_check.outputs.upstream_tag }} https://github.com/XTLS/Xray-core.git upstream_src
 
+      - name: Test Xray injector invariants
+        if: steps.upstream_check.outputs.should_build == 'true'
+        run: python3 -m unittest discover -s scripts -p test_inject_xray.py
+
       - name: Inject Chitanda Protocol Adapter
         if: steps.upstream_check.outputs.should_build == 'true'
         run: |
           python3 scripts/inject-xray.py upstream_src $PWD
 
+      - name: Prepare Xray root vendor patches
+        if: steps.upstream_check.outputs.should_build == 'true'
+        run: |
+          cd upstream_src
+          sh "$GITHUB_WORKSPACE/scripts/prepare-xray-quic-vendor.sh" "$GITHUB_WORKSPACE"
+
       - name: Test Xray Chitanda adapter regressions
         if: steps.upstream_check.outputs.should_build == 'true'
         run: |
           cd upstream_src
-          go mod tidy
-          go test -race ./proxy/chitanda -count=1 -timeout 180s
-          go test -race ./infra/conf -run Chitanda -count=1 -timeout 120s
+          go test -mod=vendor -race ./proxy/chitanda -count=1 -timeout 180s
+          go test -mod=vendor -race ./infra/conf -run Chitanda -count=1 -timeout 120s
 
       - name: Test Chitanda SDK regressions
         if: steps.upstream_check.outputs.should_build == 'true'
@@ -103,8 +117,6 @@ jobs:
         if: steps.upstream_check.outputs.should_build == 'true'
         run: |
           cd upstream_src
-          go mod tidy || true
-          python3 "$GITHUB_WORKSPACE/scripts/patch_xnet.py"
           mkdir -p ../dist
           
           PLATFORMS=("linux/amd64" "linux/arm64" "windows/amd64" "darwin/arm64" "darwin/amd64")
@@ -118,7 +130,7 @@ jobs:
             BIN_NAME="xray${EXT}"
             echo "Building $BIN_NAME for $GOOS/$GOARCH..."
             
-            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -trimpath -ldflags="-s -w -buildid=" -o "../dist/$BIN_NAME" ./main
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -mod=vendor -trimpath -ldflags="-s -w -buildid=" -o "../dist/$BIN_NAME" ./main
             
             cd ../dist
             

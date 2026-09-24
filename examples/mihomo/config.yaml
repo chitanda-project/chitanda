@@ -84,6 +84,24 @@ proxies:
     server-id: "tokyo-node-01"
     udp: true
 
+  # -------------------------------------------------------------
+  # 特殊構成例: 軟ルーター・透明ゲートウェイ向け最適化構成 (TPROXY / TUN 多端末高並行)
+  # -------------------------------------------------------------
+  # 多数の端末（10〜50台）が常時接続する軟ルーター環境（x86 N100/N5105 等）向け推奨。
+  # pool-size で TCP 物理多重化コネクションを 8 本に拡張し、udp-pool-size を 4 本に設定して
+  # 大容量ダウンロードによるゲーム・DNS・音声パケットの押し出し（バッファブロート）を物理分離・防止します。
+  - name: "Chitanda-06-Gateway-Tokyo"
+    type: chitanda
+    server: jp.example.com
+    port: 443
+    psk: "super-secure-pre-shared-key-sample-token"
+    path: "/api/v1/sync"
+    transport: "h2"
+    sni: "jp.example.com"
+    pool-size: 8          # TCP 物理多重化コネクション数（軟ルーター推奨: 6〜8、最大: 16）
+    udp-pool-size: 4      # UDP (H3) 物理多重化コネクション数（推奨: 4、最大: 16）
+    udp: true
+
 proxy-groups:
   - name: "PROXIES"
     type: select
@@ -94,6 +112,7 @@ proxy-groups:
       - "Chitanda-03-Auto-Tokyo"
       - "Chitanda-04-H1-DirectIP"
       - "Chitanda-05-Stream-Tokyo"
+      - "Chitanda-06-Gateway-Tokyo"
       - DIRECT
 
   - name: "AUTO-FALLBACK"
@@ -106,6 +125,7 @@ proxy-groups:
       - "Chitanda-03-Auto-Tokyo"
       - "Chitanda-04-H1-DirectIP"
       - "Chitanda-05-Stream-Tokyo"
+      - "Chitanda-06-Gateway-Tokyo"
 
   - name: "LOAD-BALANCE"
     type: load-balance
@@ -116,6 +136,7 @@ proxy-groups:
       - "Chitanda-02-H3-Tokyo"
       - "Chitanda-03-Auto-Tokyo"
       - "Chitanda-05-Stream-Tokyo"
+      - "Chitanda-06-Gateway-Tokyo"
 
 rules:
   - GEOIP,LAN,DIRECT

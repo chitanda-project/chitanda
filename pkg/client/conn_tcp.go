@@ -27,6 +27,8 @@ type h2TransportClient struct {
 	client        *http.Client
 	transport     *http.Transport
 	activeStreams atomic.Int64
+	isDynamic     bool
+	idleSince     time.Time
 }
 
 func newH2TransportClient(server, serverName, rootURL, requestURL, path string, psk []byte, insecureSkipVerify bool, dialRaw func(ctx context.Context, network, addr string) (net.Conn, error)) (*h2TransportClient, error) {
@@ -188,7 +190,6 @@ func (c *h2TransportClient) dialH2TCPOnce(ctx context.Context, target string) (n
 		return nil, errors.New("missing session confirmation header")
 	}
 
-	c.activeStreams.Add(1)
 	var body io.ReadCloser = response.Body
 	if response.Header.Get("X-Session-Framing") == "1" {
 		body = &framedResponseBody{Reader: frame.NewStreamReader(body), Closer: body}

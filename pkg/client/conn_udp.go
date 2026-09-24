@@ -46,6 +46,9 @@ type h3TransportManager struct {
 	// Separate physical connections for TCP and UDP
 	currentTCP *h3Connection
 	currentUDP *h3Connection
+
+	isDynamic bool
+	idleSince time.Time
 }
 
 func newH3TransportManager(
@@ -137,6 +140,26 @@ func (m *h3TransportManager) ensureTCP(ctx context.Context) (*h3Connection, erro
 
 func (m *h3TransportManager) ensureUDP(ctx context.Context) (*h3Connection, error) {
 	return m.ensureConnection(ctx, &m.currentUDP)
+}
+
+func (m *h3TransportManager) prewarm(ctx context.Context) error {
+	conn, err := m.ensureUDP(ctx)
+	if err != nil {
+		return err
+	}
+	// DialEarly can return as soon as 0-RTT data may be sent. A scaler probe
+	// must not register the carrier until the server has completed the handshake.
+	select {
+	case <-conn.quic.HandshakeComplete():
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return conn.quic.Context().Err()
+	case <-conn.quic.Context().Done():
+		return context.Cause(conn.quic.Context())
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (m *h3TransportManager) invalidate(c *h3Connection) {
@@ -565,6 +588,50 @@ func (c *quicPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+func (c *quicPacketConn) WriteBatch(payloads [][]byte, addrs []net.Addr) error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return errors.New("use of closed network connection")
+	}
+	if !c.writeDeadline.IsZero() && time.Now().After(c.writeDeadline) {
+		c.mu.Unlock()
+		return context.DeadlineExceeded
+	}
+	c.mu.Unlock()
+
+	if len(payloads) == 0 {
+		return nil
+	}
+	if len(payloads) == 1 {
+		address := addrs[0].String()
+		packet, err := frame.EncodeDatagram(c.sequence.Add(1), address, payloads[0])
+		if err != nil {
+			return err
+		}
+		return c.stream.SendDatagram(packet)
+	}
+
+	frames := make([][]byte, len(payloads))
+	for i, p := range payloads {
+		address := addrs[i].String()
+		packet, err := frame.EncodeDatagram(c.sequence.Add(1), address, p)
+		if err != nil {
+			return err
+		}
+		frames[i] = packet
+	}
+	if sender, ok := any(c.stream).(interface{ SendDatagrams([][]byte) error }); ok {
+		return sender.SendDatagrams(frames)
+	}
+	for _, f := range frames {
+		if err := c.stream.SendDatagram(f); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *quicPacketConn) Close() error {

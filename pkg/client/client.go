@@ -56,6 +56,7 @@ type Config struct {
 	Path                  string // e.g. "/your-private-path"
 	TCPTransport          string // "h2" (default), "auto", "h3", or "h1" (alias: "plain-h1")
 	TCPPoolSize           int    // Number of independent physical TCP carriers (H2 or H3, default 4)
+	UDPPoolSize           int    // Number of independent physical UDP carriers (H3, default TCPPoolSize or 4)
 	SessionCacheFile      string // optional persistent session cache path
 	QUICInitialPacketSize uint16 // 1200 - 1452, default 1452
 	InsecureSkipVerify    bool   // skip TLS certificate verification
@@ -64,22 +65,31 @@ type Config struct {
 	ListenPacket          func(ctx context.Context, network, addr string) (net.PacketConn, error)
 	// DialPacket optionally opens a packet socket to the resolved tunnel peer.
 	// Embedding cores can route this through their own UDP dispatcher.
-	DialPacket func(ctx context.Context, remote *net.UDPAddr) (net.PacketConn, error)
-	ResolveUDP func(ctx context.Context, network, addr string) (*net.UDPAddr, error)
+	DialPacket  func(ctx context.Context, remote *net.UDPAddr) (net.PacketConn, error)
+	ResolveUDP  func(ctx context.Context, network, addr string) (*net.UDPAddr, error)
+	Autoscaler  AutoscalerPlugin // optional dynamic auto-scaling plugin
+	MaxPoolSize int              // max allowed carriers under scaling (default 8, max 16)
 }
 
 // Client is the MyXray core client engine.
 type Client struct {
-	cfg          Config
-	rootURL      string
-	requestURL   string
-	h2Clients    []*h2TransportClient
-	nextH2Idx    atomic.Uint64
-	h3Managers   []*h3TransportManager
-	sessionCache *sessioncache.Cache
-	prober       *h2Prober
-	mu           sync.Mutex
-	closed       bool
+	cfg            Config
+	rootURL        string
+	requestURL     string
+	carrierMu      sync.RWMutex
+	scaleMu        sync.Mutex
+	h2Clients      []*h2TransportClient
+	baseH2Carriers int
+	nextH2Idx      atomic.Uint64
+	h3Managers     []*h3TransportManager
+	baseH3Carriers int
+	nextH3Idx      atomic.Uint64
+	sessionCache   *sessioncache.Cache
+	prober         *h2Prober
+	autoscaler     AutoscalerPlugin
+	maxCarriers    int
+	mu             sync.Mutex
+	closed         bool
 }
 
 func (c *Client) dialRaw(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -126,6 +136,12 @@ func New(cfg Config) (*Client, error) {
 	if cfg.TCPPoolSize > 16 {
 		cfg.TCPPoolSize = 16
 	}
+	if cfg.UDPPoolSize <= 0 {
+		cfg.UDPPoolSize = cfg.TCPPoolSize
+	}
+	if cfg.UDPPoolSize > 16 {
+		cfg.UDPPoolSize = 16
+	}
 	if cfg.QUICInitialPacketSize == 0 {
 		cfg.QUICInitialPacketSize = quicconfig.DefaultInitialPacketSize
 	}
@@ -163,11 +179,11 @@ func New(cfg Config) (*Client, error) {
 			h2Clients = append(h2Clients, h2Cli)
 		}
 
-		h3Count := 1
-		if cfg.TCPTransport == TCPTransportH3 {
-			h3Count = cfg.TCPPoolSize
-		} else if cfg.TCPTransport == TCPTransportAuto {
-			h3Count = cfg.TCPPoolSize
+		h3Count := cfg.UDPPoolSize
+		if cfg.TCPTransport == TCPTransportH3 || cfg.TCPTransport == TCPTransportAuto {
+			if cfg.TCPPoolSize > h3Count {
+				h3Count = cfg.TCPPoolSize
+			}
 		}
 		for i := 0; i < h3Count; i++ {
 			h3Managers = append(h3Managers, newH3TransportManager(
@@ -176,16 +192,40 @@ func New(cfg Config) (*Client, error) {
 		}
 	}
 
+	maxCarriers := cfg.MaxPoolSize
+	if maxCarriers <= 0 {
+		maxCarriers = 8
+	}
+	if maxCarriers > 16 {
+		maxCarriers = 16
+	}
+	if maxCarriers < cfg.TCPPoolSize {
+		maxCarriers = cfg.TCPPoolSize
+	}
+	if maxCarriers < cfg.UDPPoolSize {
+		maxCarriers = cfg.UDPPoolSize
+	}
+
 	c := &Client{
-		cfg:          cfg,
-		rootURL:      rootURL,
-		requestURL:   requestURL,
-		h2Clients:    h2Clients,
-		h3Managers:   h3Managers,
-		sessionCache: cache,
+		cfg:            cfg,
+		rootURL:        rootURL,
+		requestURL:     requestURL,
+		h2Clients:      h2Clients,
+		baseH2Carriers: len(h2Clients),
+		h3Managers:     h3Managers,
+		baseH3Carriers: len(h3Managers),
+		sessionCache:   cache,
+		maxCarriers:    maxCarriers,
+		autoscaler:     cfg.Autoscaler,
 	}
 	if cfg.TCPTransport == TCPTransportAuto {
 		c.prober = newH2Prober(c)
+	}
+	if c.autoscaler != nil {
+		if err := c.autoscaler.Init(c); err != nil {
+			c.Close()
+			return nil, fmt.Errorf("init autoscaler plugin: %w", err)
+		}
 	}
 	return c, nil
 }
@@ -222,6 +262,7 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 			if err == nil {
 				return conn, nil
 			}
+			h2Cli.activeStreams.Add(-1)
 			if c.cfg.TCPTransport == TCPTransportH2 {
 				return nil, fmt.Errorf("h2 tcp dial failed: %w", err)
 			}
@@ -244,38 +285,77 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 }
 
 func (c *Client) pickBestH2Client() *h2TransportClient {
-	if len(c.h2Clients) == 0 {
+	c.carrierMu.RLock()
+	n := len(c.h2Clients)
+	if n == 0 {
+		c.carrierMu.RUnlock()
 		return nil
 	}
-	if len(c.h2Clients) == 1 {
-		return c.h2Clients[0]
+	if n == 1 {
+		cli := c.h2Clients[0]
+		active := cli.activeStreams.Add(1)
+		c.carrierMu.RUnlock()
+		if c.autoscaler != nil {
+			c.autoscaler.OnActivity("h2", active, 1)
+		}
+		return cli
 	}
 
-	best := c.h2Clients[0]
+	start := int(c.nextH2Idx.Add(1) % uint64(n))
+	best := c.h2Clients[start]
 	minActive := best.activeStreams.Load()
 
-	for _, cli := range c.h2Clients[1:] {
+	for i := 1; i < n; i++ {
+		idx := (start + i) % n
+		cli := c.h2Clients[idx]
 		active := cli.activeStreams.Load()
 		if active < minActive {
 			minActive = active
 			best = cli
 		}
 	}
+	best.activeStreams.Add(1)
+	c.carrierMu.RUnlock()
+
+	if c.autoscaler != nil {
+		c.autoscaler.OnActivity("h2", minActive+1, n)
+	}
 	return best
 }
 
 func (c *Client) pickBestH3Manager() *h3TransportManager {
-	if len(c.h3Managers) == 0 {
+	c.carrierMu.RLock()
+	n := len(c.h3Managers)
+	if n == 0 {
+		c.carrierMu.RUnlock()
 		return nil
 	}
-	best := c.h3Managers[0]
+	if n == 1 {
+		mgr := c.h3Managers[0]
+		c.carrierMu.RUnlock()
+		if c.autoscaler != nil {
+			c.autoscaler.OnActivity("h3", mgr.activeStreams.Load(), 1)
+		}
+		return mgr
+	}
+
+	start := int(c.nextH3Idx.Add(1) % uint64(n))
+	best := c.h3Managers[start]
 	minActive := best.activeStreams.Load()
-	for _, manager := range c.h3Managers[1:] {
+
+	for i := 1; i < n; i++ {
+		idx := (start + i) % n
+		manager := c.h3Managers[idx]
 		active := manager.activeStreams.Load()
 		if active < minActive {
 			minActive = active
 			best = manager
 		}
+	}
+	c.carrierMu.RUnlock()
+
+	if c.autoscaler != nil {
+		c.autoscaler.OnActivity("h3", minActive, n)
 	}
 	return best
 }
@@ -328,8 +408,13 @@ func (c *Client) Prewarm(ctx context.Context) error {
 	prewarmCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
+	c.carrierMu.RLock()
+	clients := make([]*h2TransportClient, len(c.h2Clients))
+	copy(clients, c.h2Clients)
+	c.carrierMu.RUnlock()
+
 	var wg sync.WaitGroup
-	for _, cli := range c.h2Clients {
+	for _, cli := range clients {
 		wg.Add(1)
 		go func(h *h2TransportClient) {
 			defer wg.Done()
@@ -350,14 +435,25 @@ func (c *Client) Close() {
 	c.closed = true
 	c.mu.Unlock()
 
+	if c.autoscaler != nil {
+		_ = c.autoscaler.Close()
+	}
+
 	if c.prober != nil {
 		c.prober.Close()
 	}
 
-	for _, cli := range c.h2Clients {
+	c.carrierMu.Lock()
+	h2List := c.h2Clients
+	c.h2Clients = nil
+	h3List := c.h3Managers
+	c.h3Managers = nil
+	c.carrierMu.Unlock()
+
+	for _, cli := range h2List {
 		cli.close()
 	}
-	for _, manager := range c.h3Managers {
+	for _, manager := range h3List {
 		manager.close()
 	}
 }

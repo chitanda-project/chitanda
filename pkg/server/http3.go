@@ -87,7 +87,8 @@ func (s *Server) serveHTTP3(w http.ResponseWriter, r *http.Request) {
 	signature := r.Header.Get(headerSignature)
 	switch {
 	case r.Method == http.MethodGet && r.Header.Get(headerMode) == modeTCPv2:
-		if err := s.authorize(r, targetAddress, timestamp, nonce, signature); err != nil {
+		matchedUser, err := s.authorize(r, targetAddress, timestamp, nonce, signature)
+		if err != nil {
 			if errors.Is(err, errReplayDetected) {
 				http.Error(w, "Bad Request", http.StatusBadRequest)
 				return
@@ -95,13 +96,15 @@ func (s *Server) serveHTTP3(w http.ResponseWriter, r *http.Request) {
 			s.serveFallback(w, r)
 			return
 		}
+		r = r.WithContext(ContextWithUser(r.Context(), matchedUser))
 		s.serveHTTP3TCP(w, r, targetAddress)
 	case r.Method == http.MethodConnect && r.Proto == "connect-udp" && r.Header.Get(headerMode) == modeUDPv2:
 		if targetAddress != udpAuthName {
 			s.serveFallback(w, r)
 			return
 		}
-		if err := s.authorize(r, targetAddress, timestamp, nonce, signature); err != nil {
+		matchedUser, err := s.authorize(r, targetAddress, timestamp, nonce, signature)
+		if err != nil {
 			if errors.Is(err, errReplayDetected) {
 				http.Error(w, "Bad Request", http.StatusBadRequest)
 				return
@@ -109,10 +112,12 @@ func (s *Server) serveHTTP3(w http.ResponseWriter, r *http.Request) {
 			s.serveFallback(w, r)
 			return
 		}
+		r = r.WithContext(ContextWithUser(r.Context(), matchedUser))
 		s.serveHTTP3UDP(w, r)
 	default:
 		s.serveFallback(w, r)
 	}
+
 }
 
 func (s *Server) serveHTTP3TCP(w http.ResponseWriter, r *http.Request, targetAddress string) {
@@ -453,6 +458,9 @@ func (r *udpRelay) target(address string) (*udpTarget, error) {
 }
 
 func (t *udpTarget) writeBatch(payloads [][]byte) error {
+	if bw, ok := t.conn.(interface{ WriteBatch([][]byte) error }); ok && len(payloads) > 1 {
+		return bw.WriteBatch(payloads)
+	}
 	if t.batch == nil || len(payloads) == 1 {
 		for _, payload := range payloads {
 			if _, err := t.conn.Write(payload); err != nil {
@@ -461,6 +469,7 @@ func (t *udpTarget) writeBatch(payloads [][]byte) error {
 		}
 		return nil
 	}
+
 	for i, payload := range payloads {
 		t.messages[i].Buffers[0] = payload
 	}

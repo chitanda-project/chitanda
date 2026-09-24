@@ -98,3 +98,20 @@ func TestRegressionMihomoRejectInvalidConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestRegressionMihomoExplicitAutoScaleFalse(t *testing.T) {
+	disabled := false
+	enabled := true
+	base := ChitandaOption{PoolSize: 2, MaxPoolSize: 8}
+	if !shouldAutoScale(&base) {
+		t.Fatal("an omitted auto-scale flag should allow max-pool-size to enable scaling")
+	}
+	base.AutoScale = &disabled
+	if shouldAutoScale(&base) {
+		t.Fatal("explicit auto-scale: false must disable scaling")
+	}
+	base.AutoScale = &enabled
+	if !shouldAutoScale(&base) {
+		t.Fatal("explicit auto-scale: true must enable scaling")
+	}
+}

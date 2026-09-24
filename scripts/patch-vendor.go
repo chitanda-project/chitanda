@@ -140,6 +140,21 @@ func (c *Conn) sendDatagram(p []byte, copyPayload bool) error {
 	}
 
 	for _, replacement := range replacements {
+		if len(os.Args) > 1 {
+			switch os.Args[1] {
+			case "--quic-only":
+				if !strings.HasPrefix(replacement.path, "vendor/github.com/quic-go/quic-go/") {
+					continue
+				}
+			case "--xnet-only":
+				if !strings.HasPrefix(replacement.path, "vendor/golang.org/x/net/") {
+					continue
+				}
+			default:
+				fmt.Fprintln(os.Stderr, "usage: patch-vendor.go [--quic-only|--xnet-only]")
+				os.Exit(2)
+			}
+		}
 		if err := replaceExactlyOnce(replacement); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)

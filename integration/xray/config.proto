@@ -6,6 +6,12 @@ option go_package = "github.com/xtls/xray-core/proxy/chitanda";
 option java_package = "com.xray.proxy.chitanda";
 option java_multiple_files = true;
 
+message User {
+  string email = 1;
+  string psk = 2;
+  uint32 level = 3;
+}
+
 message InboundConfig {
   string psk = 1;
   string path = 2;
@@ -16,6 +22,7 @@ message InboundConfig {
   string replay_file = 7;
   string cert_file = 8;
   string key_file = 9;
+  repeated User users = 10;
 }
 
 message OutboundConfig {
@@ -27,5 +34,7 @@ message OutboundConfig {
   int32 pool_size = 6;
   string server_id = 7;
   bool allow_insecure = 8;
+  bool auto_scale = 9;
+  int32 max_pool_size = 10;
 }
 

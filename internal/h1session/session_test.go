@@ -190,3 +190,36 @@ func TestOpenFrameRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestMatchClientHelloMultiUser(t *testing.T) {
+	now := time.Now()
+	key1 := []byte("user1-secret-key-at-least-32-bytes-long!")
+	key2 := []byte("user2-secret-key-at-least-32-bytes-long!")
+	key3 := []byte("user3-secret-key-at-least-32-bytes-long!")
+	keys := [][]byte{key1, key2, key3}
+
+	// 1. Client creates ClientHello with key2
+	hello2, nonce2, ts2, err := CreateClientHello(key2, now)
+	if err != nil {
+		t.Fatalf("CreateClientHello: %v", err)
+	}
+
+	// 2. Server matches across keys
+	matchedIdx, matchedNonce, matchedTs, err := MatchClientHello(keys, hello2, now)
+	if err != nil {
+		t.Fatalf("MatchClientHello: %v", err)
+	}
+	if matchedIdx != 1 {
+		t.Fatalf("expected matchedIdx 1, got %d", matchedIdx)
+	}
+	if matchedNonce != nonce2 || matchedTs != ts2 {
+		t.Fatalf("nonce or ts mismatch")
+	}
+
+	// 3. Unknown key should fail
+	unknownKey := []byte("unknown-user-key-at-least-32-bytes-long!")
+	helloUnknown, _, _, _ := CreateClientHello(unknownKey, now)
+	if _, _, _, err := MatchClientHello(keys, helloUnknown, now); err != ErrInvalidClientAuth {
+		t.Fatalf("expected ErrInvalidClientAuth, got %v", err)
+	}
+}

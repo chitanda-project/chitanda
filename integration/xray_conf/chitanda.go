@@ -3,26 +3,34 @@ package conf
 import (
 	"fmt"
 	"github.com/violetaini/chitanda/pkg/client"
+	"github.com/violetaini/chitanda/pkg/server"
 	"github.com/xtls/xray-core/proxy/chitanda"
 	"google.golang.org/protobuf/proto"
 	"net"
 	"strings"
 )
 
+type ChitandaUser struct {
+	Email string `json:"email"`
+	PSK   string `json:"psk"`
+	Level uint32 `json:"level"`
+}
+
 type ChitandaInboundConfig struct {
-	PSK           string `json:"psk"`
-	Path          string `json:"path"`
-	Transport     string `json:"transport"`
-	StrictSNI     string `json:"strict_sni"`
-	Fallback      string `json:"fallback"`
-	ServerID      string `json:"server_id"`
-	ServerId      string `json:"serverId"`
-	ServerHyphen  string `json:"server-id"`
-	ReplayFile    string `json:"replay_file"`
-	CertFile      string `json:"cert_file"`
-	CertFileCamel string `json:"certFile"`
-	KeyFile       string `json:"key_file"`
-	KeyFileCamel  string `json:"keyFile"`
+	PSK           string          `json:"psk"`
+	Path          string          `json:"path"`
+	Transport     string          `json:"transport"`
+	StrictSNI     string          `json:"strict_sni"`
+	Fallback      string          `json:"fallback"`
+	ServerID      string          `json:"server_id"`
+	ServerId      string          `json:"serverId"`
+	ServerHyphen  string          `json:"server-id"`
+	ReplayFile    string          `json:"replay_file"`
+	CertFile      string          `json:"cert_file"`
+	CertFileCamel string          `json:"certFile"`
+	KeyFile       string          `json:"key_file"`
+	KeyFileCamel  string          `json:"keyFile"`
+	Users         []*ChitandaUser `json:"users"`
 }
 
 // InheritTLS reuses an explicitly configured Xray server certificate for the
@@ -55,8 +63,57 @@ func validateChitanda(psk, mode string) error {
 }
 
 func (c *ChitandaInboundConfig) Build() (proto.Message, error) {
-	if err := validateChitanda(c.PSK, c.Transport); err != nil {
-		return nil, err
+	switch c.Transport {
+	case "", "stream", "h1", "plain-h1", "h2", "h3", "auto":
+	default:
+		return nil, fmt.Errorf("chitanda: unsupported transport %q", c.Transport)
+	}
+
+	var protoUsers []*chitanda.User
+	if len(c.Users) > 0 {
+		if c.PSK != "" {
+			return nil, fmt.Errorf("chitanda: psk and users cannot be configured together")
+		}
+		if len(c.Users) > server.MaxUserKeys {
+			return nil, fmt.Errorf("chitanda: no more than %d users are supported", server.MaxUserKeys)
+		}
+		seenEmails := make(map[string]struct{})
+		seenPSKs := make(map[string]struct{})
+		for idx, u := range c.Users {
+			if u == nil {
+				return nil, fmt.Errorf("chitanda: user at index %d is nil", idx)
+			}
+			email := strings.TrimSpace(u.Email)
+			if email == "" {
+				return nil, fmt.Errorf("chitanda: user at index %d has empty email", idx)
+			}
+			lowerEmail := strings.ToLower(email)
+			if _, exists := seenEmails[lowerEmail]; exists {
+				return nil, fmt.Errorf("chitanda: duplicate user email %q", email)
+			}
+			seenEmails[lowerEmail] = struct{}{}
+
+			if len(u.PSK) < 32 {
+				return nil, fmt.Errorf("chitanda: user %q psk must contain at least 32 bytes", email)
+			}
+			if _, exists := seenPSKs[u.PSK]; exists {
+				return nil, fmt.Errorf("chitanda: duplicate user psk for user %q", email)
+			}
+			seenPSKs[u.PSK] = struct{}{}
+
+			protoUsers = append(protoUsers, &chitanda.User{
+				Email: email,
+				Psk:   u.PSK,
+				Level: u.Level,
+			})
+		}
+		if len(protoUsers) == 0 {
+			return nil, fmt.Errorf("chitanda: no valid users configured in users list")
+		}
+	} else {
+		if err := validateChitanda(c.PSK, c.Transport); err != nil {
+			return nil, err
+		}
 	}
 	if c.Path == "" {
 		c.Path = "/api/v1/sync"
@@ -92,6 +149,7 @@ func (c *ChitandaInboundConfig) Build() (proto.Message, error) {
 		ReplayFile: c.ReplayFile,
 		CertFile:   certFile,
 		KeyFile:    keyFile,
+		Users:      protoUsers,
 	}, nil
 }
 
@@ -102,6 +160,8 @@ type ChitandaOutboundConfig struct {
 	Path               string `json:"path"`
 	Transport          string `json:"transport"`
 	PoolSize           int32  `json:"pool_size"`
+	AutoScale          bool   `json:"auto_scale"`
+	MaxPoolSize        int32  `json:"max_pool_size"`
 	ServerID           string `json:"server_id"`
 	ServerId           string `json:"serverId"`
 	ServerHyphen       string `json:"server-id"`
@@ -140,6 +200,8 @@ func (c *ChitandaOutboundConfig) Build() (proto.Message, error) {
 		Path:          c.Path,
 		Transport:     c.Transport,
 		PoolSize:      c.PoolSize,
+		AutoScale:     c.AutoScale,
+		MaxPoolSize:   c.MaxPoolSize,
 		ServerId:      sid,
 		AllowInsecure: c.AllowInsecure || c.AllowInsecureCamel,
 	}, nil

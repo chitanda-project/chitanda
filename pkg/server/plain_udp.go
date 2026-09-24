@@ -27,6 +27,7 @@ var udpTaskPool = sync.Pool{
 }
 
 type udpTask struct {
+	userIndex  int
 	sessionID  uint64
 	clientAddr *net.UDPAddr
 	targetAddr string
@@ -36,10 +37,16 @@ type udpTask struct {
 	seq        uint64
 }
 
+type plainUDPSessionKey struct {
+	userIndex int
+	sessionID uint64
+}
+
 type PlainUDPServer struct {
 	codec        *plainudp.Codec
+	codecs       []*plainudp.Codec
 	conn         *net.UDPConn
-	sessions     sync.Map // uint64(sessionID) -> *plainUDPSession
+	sessions     sync.Map // plainUDPSessionKey -> *plainUDPSession
 	sessionCount atomic.Int64
 	maxSessions  int64
 	workers      []chan udpTask
@@ -59,6 +66,7 @@ type PlainUDPServer struct {
 
 type plainUDPSession struct {
 	sessionID   uint64
+	codec       *plainudp.Codec
 	clientAddr  atomic.Pointer[net.UDPAddr]
 	targets     sync.Map // string(targetAddr) -> *net.UDPConn
 	targetCount atomic.Int64
@@ -69,13 +77,28 @@ type plainUDPSession struct {
 
 // NewPlainUDPServer creates a new plain-udp listener with a bounded worker pool and memory budget.
 func NewPlainUDPServer(conn *net.UDPConn, psk []byte) (*PlainUDPServer, error) {
-	_ = conn.SetReadBuffer(8 << 20)
-	_ = conn.SetWriteBuffer(8 << 20)
+	return NewPlainUDPServerWithUsers(conn, []UserKey{{PSK: psk}})
+}
 
-	codec, err := plainudp.NewCodec(psk)
-	if err != nil {
+// NewPlainUDPServerWithUsers keeps each user's authenticated UDP sessions and
+// response cipher separate, even when clients choose the same session ID.
+func NewPlainUDPServerWithUsers(conn *net.UDPConn, users []UserKey) (*PlainUDPServer, error) {
+	if conn == nil {
+		return nil, errors.New("plainudp: listener is required")
+	}
+	if err := ValidateUserKeys(users); err != nil {
 		return nil, err
 	}
+	codecs := make([]*plainudp.Codec, 0, len(users))
+	for _, user := range users {
+		codec, err := plainudp.NewCodec(user.PSK)
+		if err != nil {
+			return nil, err
+		}
+		codecs = append(codecs, codec)
+	}
+	_ = conn.SetReadBuffer(8 << 20)
+	_ = conn.SetWriteBuffer(8 << 20)
 
 	numWorkers := runtime.NumCPU() * 2
 	if numWorkers < 8 {
@@ -89,7 +112,8 @@ func NewPlainUDPServer(conn *net.UDPConn, psk []byte) (*PlainUDPServer, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &PlainUDPServer{
 		ctx: ctx, cancel: cancel, done: make(chan struct{}),
-		codec:        codec,
+		codec:        codecs[0],
+		codecs:       codecs,
 		conn:         conn,
 		workers:      workers,
 		maxMemBudget: DefaultUDPMemoryBudget,
@@ -172,15 +196,24 @@ func (s *PlainUDPServer) Serve(ctx context.Context) error {
 		}
 
 		now := time.Now()
-		sessionID, targetAddr, payload, _, seq, err := s.codec.DecodePacket((*rawBufPtr)[:n], plainudp.DirClientToServer, now)
+		var userIndex int
+		var sessionID, seq uint64
+		var targetAddr string
+		var payload []byte
+		if len(s.codecs) == 1 {
+			sessionID, targetAddr, payload, _, seq, err = s.codecs[0].DecodePacket((*rawBufPtr)[:n], plainudp.DirClientToServer, now)
+		} else {
+			userIndex, sessionID, targetAddr, payload, _, seq, err = plainudp.DecodePacketMulti(s.codecs, (*rawBufPtr)[:n], plainudp.DirClientToServer, now)
+		}
 		if err != nil {
 			s.inFlightMem.Add(-bufCap)
 			udpTaskPool.Put(rawBufPtr)
 			continue // Drop invalid / tampered / expired / wrong direction packets
 		}
 
-		workerIdx := sessionID % uint64(len(s.workers))
+		workerIdx := (sessionID ^ uint64(userIndex)) % uint64(len(s.workers))
 		task := udpTask{
+			userIndex:  userIndex,
 			sessionID:  sessionID,
 			clientAddr: clientAddr,
 			targetAddr: targetAddr,
@@ -226,13 +259,17 @@ func (s *PlainUDPServer) workerLoop(ctx context.Context, workerID int, tasks <-c
 }
 
 func (s *PlainUDPServer) processTask(ctx context.Context, task udpTask) {
-	val, loaded := s.sessions.Load(task.sessionID)
+	if task.userIndex < 0 || task.userIndex >= len(s.codecs) {
+		return
+	}
+	key := plainUDPSessionKey{userIndex: task.userIndex, sessionID: task.sessionID}
+	val, loaded := s.sessions.Load(key)
 	if !loaded {
 		if s.maxSessions > 0 && s.sessionCount.Load() >= s.maxSessions {
 			return // Session limit reached, drop task
 		}
-		newSession := &plainUDPSession{sessionID: task.sessionID}
-		actual, loadedActual := s.sessions.LoadOrStore(task.sessionID, newSession)
+		newSession := &plainUDPSession{sessionID: task.sessionID, codec: s.codecs[task.userIndex]}
+		actual, loadedActual := s.sessions.LoadOrStore(key, newSession)
 		if !loadedActual {
 			s.sessionCount.Add(1)
 		}
@@ -310,7 +347,7 @@ func (s *PlainUDPServer) listenUpstream(ctx context.Context, session *plainUDPSe
 		}
 
 		session.lastActive.Store(time.Now().Unix())
-		encrypted, err := s.codec.EncodePacket(nil, plainudp.DirServerToClient, session.sessionID, targetAddr, buf[:n], time.Now())
+		encrypted, err := session.codec.EncodePacket(nil, plainudp.DirServerToClient, session.sessionID, targetAddr, buf[:n], time.Now())
 		if err != nil {
 			continue
 		}
@@ -396,12 +433,30 @@ func (c *PlainUDPCodec) DecodeClientPacket(packet []byte, now time.Time) (sessio
 	return c.codec.DecodePacket(packet, plainudp.DirClientToServer, now)
 }
 
+func (c *PlainUDPCodec) DecodeServerPacket(packet []byte, now time.Time) (sessionID uint64, targetAddr string, payload []byte, timestamp uint64, seq uint64, err error) {
+	return c.codec.DecodePacket(packet, plainudp.DirServerToClient, now)
+}
+
 func (c *PlainUDPCodec) EncodeServerPacket(sessionID uint64, targetAddr string, payload []byte, now time.Time) ([]byte, error) {
 	return c.codec.EncodePacket(nil, plainudp.DirServerToClient, sessionID, targetAddr, payload, now)
 }
 
 func (c *PlainUDPCodec) EncodeClientPacket(sessionID uint64, targetAddr string, payload []byte, now time.Time) ([]byte, error) {
 	return c.codec.EncodePacket(nil, plainudp.DirClientToServer, sessionID, targetAddr, payload, now)
+}
+
+// DecodeClientPacketMulti decodes a client packet across multiple user codecs.
+func DecodeClientPacketMulti(codecs []*PlainUDPCodec, packet []byte, now time.Time) (matchedIndex int, sessionID uint64, targetAddr string, payload []byte, timestamp uint64, seq uint64, err error) {
+	for i, c := range codecs {
+		if c == nil || c.codec == nil {
+			continue
+		}
+		sID, tAddr, pLoad, ts, sNum, err := c.DecodeClientPacket(packet, now)
+		if err == nil {
+			return i, sID, tAddr, pLoad, ts, sNum, nil
+		}
+	}
+	return -1, 0, "", nil, 0, 0, plainudp.ErrDecryptionFailed
 }
 
 // UDPReplayWindow provides anti-replay window tracking for datagrams.

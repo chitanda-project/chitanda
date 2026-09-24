@@ -68,13 +68,11 @@ func CreateClientHello(psk []byte, now time.Time) (record []byte, clientNonce [2
 	return record, clientNonce, timestamp, nil
 }
 
-// VerifyClientHello verifies an incoming 48-byte ClientHello record.
-func VerifyClientHello(psk []byte, record []byte, now time.Time) (clientNonce [24]byte, timestamp uint64, err error) {
-	if len(psk) < 32 {
-		return clientNonce, 0, errors.New("h1session: PSK must be at least 32 bytes")
-	}
+// MatchClientHello verifies an incoming 48-byte ClientHello record against multiple PSKs.
+// Returns the index of the matching key in keys, clientNonce, timestamp, or an error.
+func MatchClientHello(keys [][]byte, record []byte, now time.Time) (matchedIndex int, clientNonce [24]byte, timestamp uint64, err error) {
 	if len(record) != ClientHelloSize {
-		return clientNonce, 0, ErrInvalidRecordLen
+		return -1, clientNonce, 0, ErrInvalidRecordLen
 	}
 
 	timestamp = binary.BigEndian.Uint64(record[0:8])
@@ -84,21 +82,39 @@ func VerifyClientHello(psk []byte, record []byte, now time.Time) (clientNonce [2
 	nowSec := uint64(now.Unix())
 	diff := int64(nowSec) - int64(timestamp)
 	if diff < -int64(MaxTimestampSkew/time.Second) || diff > int64(MaxTimestampSkew/time.Second) {
-		return clientNonce, 0, ErrTimestampExpired
+		return -1, clientNonce, 0, ErrTimestampExpired
 	}
 
-	mac := hmac.New(sha256.New, psk)
-	mac.Write([]byte(DomainClientHello))
-	mac.Write(record[0:8])
-	mac.Write(clientNonce[:])
-	expectedFullTag := mac.Sum(nil)
+	for i, psk := range keys {
+		if len(psk) < 32 {
+			continue
+		}
+		mac := hmac.New(sha256.New, psk)
+		mac.Write([]byte(DomainClientHello))
+		mac.Write(record[0:8])
+		mac.Write(clientNonce[:])
+		expectedFullTag := mac.Sum(nil)
 
-	if !hmac.Equal(clientTag, expectedFullTag[:16]) {
-		return clientNonce, 0, ErrInvalidClientAuth
+		if hmac.Equal(clientTag, expectedFullTag[:16]) {
+			return i, clientNonce, timestamp, nil
+		}
 	}
 
-	return clientNonce, timestamp, nil
+	return -1, clientNonce, 0, ErrInvalidClientAuth
 }
+
+// VerifyClientHello verifies an incoming 48-byte ClientHello record.
+func VerifyClientHello(psk []byte, record []byte, now time.Time) (clientNonce [24]byte, timestamp uint64, err error) {
+	if len(psk) < 32 {
+		return clientNonce, 0, errors.New("h1session: PSK must be at least 32 bytes")
+	}
+	matched, cNonce, ts, err := MatchClientHello([][]byte{psk}, record, now)
+	if err != nil || matched < 0 {
+		return cNonce, ts, err
+	}
+	return cNonce, ts, nil
+}
+
 
 // Derive0RTTKey derives a 32-byte 0-RTT ChaCha20-Poly1305 key for Flight 1 client payload.
 func Derive0RTTKey(psk []byte, timestamp uint64, clientNonce [24]byte) ([32]byte, error) {

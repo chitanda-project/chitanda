@@ -225,7 +225,7 @@ func TestReviewInboundReplayAcrossAssociations(t *testing.T) {
 	pc.WriteTo([]byte("one authenticated request"), &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 53})
 	wire := recvReview(t, p.out)
 	codec, _ := server.NewPlainUDPCodec(reviewKey)
-	h := &InboundHandler{config: &InboundConfig{Transport: "stream"}, plainCodec: codec}
+	h := &InboundHandler{config: &InboundConfig{Transport: "stream"}, userCodecs: []*server.PlainUDPCodec{codec}, userReplays: make([]udpReplayRegistry, 1)}
 	d := &reviewDispatcher{writes: &reviewWriter{make(chan buf.MultiBuffer, 8)}}
 	defer d.Close()
 	for i := 0; i < 2; i++ {

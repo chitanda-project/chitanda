@@ -199,6 +199,23 @@ func (c *Codec) DecodePacket(packet []byte, expectedDir Direction, now time.Time
 	return sessionID, targetAddr, payloadCopy, timestamp, seq, nil
 }
 
+// DecodePacketMulti tries decrypting the packet across multiple Codecs.
+// Returns the index of the codec in codecs that successfully decrypted the packet,
+// along with the decoded packet fields.
+func DecodePacketMulti(codecs []*Codec, packet []byte, expectedDir Direction, now time.Time) (matchedIndex int, sessionID uint64, targetAddr string, payload []byte, timestamp uint64, seq uint64, err error) {
+	for i, codec := range codecs {
+		if codec == nil {
+			continue
+		}
+		sID, tAddr, pLoad, ts, sNum, err := codec.DecodePacket(packet, expectedDir, now)
+		if err == nil {
+			return i, sID, tAddr, pLoad, ts, sNum, nil
+		}
+	}
+	return -1, 0, "", nil, 0, 0, ErrDecryptionFailed
+}
+
+
 func appendTargetAddress(buf []byte, address string) ([]byte, error) {
 	host, portText, err := net.SplitHostPort(address)
 	if err != nil {

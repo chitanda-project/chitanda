@@ -13,3 +13,4 @@ inspect_db.py
 test_tls.py
 proto_scan.py
 __pycache__/
+/upstream_src/

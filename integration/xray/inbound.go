@@ -25,6 +25,7 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/routing"
@@ -34,21 +35,55 @@ import (
 // InboundHandler implements proxy.Inbound for Chitanda protocol in Xray
 type InboundHandler struct {
 	config       *InboundConfig
+	users        []server.UserKey
 	server       *server.Server
 	streamServer *server.StreamServer
 	h3Server     *http3.Server
 	vconn        *virtualPacketConn
-	plainCodec   *server.PlainUDPCodec
+	userCodecs   []*server.PlainUDPCodec
 	replays      *auth.ReplayCache
-	udpReplays   udpReplayRegistry
+	userReplays  []udpReplayRegistry
 	dispatcher   routing.Dispatcher
 	ctx          context.Context
 	cancel       context.CancelFunc
-	mu           sync.Mutex
 	httpSlots    chan struct{}
 }
 
 func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHandler, error) {
+	if config == nil {
+		return nil, fmt.Errorf("chitanda: inbound config is required")
+	}
+	if len(config.Users) > 0 && config.Psk != "" {
+		return nil, fmt.Errorf("chitanda: psk and users cannot be configured together")
+	}
+	if len(config.Users) == 0 && len(config.Psk) < 32 {
+		return nil, fmt.Errorf("chitanda: psk must contain at least 32 bytes")
+	}
+	switch config.Transport {
+	case "", "stream", "h1", "plain-h1", "h2", "h3", "auto":
+	default:
+		return nil, fmt.Errorf("chitanda: unsupported transport %q", config.Transport)
+	}
+	var serverUsers []server.UserKey
+	if len(config.Users) > 0 {
+		serverUsers = make([]server.UserKey, 0, len(config.Users))
+		for i, user := range config.Users {
+			if user == nil {
+				return nil, fmt.Errorf("chitanda: user %d is nil", i)
+			}
+			email := strings.TrimSpace(user.Email)
+			if email == "" {
+				return nil, fmt.Errorf("chitanda: user %d has no email", i)
+			}
+			serverUsers = append(serverUsers, server.UserKey{Email: email, PSK: []byte(user.Psk), Level: user.Level})
+		}
+	} else {
+		serverUsers = []server.UserKey{{PSK: []byte(config.Psk)}}
+	}
+	if err := server.ValidateUserKeys(serverUsers); err != nil {
+		return nil, err
+	}
+
 	v := core.MustFromContext(ctx)
 	dispatcher := v.GetFeature(routing.DispatcherType()).(routing.Dispatcher)
 
@@ -82,19 +117,16 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 			return nil, err
 		}
 
-		inbound := session.InboundFromContext(ctx)
-		if inbound == nil {
-			inbound = &session.Inbound{
-				Tag: "chitanda-inbound",
+		reqCtx := requestContext(ctx)
+		inbound := session.InboundFromContext(reqCtx)
+		if u, ok := server.UserFromContext(ctx); ok && u != nil && u.Email != "" {
+			inbound.User = &protocol.MemoryUser{
+				Email: u.Email,
+				Level: u.Level,
 			}
-			ctx = session.ContextWithInbound(ctx, inbound)
-		} else if inbound.Tag == "" {
-			copyInbound := *inbound
-			copyInbound.Tag = "chitanda-inbound"
-			ctx = session.ContextWithInbound(ctx, &copyInbound)
 		}
 
-		link, err := dispatcher.Dispatch(requestContext(ctx), dest)
+		link, err := dispatcher.Dispatch(reqCtx, dest)
 		if err != nil {
 			return nil, err
 		}
@@ -105,7 +137,27 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 		return newPipeConn(link.Reader, link.Writer), nil
 	}
 
-	srv := server.NewServer(config.Path, []byte(config.Psk), replays, fbHandler, 1024)
+	var srv *server.Server
+	var streamSrv *server.StreamServer
+	if len(config.Users) > 0 {
+		srv, err = server.NewServerWithUsers(config.Path, serverUsers, replays, fbHandler, 1024)
+		if err != nil {
+			_ = replays.Close()
+			return nil, err
+		}
+		streamSrv, err = server.NewStreamServerWithUsers(serverUsers, config.ServerId, replays, func(ctx context.Context, network, address string) (net.Conn, error) {
+			return dialTargetFn(ctx, network, address)
+		})
+		if err != nil {
+			_ = replays.Close()
+			return nil, err
+		}
+	} else {
+		srv = server.NewServer(config.Path, serverUsers[0].PSK, replays, fbHandler, 1024)
+		streamSrv = server.NewStreamServer(serverUsers[0].PSK, config.ServerId, replays, func(ctx context.Context, network, address string) (net.Conn, error) {
+			return dialTargetFn(ctx, network, address)
+		})
+	}
 	srv.SetDialTargetForTest(func(ctx context.Context, address string) (net.Conn, error) {
 		return dialTargetFn(ctx, "tcp", address)
 	})
@@ -113,18 +165,24 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 		return dialTargetFn(ctx, "udp", address)
 	})
 
-	streamSrv := server.NewStreamServer([]byte(config.Psk), config.ServerId, replays, func(ctx context.Context, network, address string) (net.Conn, error) {
-		return dialTargetFn(ctx, network, address)
-	})
-
-	var plainCodec *server.PlainUDPCodec
-	if len(config.Psk) >= 32 {
-		codec, err := server.NewPlainUDPCodec([]byte(config.Psk))
-		if err != nil {
-			_ = replays.Close()
-			return nil, fmt.Errorf("init plain-udp codec: %w", err)
+	var userCodecs []*server.PlainUDPCodec
+	var userReplays []udpReplayRegistry
+	inCtx, inCancel := context.WithCancel(context.Background())
+	if config.Transport == "stream" || config.Transport == "h1" || config.Transport == "plain-h1" {
+		userCodecs = make([]*server.PlainUDPCodec, 0, len(serverUsers))
+		for _, u := range serverUsers {
+			codec, err := server.NewPlainUDPCodec(u.PSK)
+			if err != nil {
+				_ = replays.Close()
+				inCancel()
+				return nil, fmt.Errorf("init plain-udp codec: %w", err)
+			}
+			userCodecs = append(userCodecs, codec)
 		}
-		plainCodec = codec
+		userReplays = make([]udpReplayRegistry, len(serverUsers))
+		for i := range userReplays {
+			go userReplays[i].run(inCtx)
+		}
 	}
 
 	var h3Server *http3.Server
@@ -133,6 +191,7 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 		tlsConfig, err := buildServerTLSConfig(config)
 		if err != nil {
 			_ = replays.Close()
+			inCancel()
 			return nil, fmt.Errorf("build h3 tls config: %w", err)
 		}
 		vconn = newVirtualPacketConn()
@@ -145,21 +204,21 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 		}()
 	}
 
-	inCtx, inCancel := context.WithCancel(context.Background())
 	h := &InboundHandler{
 		config:       config,
+		users:        serverUsers,
 		server:       srv,
 		streamServer: streamSrv,
 		h3Server:     h3Server,
 		vconn:        vconn,
-		plainCodec:   plainCodec,
+		userCodecs:   userCodecs,
 		replays:      replays,
+		userReplays:  userReplays,
 		dispatcher:   dispatcher,
 		ctx:          inCtx,
 		cancel:       inCancel,
 		httpSlots:    make(chan struct{}, 1024),
 	}
-	go h.udpReplays.run(inCtx)
 
 	return h, nil
 }
@@ -272,7 +331,7 @@ func (h *InboundHandler) Process(ctx context.Context, network xnet.Network, conn
 
 	if string(prefix) == "PRI " {
 		// HTTP/2 Connection Preface
-		h2Server := &http2.Server{}
+		h2Server := newInboundH2Server()
 		h2Server.ServeConn(bconn, &http2.ServeConnOpts{
 			Handler: h.server,
 			Context: ctx,
@@ -303,6 +362,17 @@ func (h *InboundHandler) Process(ctx context.Context, network xnet.Network, conn
 	return httpServer.Serve(sl)
 }
 
+func newInboundH2Server() *http2.Server {
+	// Match the standalone server's flow-control budget. The default
+	// stream window caps a single upload to roughly one window per RTT.
+	return &http2.Server{
+		MaxUploadBufferPerConnection: 15 * 1024 * 1024,
+		MaxUploadBufferPerStream:     15 * 1024 * 1024,
+		MaxReadFrameSize:             1 << 20,
+		IdleTimeout:                  3 * time.Minute,
+	}
+}
+
 func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	defer conn.Close()
 	stopCaller := context.AfterFunc(ctx, func() { _ = conn.Close() })
@@ -311,17 +381,38 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 		stopHandler := context.AfterFunc(h.ctx, func() { _ = conn.Close() })
 		defer stopHandler()
 	}
-	if h.plainCodec == nil && h.h3Server == nil {
-		return fmt.Errorf("neither chitanda plain-udp nor h3 initialized")
-	}
 
-	key := conn.RemoteAddr().String()
+	// 1. HTTP/3 UDP path for h2, h3, and auto inbounds (QUIC Datagrams).
+	// Directly routes to QUIC stack with 0 µs Plain-UDP trial decryption overhead.
 	if h.vconn != nil {
+		key := conn.RemoteAddr().String()
 		h.vconn.registerConn(key, conn, ctx)
 		defer h.vconn.unregisterConn(key, conn)
+
+		reader := newFullPacketReader(conn)
+		for {
+			mpayload, err := reader.ReadMultiBuffer()
+			if err != nil {
+				return err
+			}
+			for _, payload := range mpayload {
+				data := payload.Bytes()
+				if len(data) > 0 && isQUICPacket(data) {
+					h.vconn.feed(data, conn.RemoteAddr())
+				}
+				payload.Release()
+			}
+		}
 	}
 
-	routes := newUDPRoutes(ctx, dispatcher, h.plainCodec, conn)
+	// 2. Native Plain-UDP path for stream, h1, and plain-h1 inbounds.
+	userCodecs := h.userCodecs
+	userReplays := h.userReplays
+	if len(userCodecs) != len(userReplays) || len(userCodecs) == 0 {
+		return fmt.Errorf("chitanda: plain-udp not initialized for transport %q", h.config.Transport)
+	}
+
+	routes := newUDPRoutes(ctx, dispatcher, userCodecs, conn)
 	defer routes.Close()
 
 	reader := newFullPacketReader(conn)
@@ -338,57 +429,36 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 				continue
 			}
 
-			// If transport is strictly h3, route directly to H3
-			if h.config.Transport == "h3" {
-				if h.vconn != nil {
-					h.vconn.feed(data, conn.RemoteAddr())
-				}
-				payload.Release()
-				continue
-			}
-
-			// Try Plain-UDP decode first if codec initialized
-			if h.plainCodec != nil {
-				sessionID, targetAddr, rawData, _, seq, err := h.plainCodec.DecodeClientPacket(data, time.Now())
-				if err == nil {
-					if !h.udpReplays.accept(sessionID, seq, time.Now()) {
-						payload.Release()
-						continue // drop replayed packet across any connection/association!
-					}
-
-					dest, err := xnet.ParseDestination("udp:" + targetAddr)
-					if err != nil {
-						payload.Release()
-						continue
-					}
-
-					var packetCtx context.Context
-					inbound := session.InboundFromContext(ctx)
-					if inbound == nil {
-						inbound = &session.Inbound{
-							Tag: "chitanda-inbound",
-						}
-						packetCtx = session.ContextWithInbound(ctx, inbound)
-					} else {
-						if inbound.Tag == "" {
-							copyInbound := *inbound
-							copyInbound.Tag = "chitanda-inbound"
-							packetCtx = session.ContextWithInbound(ctx, &copyInbound)
-						} else {
-							packetCtx = ctx
-						}
-					}
-
+			matchedIdx, sessionID, targetAddr, rawData, _, seq, err := server.DecodeClientPacketMulti(userCodecs, data, time.Now())
+			if err == nil {
+				if matchedIdx < 0 || matchedIdx >= len(userReplays) || !userReplays[matchedIdx].accept(sessionID, seq, time.Now()) {
 					payload.Release()
-					_ = routes.Write(packetCtx, sessionID, dest, rawData)
+					continue // drop replayed packet across any connection/association!
+				}
+
+				dest, err := xnet.ParseDestination("udp:" + targetAddr)
+				if err != nil {
+					payload.Release()
 					continue
 				}
-			}
 
-			// If not Plain-UDP, check if H3 is enabled and if packet looks like QUIC
-			if h.vconn != nil && isQUICPacket(data) {
-				h.vconn.feed(data, conn.RemoteAddr())
+				copyInbound := session.Inbound{Tag: "chitanda-inbound"}
+				if inbound := session.InboundFromContext(ctx); inbound != nil {
+					copyInbound = *inbound
+					if copyInbound.Tag == "" {
+						copyInbound.Tag = "chitanda-inbound"
+					}
+				}
+				if matchedIdx >= 0 && matchedIdx < len(h.users) && h.users[matchedIdx].Email != "" {
+					copyInbound.User = &protocol.MemoryUser{
+						Email: h.users[matchedIdx].Email,
+						Level: h.users[matchedIdx].Level,
+					}
+				}
+				packetCtx := session.ContextWithInbound(ctx, &copyInbound)
+
 				payload.Release()
+				_ = routes.Write(packetCtx, matchedIdx, sessionID, dest, rawData)
 				continue
 			}
 
@@ -543,6 +613,7 @@ type virtualPacketConn struct {
 	recvCh    chan *packetItem
 	closeCh   chan struct{}
 	closed    atomic.Bool
+	onFeed    func() // test hook; nil in production to avoid atomic overhead
 	localAddr net.Addr
 
 	mu      sync.RWMutex
@@ -557,7 +628,7 @@ type virtualPacketConn struct {
 
 func newVirtualPacketConn() *virtualPacketConn {
 	c := &virtualPacketConn{
-		recvCh:          make(chan *packetItem, 2048),
+		recvCh:          make(chan *packetItem, 8192),
 		closeCh:         make(chan struct{}),
 		localAddr:       &net.UDPAddr{IP: net.IPv4zero, Port: 0},
 		writers:         make(map[string]stat.Connection),
@@ -676,6 +747,9 @@ func (c *virtualPacketConn) SetWriteDeadline(t time.Time) error {
 func (c *virtualPacketConn) feed(data []byte, addr net.Addr) {
 	if c.closed.Load() {
 		return
+	}
+	if c.onFeed != nil {
+		c.onFeed()
 	}
 	buf := make([]byte, len(data))
 	copy(buf, data)

@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/violetaini/chitanda/internal/plainudp"
 )
 
 // Exercise the actual worker path while the resolver is replaced. AttachUDP
@@ -18,7 +20,9 @@ func TestPlainUDPServer_ConcurrentResolverUpdate(t *testing.T) {
 		calls.Add(1)
 		return nil, errors.New("test resolver: do not dial")
 	}
-	s := &PlainUDPServer{resolveUDP: resolve}
+	// The resolver fails before a codec is used; one slot makes this a valid
+	// authenticated worker task without changing the resolver race under test.
+	s := &PlainUDPServer{resolveUDP: resolve, codecs: make([]*plainudp.Codec, 1)}
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(5)
@@ -49,7 +53,7 @@ func TestPlainUDPServer_ConcurrentResolverUpdate(t *testing.T) {
 }
 
 func TestPlainUDPServer_ResolverCanUpdateItself(t *testing.T) {
-	s := &PlainUDPServer{}
+	s := &PlainUDPServer{codecs: make([]*plainudp.Codec, 1)}
 	s.SetResolveUDP(func(context.Context, string) (*net.UDPAddr, error) {
 		// A resolver must not execute while the configuration lock is held.
 		s.SetResolveUDP(nil)

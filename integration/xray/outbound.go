@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/violetaini/chitanda/pkg/client"
+	"github.com/violetaini/chitanda/pkg/plugin/autoscaler"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -59,7 +60,7 @@ func NewOutboundHandler(ctx context.Context, config *OutboundConfig) (*OutboundH
 			h.initMu.Unlock()
 		}
 		if d == nil {
-			return nil, fmt.Errorf("chitanda: Xray outbound dialer not ready")
+			return nil, fmt.Errorf("chitanda: Xray outbound dialer not ready: %w", client.ErrCarrierNotReady)
 		}
 		// Background carrier probes have no application outbound session. Xray's
 		// sendThrough path requires one; never reuse a previous flow's Conn state.
@@ -78,6 +79,17 @@ func NewOutboundHandler(ctx context.Context, config *OutboundConfig) (*OutboundH
 		poolSize = 4
 	}
 
+	var scaler client.AutoscalerPlugin
+	if config.AutoScale || (config.MaxPoolSize > 0 && config.MaxPoolSize > poolSize) {
+		maxCarriers := int(config.MaxPoolSize)
+		if maxCarriers <= 0 {
+			maxCarriers = 8
+		}
+		scaler = autoscaler.New(autoscaler.Config{
+			MaxCarriers: maxCarriers,
+		})
+	}
+
 	cli, err := client.New(client.Config{
 		Server:             config.Server,
 		ServerName:         config.ServerName,
@@ -86,6 +98,9 @@ func NewOutboundHandler(ctx context.Context, config *OutboundConfig) (*OutboundH
 		Path:               config.Path,
 		TCPTransport:       transportMode,
 		TCPPoolSize:        int(poolSize),
+		UDPPoolSize:        int(poolSize),
+		MaxPoolSize:        int(config.MaxPoolSize),
+		Autoscaler:         scaler,
 		InsecureSkipVerify: config.AllowInsecure,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			dest, err := xnet.ParseDestination(network + ":" + addr)
@@ -273,16 +288,37 @@ func (h *OutboundHandler) processUDP(ctx context.Context, link *transport.Link, 
 	uploadDone := make(chan error, 1)
 	go func() {
 		defer pconn.Close() // An ended uplink must wake the blocked downlink.
+		batchConn, hasBatch := pconn.(interface {
+			WriteBatch([][]byte, []net.Addr) error
+		})
 		for {
 			mb, readErr := link.Reader.ReadMultiBuffer()
 			var writeErr error
-			for _, b := range mb {
-				addr := target
-				if b.UDP != nil && b.UDP.IsValid() {
-					addr = packetAddress(b.UDP.NetAddr())
+			if hasBatch && len(mb) > 1 {
+				payloads := make([][]byte, 0, len(mb))
+				addrs := make([]net.Addr, 0, len(mb))
+				for _, b := range mb {
+					if !b.IsEmpty() {
+						addr := target
+						if b.UDP != nil && b.UDP.IsValid() {
+							addr = packetAddress(b.UDP.NetAddr())
+						}
+						payloads = append(payloads, b.Bytes())
+						addrs = append(addrs, addr)
+					}
 				}
-				if _, writeErr = pconn.WriteTo(b.Bytes(), addr); writeErr != nil {
-					break
+				if len(payloads) > 0 {
+					writeErr = batchConn.WriteBatch(payloads, addrs)
+				}
+			} else {
+				for _, b := range mb {
+					addr := target
+					if b.UDP != nil && b.UDP.IsValid() {
+						addr = packetAddress(b.UDP.NetAddr())
+					}
+					if _, writeErr = pconn.WriteTo(b.Bytes(), addr); writeErr != nil {
+						break
+					}
 				}
 			}
 			buf.ReleaseMulti(mb)
@@ -296,6 +332,7 @@ func (h *OutboundHandler) processUDP(ctx context.Context, link *transport.Link, 
 			}
 		}
 	}()
+
 	recvBuf := make([]byte, 65535)
 	var downloadErr error
 	for {

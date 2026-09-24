@@ -211,6 +211,8 @@ proxies:
     transport: "h2"
     sni: "jp.example.com"
     pool-size: 4
+    auto-scale: true
+    max-pool-size: 8
     udp: true
 
   # モード 2: Stream 専用線高スループットモード (RawStream TCP + AES-128-GCM + 動的難読化) - 専用線推奨
@@ -327,6 +329,8 @@ proxies:
         "path": "/api/v1/sync",
         "transport": "h2",
         "pool_size": 4,
+        "auto_scale": true,
+        "max_pool_size": 8,
         "allow_insecure": false
       }
     },
@@ -380,6 +384,47 @@ proxies:
 ```
 
 完全なサーバーおよびクライアントの JSON ファイルは **[examples/xray/server_all_modes.json](examples/xray/server_all_modes.json)** および **[examples/xray/client_all_modes.json](examples/xray/client_all_modes.json)** を参照してください。
+
+---
+
+### C. 软路由与透明网关多通道连接池调优指南 (Soft Router Gateway Tuning)
+
+Chitanda 在客户端（Mihomo / Xray）原生支持多物理载波连接池。在家庭、办公室或机房等**软路由 / 透明网关（TPROXY / TUN）**环境下，针对多设备、高并发场景，推荐按照以下指导进行连接池参数规划：
+
+#### 1) 通道参数定义与运作原则
+- **`pool-size` (TCP 物理通道数)**：控制客户端与服务端之间维护的独立 TLS 1.3 / H2 物理长连接数量（默认 `4`）。用于分散内网大量设备的 TCP 逻辑流，避免单一物理连接丢包引发队头阻塞。
+- **`udp-pool-size` (UDP 物理通道数)**：控制客户端与服务端之间独立的 H3 / QUIC 物理通道数量（默认与 `pool-size` 相同，即 `4`）。不同 UDP 逻辑会话（游戏、DNS、语音）会自动按最小活跃流负载均衡分配至不同管道，实现 QoS 物理硬隔离。
+- **动态扩容（可选）**：Mihomo 设置 `auto-scale: true`、`max-pool-size: 8`；Xray 出站 `settings` 使用 `auto_scale: true`、`max_pool_size: 8`。`max-pool-size` 是每类载体池的上限，不保证实际吞吐提升；Mihomo 显式 `auto-scale: false` 会覆盖上限设置。
+- **开箱即用零配置**：日常个人设备使用时，**完全无需在配置中指定 `pool-size` 或 `udp-pool-size`**，内核默认自动建立 `4 TCP + 4 UDP` 独立通道池。
+
+#### 2) 软路由硬件与通道推荐配置档位
+
+| 软路由硬件类型 | 典型网络环境 | 推荐 `pool-size` (TCP) | 推荐 `udp-pool-size` (UDP) | 内存与性能评价 |
+| :--- | :--- | :---: | :---: | :--- |
+| **主流 x86 软路由**<br>(N100, N5105, J4125 等，内存 $\ge 4\text{GB}$) | 千兆家庭宽带，内网 10~50 台设备并发 | **6 ~ 8** | **4** | **黄金平衡档**。充分利用 4 核 CPU，内网多设备高并发抗挤压，内存开销微乎其微（~60MB 峰值）。 |
+| **轻量 ARM / 低配盒子**<br>(MT7981, RK3568, 内存 512MB~1GB) | 普通家庭 5~10 台设备 | **4** | **2 ~ 4** | **保持默认 4 最安全**。防止极端突发流量下大量 UDP 环形缓冲区吃满内存触发 OOM。 |
+| **高性能企业级网关**<br>(Core i5/i7/Xeon，多网卡 2.5G/10G 专线) | 2.5G/5G+ 专线，数百台设备并发 | **8 ~ 12** | **6 ~ 8** | 充分释放万兆网络并行吞吐，彻底消除大吞吐对竞技游戏的排队挤压。 |
+
+> [!WARNING]
+> **切忌盲目将通道数拉满（如 16+）**：
+> 1. **避免 Bufferbloat 延迟暴增**：物理公网带宽是有限的。若同时开启过多物理长连接并发下发，多条连接的拥塞窗口会在光猫和运营商队列中互相争抢，引发缓冲区膨胀，导致所有设备 Ping 值从 40ms 暴增至 500ms+；
+> 2. **避免特征暴露**：单客户端向境外单 IP 维持数十条活跃长连接属于极度突兀的异常机器行为，极易招致运营商 QoS 针对性干扰。
+
+#### 3) Mihomo 软路由网关专用配置示例 (`config.yaml`)
+```yaml
+proxies:
+  - name: "Chitanda-SoftRouter-Gateway"
+    type: chitanda
+    server: jp.example.com
+    port: 443
+    psk: "your-32-byte-secure-pre-shared-key-here"
+    path: "/api/v1/sync"
+    transport: "h2"
+    sni: "jp.example.com"
+    pool-size: 8          # 针对网关海量终端的高并发 TCP 流量（8 条 H2 管道）
+    udp-pool-size: 4      # 针对网关独立游戏/DNS/语音等 QoS 隔离（4 条 H3 独立管道）
+    udp: true
+```
 
 ---
 
