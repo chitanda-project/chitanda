@@ -169,7 +169,10 @@ func shouldAutoScale(option *ChitandaOption) bool {
 	if option.AutoScale != nil {
 		return *option.AutoScale
 	}
-	return option.MaxPoolSize > option.PoolSize && option.MaxPoolSize > 0
+	if option.MaxPoolSize > 0 && option.MaxPoolSize <= option.PoolSize {
+		return false
+	}
+	return true
 }
 
 func (c *Chitanda) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
