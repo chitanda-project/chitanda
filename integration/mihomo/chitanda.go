@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/violetaini/chitanda/pkg/client"
 	"github.com/violetaini/chitanda/pkg/plugin/autoscaler"

@@ -777,10 +777,10 @@ index 9b539ea..a521362 100644
  	)
  	h.setLossDetectionTimer(now)
 diff --git a/vendor/github.com/quic-go/quic-go/internal/congestion/cubic.go b/vendor/github.com/quic-go/quic-go/internal/congestion/cubic.go
-index 40655de..d1a0181 100644
+index 40655de..4592866 100644
 --- a/vendor/github.com/quic-go/quic-go/internal/congestion/cubic.go
 +++ b/vendor/github.com/quic-go/quic-go/internal/congestion/cubic.go
-@@ -25,9 +25,9 @@ const (
+@@ -25,10 +25,10 @@ const (
  	maxDatagramSize = protocol.ByteCount(protocol.InitialPacketSize)
  )
  
@@ -790,11 +790,15 @@ index 40655de..d1a0181 100644
  // Default Cubic backoff factor
 -const beta float32 = 0.7
 +const beta float32 = 0.85
+ 
+ // Additional backoff factor when loss occurs in the concave part of the Cubic
+ // curve. This additional backoff factor is expected to give up bandwidth to
 diff --git a/vendor/github.com/quic-go/quic-go/internal/congestion/cubic_sender.go b/vendor/github.com/quic-go/quic-go/internal/congestion/cubic_sender.go
-index e5457dd..1a1b091 100644
+index e5457dd..aaa7cfc 100644
 --- a/vendor/github.com/quic-go/quic-go/internal/congestion/cubic_sender.go
 +++ b/vendor/github.com/quic-go/quic-go/internal/congestion/cubic_sender.go
-@@ -16,8 +16,8 @@ const (
+@@ -15,9 +15,9 @@ const (
+ 	// Used in QUIC for congestion window computations in bytes.
  	initialMaxDatagramSize     = protocol.ByteCount(protocol.InitialPacketSize)
  	maxBurstPackets            = 3
 -	renoBeta                   = 0.7 // Reno backoff factor.
