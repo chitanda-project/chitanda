@@ -428,13 +428,19 @@ const erpHtmlTemplate = `<!DOCTYPE html>
 `
 
 type flushWriter struct {
-	w http.ResponseWriter
+	w       http.ResponseWriter
+	flusher http.Flusher
+}
+
+func newFlushWriter(w http.ResponseWriter) flushWriter {
+	flusher, _ := w.(http.Flusher)
+	return flushWriter{w: w, flusher: flusher}
 }
 
 func (w flushWriter) Write(p []byte) (int, error) {
 	n, err := w.w.Write(p)
-	if flusher, ok := w.w.(http.Flusher); ok {
-		flusher.Flush()
+	if w.flusher != nil {
+		w.flusher.Flush()
 	}
 	return n, err
 }

@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	DefaultUDPWorkerQueueSize = 256
+	DefaultUDPWorkerQueueSize = 1024
 	DefaultUDPMemoryBudget    = 64 << 20 // 64 MB maximum in-flight datagram memory budget
 )
 

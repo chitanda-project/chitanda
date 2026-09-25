@@ -28,9 +28,12 @@ type ChitandaOption struct {
 	PoolSize       int    `proxy:"pool-size,omitempty"`
 	UDPPoolSize    int    `proxy:"udp-pool-size,omitempty"`
 	MaxPoolSize    int    `proxy:"max-pool-size,omitempty"`
-	AutoScale      *bool  `proxy:"auto-scale,omitempty"`
-	UDP            *bool  `proxy:"udp,omitempty"`
-	SkipCertVerify bool   `proxy:"skip-cert-verify,omitempty"`
+	AutoScale        *bool `proxy:"auto-scale,omitempty"`
+	ScaleUpThreshold int   `proxy:"scale-up-threshold,omitempty"`
+	ScaleDownIdle    int   `proxy:"scale-down-idle,omitempty"`
+	Cooldown         int   `proxy:"cooldown,omitempty"`
+	UDP              *bool `proxy:"udp,omitempty"`
+	SkipCertVerify   bool  `proxy:"skip-cert-verify,omitempty"`
 }
 
 type Chitanda struct {
@@ -117,9 +120,19 @@ func (c *Chitanda) getClient() (*client.Client, error) {
 		if maxCarriers <= 0 {
 			maxCarriers = 8
 		}
-		scaler = autoscaler.New(autoscaler.Config{
+		scalerCfg := autoscaler.Config{
 			MaxCarriers: maxCarriers,
-		})
+		}
+		if c.option.ScaleUpThreshold > 0 {
+			scalerCfg.ScaleUpThreshold = int64(c.option.ScaleUpThreshold)
+		}
+		if c.option.ScaleDownIdle > 0 {
+			scalerCfg.ScaleDownIdle = time.Duration(c.option.ScaleDownIdle) * time.Second
+		}
+		if c.option.Cooldown > 0 {
+			scalerCfg.Cooldown = time.Duration(c.option.Cooldown) * time.Millisecond
+		}
+		scaler = autoscaler.New(scalerCfg)
 	}
 
 	cli, err := client.New(client.Config{

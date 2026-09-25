@@ -16,10 +16,11 @@ import (
 
 func TestInboundH2FlowControlWindow(t *testing.T) {
 	s := newInboundH2Server()
-	const wantWindow = 15 * 1024 * 1024
-	if s.MaxUploadBufferPerConnection != wantWindow || s.MaxUploadBufferPerStream != wantWindow {
-		t.Fatalf("Xray H2 upload windows are %d/%d, want %d; the default window throttles a single stream over WAN RTT",
-			s.MaxUploadBufferPerConnection, s.MaxUploadBufferPerStream, wantWindow)
+	const wantConnWindow = 64 * 1024 * 1024
+	const wantStreamWindow = 32 * 1024 * 1024
+	if s.MaxUploadBufferPerConnection != wantConnWindow || s.MaxUploadBufferPerStream != wantStreamWindow {
+		t.Fatalf("Xray H2 upload windows are %d/%d, want %d/%d; the default window throttles a single stream over WAN RTT",
+			s.MaxUploadBufferPerConnection, s.MaxUploadBufferPerStream, wantConnWindow, wantStreamWindow)
 	}
 	if s.MaxReadFrameSize != 1<<20 || s.IdleTimeout != 3*time.Minute {
 		t.Fatalf("Xray H2 frame/idle settings drifted from the standalone server: %d/%s", s.MaxReadFrameSize, s.IdleTimeout)

@@ -85,9 +85,19 @@ func NewOutboundHandler(ctx context.Context, config *OutboundConfig) (*OutboundH
 		if maxCarriers <= 0 {
 			maxCarriers = 8
 		}
-		scaler = autoscaler.New(autoscaler.Config{
+		scalerCfg := autoscaler.Config{
 			MaxCarriers: maxCarriers,
-		})
+		}
+		if config.ScaleUpThreshold > 0 {
+			scalerCfg.ScaleUpThreshold = int64(config.ScaleUpThreshold)
+		}
+		if config.ScaleDownIdle > 0 {
+			scalerCfg.ScaleDownIdle = time.Duration(config.ScaleDownIdle) * time.Second
+		}
+		if config.Cooldown > 0 {
+			scalerCfg.Cooldown = time.Duration(config.Cooldown) * time.Millisecond
+		}
+		scaler = autoscaler.New(scalerCfg)
 	}
 
 	cli, err := client.New(client.Config{
@@ -335,6 +345,12 @@ func (h *OutboundHandler) processUDP(ctx context.Context, link *transport.Link, 
 
 	recvBuf := make([]byte, 65535)
 	var downloadErr error
+	var (
+		lastIP   net.IP
+		lastPort int
+		lastDest xnet.Destination
+		hasDest  bool
+	)
 	for {
 		n, from, readErr := pconn.ReadFrom(recvBuf)
 		if readErr != nil {
@@ -343,7 +359,16 @@ func (h *OutboundHandler) processUDP(ctx context.Context, link *transport.Link, 
 		}
 		b := ownedDatagram(recvBuf[:n])
 		if from != nil {
-			if dest, err := xnet.ParseDestination("udp:" + from.String()); err == nil {
+			if udpAddr, ok := from.(*net.UDPAddr); ok {
+				if !hasDest || lastPort != udpAddr.Port || !udpAddr.IP.Equal(lastIP) {
+					lastIP = append(lastIP[:0], udpAddr.IP...)
+					lastPort = udpAddr.Port
+					lastDest = xnet.UDPDestination(xnet.IPAddress(udpAddr.IP), xnet.Port(udpAddr.Port))
+					hasDest = true
+				}
+				dest := lastDest
+				b.UDP = &dest
+			} else if dest, err := xnet.ParseDestination("udp:" + from.String()); err == nil {
 				b.UDP = &dest
 			}
 		}

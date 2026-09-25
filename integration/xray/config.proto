@@ -36,5 +36,8 @@ message OutboundConfig {
   bool allow_insecure = 8;
   bool auto_scale = 9;
   int32 max_pool_size = 10;
+  int32 scale_up_threshold = 11;
+  int32 scale_down_idle = 12;
+  int32 cooldown = 13;
 }
 

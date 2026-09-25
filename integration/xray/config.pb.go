@@ -207,10 +207,13 @@ type OutboundConfig struct {
 	PoolSize      int32                  `protobuf:"varint,6,opt,name=pool_size,json=poolSize,proto3" json:"pool_size,omitempty"`
 	ServerId      string                 `protobuf:"bytes,7,opt,name=server_id,json=serverId,proto3" json:"server_id,omitempty"`
 	AllowInsecure bool                   `protobuf:"varint,8,opt,name=allow_insecure,json=allowInsecure,proto3" json:"allow_insecure,omitempty"`
-	AutoScale     bool                   `protobuf:"varint,9,opt,name=auto_scale,json=autoScale,proto3" json:"auto_scale,omitempty"`
-	MaxPoolSize   int32                  `protobuf:"varint,10,opt,name=max_pool_size,json=maxPoolSize,proto3" json:"max_pool_size,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	AutoScale        bool                   `protobuf:"varint,9,opt,name=auto_scale,json=autoScale,proto3" json:"auto_scale,omitempty"`
+	MaxPoolSize      int32                  `protobuf:"varint,10,opt,name=max_pool_size,json=maxPoolSize,proto3" json:"max_pool_size,omitempty"`
+	ScaleUpThreshold int32                  `protobuf:"varint,11,opt,name=scale_up_threshold,json=scaleUpThreshold,proto3" json:"scale_up_threshold,omitempty"`
+	ScaleDownIdle    int32                  `protobuf:"varint,12,opt,name=scale_down_idle,json=scaleDownIdle,proto3" json:"scale_down_idle,omitempty"`
+	Cooldown         int32                  `protobuf:"varint,13,opt,name=cooldown,proto3" json:"cooldown,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *OutboundConfig) Reset() {
@@ -309,6 +312,27 @@ func (x *OutboundConfig) GetAutoScale() bool {
 func (x *OutboundConfig) GetMaxPoolSize() int32 {
 	if x != nil {
 		return x.MaxPoolSize
+	}
+	return 0
+}
+
+func (x *OutboundConfig) GetScaleUpThreshold() int32 {
+	if x != nil {
+		return x.ScaleUpThreshold
+	}
+	return 0
+}
+
+func (x *OutboundConfig) GetScaleDownIdle() int32 {
+	if x != nil {
+		return x.ScaleDownIdle
+	}
+	return 0
+}
+
+func (x *OutboundConfig) GetCooldown() int32 {
+	if x != nil {
+		return x.Cooldown
 	}
 	return 0
 }

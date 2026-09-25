@@ -162,6 +162,9 @@ type ChitandaOutboundConfig struct {
 	PoolSize           int32  `json:"pool_size"`
 	AutoScale          bool   `json:"auto_scale"`
 	MaxPoolSize        int32  `json:"max_pool_size"`
+	ScaleUpThreshold   int32  `json:"scale_up_threshold"`
+	ScaleDownIdle      int32  `json:"scale_down_idle"`
+	Cooldown           int32  `json:"cooldown"`
 	ServerID           string `json:"server_id"`
 	ServerId           string `json:"serverId"`
 	ServerHyphen       string `json:"server-id"`
@@ -194,15 +197,18 @@ func (c *ChitandaOutboundConfig) Build() (proto.Message, error) {
 		sid = c.ServerHyphen
 	}
 	return &chitanda.OutboundConfig{
-		Server:        c.Server,
-		ServerName:    c.ServerName,
-		Psk:           c.PSK,
-		Path:          c.Path,
-		Transport:     c.Transport,
-		PoolSize:      c.PoolSize,
-		AutoScale:     c.AutoScale,
-		MaxPoolSize:   c.MaxPoolSize,
-		ServerId:      sid,
-		AllowInsecure: c.AllowInsecure || c.AllowInsecureCamel,
+		Server:           c.Server,
+		ServerName:       c.ServerName,
+		Psk:              c.PSK,
+		Path:             c.Path,
+		Transport:        c.Transport,
+		PoolSize:         c.PoolSize,
+		AutoScale:        c.AutoScale,
+		MaxPoolSize:      c.MaxPoolSize,
+		ScaleUpThreshold: c.ScaleUpThreshold,
+		ScaleDownIdle:    c.ScaleDownIdle,
+		Cooldown:         c.Cooldown,
+		ServerId:         sid,
+		AllowInsecure:    c.AllowInsecure || c.AllowInsecureCamel,
 	}, nil
 }

@@ -260,14 +260,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		var err error
+		fw := newFlushWriter(w)
 		if useFraming {
 			ar := &activityReader{r: upstream, onActivity: signalActivity}
-			err = frame.CopyAsDataFramesAndClose(flushWriter{w: w}, ar)
+			err = frame.CopyAsDataFramesAndClose(fw, ar)
 		} else {
 			bufPtr := copyBufferPool.Get().(*[]byte)
 			defer copyBufferPool.Put(bufPtr)
 			ar := &activityReader{r: upstream, onActivity: signalActivity}
-			_, err = io.CopyBuffer(flushWriter{w: w}, ar, *bufPtr)
+			_, err = io.CopyBuffer(fw, ar, *bufPtr)
 		}
 		downloadDone <- err
 	}()

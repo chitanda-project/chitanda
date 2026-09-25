@@ -780,7 +780,7 @@ diff --git a/vendor/github.com/quic-go/quic-go/internal/congestion/cubic.go b/ve
 index 40655de..d1a0181 100644
 --- a/vendor/github.com/quic-go/quic-go/internal/congestion/cubic.go
 +++ b/vendor/github.com/quic-go/quic-go/internal/congestion/cubic.go
-@@ -25,7 +25,7 @@ const (
+@@ -25,9 +25,9 @@ const (
  	maxDatagramSize = protocol.ByteCount(protocol.InitialPacketSize)
  )
  
@@ -788,7 +788,8 @@ index 40655de..d1a0181 100644
 +const defaultNumConnections = 8
  
  // Default Cubic backoff factor
- const beta float32 = 0.7
+-const beta float32 = 0.7
++const beta float32 = 0.85
 diff --git a/vendor/github.com/quic-go/quic-go/internal/congestion/cubic_sender.go b/vendor/github.com/quic-go/quic-go/internal/congestion/cubic_sender.go
 index e5457dd..1a1b091 100644
 --- a/vendor/github.com/quic-go/quic-go/internal/congestion/cubic_sender.go
@@ -796,9 +797,10 @@ index e5457dd..1a1b091 100644
 @@ -16,8 +16,8 @@ const (
  	initialMaxDatagramSize     = protocol.ByteCount(protocol.InitialPacketSize)
  	maxBurstPackets            = 3
- 	renoBeta                   = 0.7 // Reno backoff factor.
+-	renoBeta                   = 0.7 // Reno backoff factor.
 -	minCongestionWindowPackets = 2
 -	initialCongestionWindow    = 32
++	renoBeta                   = 0.85 // Reno backoff factor.
 +	minCongestionWindowPackets = 1536
 +	initialCongestionWindow    = 4096
  )

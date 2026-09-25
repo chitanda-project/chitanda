@@ -22,9 +22,8 @@ type Config struct {
 	// MaxCarriers is the upper bound on total carriers (default: 8, max: 16).
 	MaxCarriers int
 
-	// ScaleUpThreshold is the minimum active streams on all active carriers required to trigger expansion.
-	// For example, if set to 16, a new carrier is added only when every existing carrier is handling >= 16 streams.
-	// Default: 16.
+	// ScaleUpThreshold is the minimum active streams or saturation threshold required to trigger expansion.
+	// Default: 4.
 	ScaleUpThreshold int64
 
 	// ScaleDownIdle is the duration a dynamic carrier must maintain 0 active streams before being evicted.
@@ -32,7 +31,7 @@ type Config struct {
 	ScaleDownIdle time.Duration
 
 	// Cooldown is the minimum duration required between successive carrier additions.
-	// Default: 2s.
+	// Default: 1s.
 	Cooldown time.Duration
 
 	// SweepInterval is how often the background monitor scans for idle dynamic carriers.
@@ -72,13 +71,13 @@ func New(cfg Config) *Autoscaler {
 		cfg.MaxCarriers = 16
 	}
 	if cfg.ScaleUpThreshold <= 0 {
-		cfg.ScaleUpThreshold = 16
+		cfg.ScaleUpThreshold = 4
 	}
 	if cfg.ScaleDownIdle <= 0 {
 		cfg.ScaleDownIdle = 30 * time.Second
 	}
 	if cfg.Cooldown <= 0 {
-		cfg.Cooldown = 2 * time.Second
+		cfg.Cooldown = 1 * time.Second
 	}
 	if cfg.SweepInterval <= 0 {
 		cfg.SweepInterval = 5 * time.Second
@@ -122,9 +121,6 @@ func (a *Autoscaler) Init(controller client.PoolController) error {
 // OnActivity is invoked by the Client when dispatching a stream. It performs non-blocking evaluation of load.
 func (a *Autoscaler) OnActivity(transport string, minActive int64, totalCarriers int) {
 	if a.closed.Load() {
-		return
-	}
-	if minActive < a.cfg.ScaleUpThreshold {
 		return
 	}
 	if totalCarriers >= a.cfg.MaxCarriers {
@@ -181,10 +177,27 @@ func (a *Autoscaler) tryScaleUp(transport string) {
 	}
 
 	stats := a.controller.Stats(transport)
-	if stats.TotalCarriers >= a.cfg.MaxCarriers {
+	if stats.TotalCarriers >= a.cfg.MaxCarriers || stats.TotalCarriers <= 0 {
 		return
 	}
-	if stats.TotalCarriers > 0 && stats.MinActiveStreams < a.cfg.ScaleUpThreshold {
+
+	// Multi-dimensional scaling criteria:
+	// 1. MinActiveStreams >= ScaleUpThreshold (traditional uniform load)
+	// 2. Average active streams per carrier >= ScaleUpThreshold (saturation ratio)
+	// 3. Peak relief: MaxActiveStreams >= max(6, ScaleUpThreshold*2) and TotalActiveStreams > TotalCarriers
+	var shouldScale bool
+	if stats.MinActiveStreams >= a.cfg.ScaleUpThreshold {
+		shouldScale = true
+	} else {
+		avgActive := float64(stats.TotalActiveStreams) / float64(stats.TotalCarriers)
+		if avgActive >= float64(a.cfg.ScaleUpThreshold) {
+			shouldScale = true
+		} else if stats.MaxActiveStreams >= max(6, a.cfg.ScaleUpThreshold*2) && stats.TotalActiveStreams > int64(stats.TotalCarriers) {
+			shouldScale = true
+		}
+	}
+
+	if !shouldScale {
 		return
 	}
 

@@ -14,3 +14,7 @@ test_tls.py
 proto_scan.py
 __pycache__/
 /upstream_src/
+pkg/client/ai_test.go
+pkg/client/antigravity_sim_test.go
+pkg/client/halfclose_chitanda_test.go
+pkg/client/halfclose_test.go

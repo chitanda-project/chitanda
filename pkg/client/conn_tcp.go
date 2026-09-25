@@ -150,7 +150,7 @@ func (c *h2TransportClient) dialH2TCPOnce(ctx context.Context, target string) (n
 	})
 	defer stopCancel()
 
-	pipeReader, pipeWriter := io.Pipe()
+	pipeReader, pipeWriter := newBufferedPipe(128 * 1024)
 
 	request, err := http.NewRequestWithContext(streamCtx, http.MethodPost, c.requestURL, pipeReader)
 	if err != nil {
@@ -210,7 +210,7 @@ func (c *h2TransportClient) close() {
 type rawH2Conn struct {
 	target     string
 	body       io.ReadCloser
-	pipeWriter *io.PipeWriter
+	pipeWriter pipeWriteCloser
 	cancel     context.CancelFunc
 	h2Client   *h2TransportClient
 	closed     atomic.Bool
@@ -218,7 +218,7 @@ type rawH2Conn struct {
 	writes     *connio.Writer
 }
 
-func newRawH2Conn(target string, body io.ReadCloser, pipeWriter *io.PipeWriter, cancel context.CancelFunc, h2Client *h2TransportClient) *rawH2Conn {
+func newRawH2Conn(target string, body io.ReadCloser, pipeWriter pipeWriteCloser, cancel context.CancelFunc, h2Client *h2TransportClient) *rawH2Conn {
 	return &rawH2Conn{
 		target:     target,
 		body:       body,

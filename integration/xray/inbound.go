@@ -366,8 +366,8 @@ func newInboundH2Server() *http2.Server {
 	// Match the standalone server's flow-control budget. The default
 	// stream window caps a single upload to roughly one window per RTT.
 	return &http2.Server{
-		MaxUploadBufferPerConnection: 15 * 1024 * 1024,
-		MaxUploadBufferPerStream:     15 * 1024 * 1024,
+		MaxUploadBufferPerConnection: 64 * 1024 * 1024,
+		MaxUploadBufferPerStream:     32 * 1024 * 1024,
 		MaxReadFrameSize:             1 << 20,
 		IdleTimeout:                  3 * time.Minute,
 	}

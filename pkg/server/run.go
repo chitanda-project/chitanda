@@ -54,8 +54,8 @@ func Run(config *Config, listenAddr, adminListenAddr, quicListenAddr string) err
 		TLSConfig:         newTLSConfig(config.StrictSNI),
 	}
 	if err := http2.ConfigureServer(public, &http2.Server{
-		MaxUploadBufferPerConnection: 15 * 1024 * 1024,
-		MaxUploadBufferPerStream:     15 * 1024 * 1024,
+		MaxUploadBufferPerConnection: 64 * 1024 * 1024,
+		MaxUploadBufferPerStream:     32 * 1024 * 1024,
 		MaxReadFrameSize:             1 << 20,
 		IdleTimeout:                  3 * time.Minute,
 	}); err != nil {

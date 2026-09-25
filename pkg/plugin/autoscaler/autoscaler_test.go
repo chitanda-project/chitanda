@@ -111,11 +111,65 @@ func TestAutoscaler_Defaults(t *testing.T) {
 	if a.cfg.MaxCarriers != 8 {
 		t.Errorf("expected default MaxCarriers 8, got %d", a.cfg.MaxCarriers)
 	}
-	if a.cfg.ScaleUpThreshold != 16 {
-		t.Errorf("expected default ScaleUpThreshold 16, got %d", a.cfg.ScaleUpThreshold)
+	if a.cfg.ScaleUpThreshold != 4 {
+		t.Errorf("expected default ScaleUpThreshold 4, got %d", a.cfg.ScaleUpThreshold)
+	}
+	if a.cfg.Cooldown != 1*time.Second {
+		t.Errorf("expected default Cooldown 1s, got %v", a.cfg.Cooldown)
 	}
 	if a.cfg.ScaleDownIdle != 30*time.Second {
 		t.Errorf("expected default ScaleDownIdle 30s, got %v", a.cfg.ScaleDownIdle)
+	}
+}
+
+func TestAutoscaler_ScaleUpOnAvgDensity(t *testing.T) {
+	mock := newMockController(4, 4, 8)
+	// MinActive is 2 (below threshold 4), but TotalActive is 20 (avg = 5 >= 4)
+	mock.h2Stats.MinActiveStreams = 2
+	mock.h2Stats.TotalActiveStreams = 20
+
+	a := New(Config{
+		MaxCarriers:      8,
+		ScaleUpThreshold: 4,
+		Cooldown:         50 * time.Millisecond,
+		SweepInterval:    1 * time.Second,
+	})
+	if err := a.Init(mock); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+	defer a.Close()
+
+	a.OnActivity("h2", 2, 4)
+	time.Sleep(100 * time.Millisecond)
+
+	if mock.addH2Calls.Load() != 1 {
+		t.Errorf("expected 1 AddCarrier call on avg density saturation, got %d", mock.addH2Calls.Load())
+	}
+}
+
+func TestAutoscaler_ScaleUpOnPeakRelief(t *testing.T) {
+	mock := newMockController(4, 4, 8)
+	// MinActive is 1, but one carrier has 12 streams (MaxActive = 12 >= max(6, 4*2))
+	mock.h2Stats.MinActiveStreams = 1
+	mock.h2Stats.MaxActiveStreams = 12
+	mock.h2Stats.TotalActiveStreams = 15
+
+	a := New(Config{
+		MaxCarriers:      8,
+		ScaleUpThreshold: 4,
+		Cooldown:         50 * time.Millisecond,
+		SweepInterval:    1 * time.Second,
+	})
+	if err := a.Init(mock); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+	defer a.Close()
+
+	a.OnActivity("h2", 1, 4)
+	time.Sleep(100 * time.Millisecond)
+
+	if mock.addH2Calls.Load() != 1 {
+		t.Errorf("expected 1 AddCarrier call on peak relief, got %d", mock.addH2Calls.Load())
 	}
 }
 

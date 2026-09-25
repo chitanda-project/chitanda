@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 )
 
 const (
@@ -70,8 +71,17 @@ func WriteFrame(w io.Writer, frameType Type, flags uint16, payload []byte) error
 	return writeFull(w, buffer)
 }
 
+var dataChunkBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, HeaderSize+DataChunkSize)
+		return &b
+	},
+}
+
 func CopyAsDataFrames(w io.Writer, r io.Reader) (int64, error) {
-	buffer := make([]byte, HeaderSize+DataChunkSize)
+	bufPtr := dataChunkBufPool.Get().(*[]byte)
+	defer dataChunkBufPool.Put(bufPtr)
+	buffer := *bufPtr
 	var total int64
 	for {
 		n, readErr := r.Read(buffer[HeaderSize:])
