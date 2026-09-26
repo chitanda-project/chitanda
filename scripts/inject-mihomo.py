@@ -3,8 +3,28 @@ import os
 import sys
 import shutil
 
+
+def patch_udp_sender_capacity(mihomo_dir):
+    """Buffer UDP packets while an outbound association is being established."""
+    tunnel_go = os.path.join(mihomo_dir, "tunnel", "tunnel.go")
+    with open(tunnel_go, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    original = "\tsenderCapacity = 128 // chan capacity of PacketSender"
+    patched = "\tsenderCapacity = 4096 // chan capacity of PacketSender"
+    if content.count(patched) == 1 and original not in content:
+        return
+    if content.count(original) != 1 or patched in content:
+        raise RuntimeError(f"unexpected Mihomo UDP sender capacity in {tunnel_go}")
+
+    with open(tunnel_go, "w", encoding="utf-8") as f:
+        f.write(content.replace(original, patched, 1))
+    print(f"  [+] Patched {tunnel_go} UDP sender capacity for cold H3 associations")
+
+
 def inject_mihomo(mihomo_dir, chitanda_dir):
     print(f"[*] Injecting Chitanda adapter into Mihomo: {mihomo_dir}")
+    patch_udp_sender_capacity(mihomo_dir)
     adapter_dir = os.path.join(mihomo_dir, "adapter", "outbound")
     constant_dir = os.path.join(mihomo_dir, "constant")
     
