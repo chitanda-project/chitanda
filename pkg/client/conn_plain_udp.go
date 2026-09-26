@@ -140,7 +140,8 @@ func (c *plainUDPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		return 0, errors.New("conn closed")
 	}
 
-	packet, err := c.codec.EncodePacket(nil, plainudp.DirClientToServer, c.sessionID, addr.String(), p, time.Now())
+	address := formatDatagramAddress(addr)
+	packet, err := c.codec.EncodePacket(nil, plainudp.DirClientToServer, c.sessionID, address, p, time.Now())
 	if err != nil {
 		return 0, err
 	}

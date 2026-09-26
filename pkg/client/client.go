@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/violetaini/chitanda/internal/auth"
+	"github.com/violetaini/chitanda/internal/icmpmsg"
 	"github.com/violetaini/chitanda/internal/quicconfig"
 	"github.com/violetaini/chitanda/internal/sessioncache"
 )
@@ -88,8 +89,16 @@ type Client struct {
 	prober         *h2Prober
 	autoscaler     AutoscalerPlugin
 	maxCarriers    int
+	packetConnFn   func(ctx context.Context) (net.PacketConn, error)
 	mu             sync.Mutex
 	closed         bool
+}
+
+// SetListenPacketForTest allows injecting a mock PacketConn for unit testing client methods like Ping.
+func (c *Client) SetListenPacketForTest(fn func(ctx context.Context) (net.PacketConn, error)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.packetConnFn = fn
 }
 
 func (c *Client) dialRaw(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -381,7 +390,12 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 		c.mu.Unlock()
 		return nil, errors.New("client closed")
 	}
+	pktFn := c.packetConnFn
 	c.mu.Unlock()
+
+	if pktFn != nil {
+		return pktFn(ctx)
+	}
 
 	if c.cfg.TCPTransport == TCPTransportPlainH1 || c.cfg.TCPTransport == TCPTransportH1 || c.cfg.TCPTransport == TCPTransportStream {
 		pconn, err := newPlainUDPConn(ctx, c.cfg.Server, c.cfg.PSK, c.cfg.ListenPacket, c.cfg.ResolveUDP, c.cfg.DialPacket)
@@ -487,9 +501,54 @@ type domainUDPAddr string
 func (domainUDPAddr) Network() string  { return "udp" }
 func (a domainUDPAddr) String() string { return string(a) }
 
+// ICMPAddr represents an ICMP endpoint address for ping datagrams.
+type ICMPAddr struct {
+	IP net.IP
+}
+
+func (a *ICMPAddr) Network() string { return "icmp" }
+func (a *ICMPAddr) String() string {
+	if a == nil || a.IP == nil {
+		return ""
+	}
+	return a.IP.String()
+}
+
+func isICMPAddr(addr net.Addr) bool {
+	if addr == nil {
+		return false
+	}
+	if _, ok := addr.(*ICMPAddr); ok {
+		return true
+	}
+	netw := addr.Network()
+	if netw == "icmp" || netw == "icmp4" || netw == "icmp6" || netw == "ip4:icmp" || netw == "ip6:ipv6-icmp" {
+		return true
+	}
+	return strings.HasPrefix(addr.String(), "icmp:")
+}
+
+func formatDatagramAddress(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	s := addr.String()
+	if isICMPAddr(addr) && !strings.HasPrefix(s, "icmp:") {
+		return "icmp:" + s
+	}
+	return s
+}
+
 // parseUDPAddr preserves domain metadata without inventing 0.0.0.0 or invoking
 // the host's DNS resolver. Datagram codecs have already validated the address.
 func parseUDPAddr(addrStr string) net.Addr {
+	if strings.HasPrefix(addrStr, "icmp:") {
+		target := strings.TrimPrefix(addrStr, "icmp:")
+		if ip := net.ParseIP(target); ip != nil {
+			return &ICMPAddr{IP: ip}
+		}
+		return &ICMPAddr{IP: net.IPv4zero}
+	}
 	if ap, err := netip.ParseAddrPort(addrStr); err == nil {
 		return net.UDPAddrFromAddrPort(ap)
 	}
@@ -535,4 +594,72 @@ func resolveUDP(ctx context.Context, addrStr string, fn func(context.Context, st
 		return nil, errors.New("no IP resolved")
 	}
 	return &net.UDPAddr{IP: ips[0], Port: port}, nil
+}
+
+// Ping sends an ICMP Echo Request through the proxy datagram session to target (IP or hostname),
+// waits for an Echo Reply matching the given ID and sequence number, and returns the response payload and round-trip time.
+func (c *Client) Ping(ctx context.Context, target string, id, seq uint16, payload []byte) ([]byte, time.Duration, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var targetIP net.IP
+	if ip := net.ParseIP(target); ip != nil {
+		targetIP = ip
+	} else {
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", target)
+		if err != nil {
+			return nil, 0, fmt.Errorf("resolve ping target %q: %w", target, err)
+		}
+		if len(ips) == 0 {
+			return nil, 0, fmt.Errorf("no IP address found for %q", target)
+		}
+		targetIP = ips[0]
+	}
+
+	pconn, err := c.ListenPacket(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("listen packet for ping: %w", err)
+	}
+	defer pconn.Close()
+
+	isIPv6 := targetIP.To4() == nil
+	req := icmpmsg.BuildEchoRequest(id, seq, payload, isIPv6)
+
+	start := time.Now()
+	if dl, ok := ctx.Deadline(); ok {
+		_ = pconn.SetDeadline(dl)
+	} else {
+		_ = pconn.SetDeadline(start.Add(5 * time.Second))
+	}
+
+	if _, err := pconn.WriteTo(req, &ICMPAddr{IP: targetIP}); err != nil {
+		return nil, 0, fmt.Errorf("send ping request: %w", err)
+	}
+
+	buf := make([]byte, 2048)
+	expectedType := byte(icmpmsg.IPv4EchoReply)
+	if isIPv6 {
+		expectedType = byte(icmpmsg.IPv6EchoReply)
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		n, from, err := pconn.ReadFrom(buf)
+		if err != nil {
+			return nil, 0, fmt.Errorf("read ping reply: %w", err)
+		}
+		icmpAddr, ok := from.(*ICMPAddr)
+		if !ok || !icmpAddr.IP.Equal(targetIP) {
+			continue
+		}
+		echo, err := icmpmsg.ParseEcho(buf[:n])
+		if err != nil {
+			continue
+		}
+		if echo.Type == expectedType && echo.ID == id && echo.Seq == seq {
+			return echo.Data, time.Since(start), nil
+		}
+	}
 }

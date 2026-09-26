@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -263,6 +264,7 @@ func (s *Server) serveHTTP3UDP(w http.ResponseWriter, r *http.Request) {
 	}()
 	relay := newUDPRelay(r.Context(), stream, s.udpTargetBuffer)
 	relay.dialUDP = s.dialUDP
+	relay.dialICMP = s.dialICMP
 	defer relay.Close()
 	var packetBuffer [udpRelayBatchSize][]byte
 	for {
@@ -318,6 +320,13 @@ type udpTarget struct {
 	messages   [udpRelayBatchSize]ipv4.Message
 }
 
+type icmpTarget struct {
+	lastActive atomic.Int64
+	address    string
+	targetIP   net.IP
+	conn       net.PacketConn
+}
+
 const udpRelayBatchSize = 64
 
 type udpRelay struct {
@@ -328,11 +337,13 @@ type udpRelay struct {
 	mu           sync.Mutex
 	sendMu       sync.Mutex
 	targets      map[string]*udpTarget
+	icmpTargets  map[string]*icmpTarget
 	replay       frame.ReplayWindow
 	decoder      frame.DatagramCache
 	sequence     atomic.Uint64
 	waitGroup    sync.WaitGroup
 	dialUDP      func(context.Context, string) (net.Conn, error)
+	dialICMP     func(context.Context, string) (net.PacketConn, error)
 	closed       bool
 }
 
@@ -342,7 +353,14 @@ func newUDPRelay(ctx context.Context, stream datagramStream, targetBuffers ...in
 		targetBuffer = targetBuffers[0]
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	return &udpRelay{ctx: ctx, cancel: cancel, stream: stream, targetBuffer: targetBuffer, targets: make(map[string]*udpTarget)}
+	return &udpRelay{
+		ctx:          ctx,
+		cancel:       cancel,
+		stream:       stream,
+		targetBuffer: targetBuffer,
+		targets:      make(map[string]*udpTarget),
+		icmpTargets:  make(map[string]*icmpTarget),
+	}
 }
 
 func (r *udpRelay) Forward(packet []byte) error {
@@ -373,6 +391,14 @@ func (r *udpRelay) ForwardBatch(packets [][]byte) error {
 		if err != nil || !r.replay.Accept(sequence) {
 			if firstErr == nil {
 				firstErr = errors.New("invalid or replayed datagram")
+			}
+			continue
+		}
+		if strings.HasPrefix(address, "icmp:") {
+			flush()
+			currentTarget = nil
+			if err := r.forwardICMP(address, payload); err != nil && firstErr == nil {
+				firstErr = err
 			}
 			continue
 		}
@@ -634,6 +660,138 @@ func (r *udpRelay) removeTarget(targetConn *udpTarget) {
 	_ = targetConn.conn.Close()
 }
 
+func (r *udpRelay) forwardICMP(address string, payload []byte) error {
+	targetConn, err := r.getOrCreateICMPTarget(address)
+	if err != nil {
+		return err
+	}
+	targetConn.lastActive.Store(time.Now().UnixNano())
+	_, err = targetConn.conn.WriteTo(payload, &net.IPAddr{IP: targetConn.targetIP})
+	return err
+}
+
+func (r *udpRelay) getOrCreateICMPTarget(address string) (*icmpTarget, error) {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, net.ErrClosed
+	}
+	if r.icmpTargets == nil {
+		r.icmpTargets = make(map[string]*icmpTarget)
+	}
+	targetConn := r.icmpTargets[address]
+	if targetConn != nil {
+		r.mu.Unlock()
+		return targetConn, nil
+	}
+	if len(r.icmpTargets) >= 64 {
+		r.mu.Unlock()
+		return nil, errors.New("too many ICMP targets")
+	}
+
+	targetStr := strings.TrimPrefix(address, "icmp:")
+	targetIP := net.ParseIP(targetStr)
+	if targetIP == nil {
+		ips, err := net.LookupIP(targetStr)
+		if err != nil || len(ips) == 0 {
+			r.mu.Unlock()
+			return nil, fmt.Errorf("invalid ICMP target address: %s", targetStr)
+		}
+		targetIP = ips[0]
+	}
+
+	var conn net.PacketConn
+	var err error
+	if r.dialICMP != nil {
+		conn, err = r.dialICMP(r.ctx, targetStr)
+	} else {
+		network := "ip4:icmp"
+		listenAddr := "0.0.0.0"
+		if targetIP.To4() == nil {
+			network = "ip6:ipv6-icmp"
+			listenAddr = "::"
+		}
+		conn, err = net.ListenPacket(network, listenAddr)
+	}
+	if err != nil {
+		r.mu.Unlock()
+		return nil, err
+	}
+
+	targetConn = &icmpTarget{
+		address:  address,
+		targetIP: targetIP,
+		conn:     conn,
+	}
+	targetConn.lastActive.Store(time.Now().UnixNano())
+	r.icmpTargets[address] = targetConn
+	r.waitGroup.Add(1)
+	go r.receiveICMP(targetConn)
+	r.mu.Unlock()
+
+	return targetConn, nil
+}
+
+func (r *udpRelay) receiveICMP(targetConn *icmpTarget) {
+	defer r.waitGroup.Done()
+	defer r.removeICMPTarget(targetConn)
+
+	buffer := make([]byte, 64<<10)
+	datagramBuffer := make([]byte, frame.MaxDatagramSize)
+	oversizeLogged := false
+
+	for {
+		_ = targetConn.conn.SetReadDeadline(time.Unix(0, targetConn.lastActive.Load()).Add(time.Minute))
+		n, from, err := targetConn.conn.ReadFrom(buffer)
+		if err != nil {
+			if e, ok := err.(net.Error); ok && e.Timeout() && time.Since(time.Unix(0, targetConn.lastActive.Load())) < time.Minute && r.ctx.Err() == nil {
+				continue
+			}
+			return
+		}
+		targetConn.lastActive.Store(time.Now().UnixNano())
+
+		data := buffer[:n]
+		if len(data) >= 20 && (data[0]>>4) == 4 {
+			ihl := int(data[0]&0x0f) * 4
+			if ihl >= 20 && ihl < len(data) && data[9] == 1 { // Protocol 1 = ICMP
+				data = data[ihl:]
+			}
+		}
+
+		if len(data) > frame.MaxDatagramPayload {
+			continue
+		}
+
+		fromIP := targetConn.targetIP.String()
+		if from != nil {
+			if ipa, ok := from.(*net.IPAddr); ok && ipa.IP != nil {
+				fromIP = ipa.IP.String()
+			} else if ua, ok := from.(*net.UDPAddr); ok && ua.IP != nil {
+				fromIP = ua.IP.String()
+			}
+		}
+
+		address := "icmp:" + fromIP
+		packet, err := frame.EncodeDatagramInto(datagramBuffer, r.sequence.Add(1), address, data)
+		if err != nil {
+			continue
+		}
+		if err := r.sendResponseBatch([][]byte{packet}, &oversizeLogged); err != nil {
+			return
+		}
+	}
+}
+
+func (r *udpRelay) removeICMPTarget(targetConn *icmpTarget) {
+	r.mu.Lock()
+	if r.icmpTargets != nil && r.icmpTargets[targetConn.address] == targetConn {
+		delete(r.icmpTargets, targetConn.address)
+	}
+	r.mu.Unlock()
+	_ = targetConn.conn.Close()
+}
+
 func (r *udpRelay) Close() {
 	if r.cancel != nil {
 		r.cancel()
@@ -642,9 +800,14 @@ func (r *udpRelay) Close() {
 	r.closed = true
 	targets := r.targets
 	r.targets = make(map[string]*udpTarget)
+	icmpTargets := r.icmpTargets
+	r.icmpTargets = make(map[string]*icmpTarget)
 	r.mu.Unlock()
 	for _, targetConn := range targets {
 		_ = targetConn.conn.Close()
+	}
+	for _, it := range icmpTargets {
+		_ = it.conn.Close()
 	}
 	r.waitGroup.Wait()
 }

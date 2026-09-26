@@ -368,6 +368,9 @@ func (h *OutboundHandler) processUDP(ctx context.Context, link *transport.Link, 
 				}
 				dest := lastDest
 				b.UDP = &dest
+			} else if icmpAddr, ok := from.(*client.ICMPAddr); ok && icmpAddr.IP != nil {
+				dest := xnet.UDPDestination(xnet.IPAddress(icmpAddr.IP), xnet.Port(0))
+				b.UDP = &dest
 			} else if dest, err := xnet.ParseDestination("udp:" + from.String()); err == nil {
 				b.UDP = &dest
 			}

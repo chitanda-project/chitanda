@@ -119,6 +119,7 @@ type Server struct {
 	udpTargetBuffer int
 	dialTarget      func(ctx context.Context, address string) (net.Conn, error)
 	dialUDP         func(ctx context.Context, address string) (net.Conn, error)
+	dialICMP        func(ctx context.Context, address string) (net.PacketConn, error)
 }
 
 // NewServer creates a new Server instance with a single PSK.
@@ -169,6 +170,11 @@ func (s *Server) SetDialTargetForTest(fn func(ctx context.Context, address strin
 // cores. Configure before serving. No direct socket/DNS fallback is used when set.
 func (s *Server) SetDialUDP(fn func(context.Context, string) (net.Conn, error)) {
 	s.dialUDP = fn
+}
+
+// SetDialICMP installs a packet-preserving ICMP packet dialer/listener. Configure before serving.
+func (s *Server) SetDialICMP(fn func(ctx context.Context, address string) (net.PacketConn, error)) {
+	s.dialICMP = fn
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {

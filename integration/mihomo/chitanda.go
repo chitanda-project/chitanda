@@ -222,6 +222,13 @@ func (c *Chitanda) SupportUDP() bool {
 	return true
 }
 
+func (c *Chitanda) SupportICMP() bool {
+	if c.option.UDP != nil {
+		return *c.option.UDP
+	}
+	return true
+}
+
 func (c *Chitanda) MarshalJSON() ([]byte, error) {
 	return json.Marshal(map[string]any{
 		"type":      C.Chitanda.String(),

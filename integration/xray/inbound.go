@@ -164,6 +164,16 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 	srv.SetDialUDP(func(ctx context.Context, address string) (net.Conn, error) {
 		return dialTargetFn(ctx, "udp", address)
 	})
+	srv.SetDialICMP(func(ctx context.Context, address string) (net.PacketConn, error) {
+		ip := net.ParseIP(address)
+		network := "ip4:icmp"
+		listenAddr := "0.0.0.0"
+		if ip != nil && ip.To4() == nil {
+			network = "ip6:ipv6-icmp"
+			listenAddr = "::"
+		}
+		return net.ListenPacket(network, listenAddr)
+	})
 
 	var userCodecs []*server.PlainUDPCodec
 	var userReplays []udpReplayRegistry
