@@ -12,6 +12,22 @@ spec.loader.exec_module(inject)
 
 
 class InjectionAnchorTests(unittest.TestCase):
+    def test_udp_pipe_burst_budget_covers_proxy_frontends(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            hub = root / "transport" / "internet" / "udp" / "hub.go"
+            worker = root / "app" / "proxyman" / "inbound" / "worker.go"
+            hub.parent.mkdir(parents=True)
+            worker.parent.mkdir(parents=True)
+            hub.write_text("type Hub struct {\n\toobBytes := make([]byte, 256)\n\t\trawBytes := buffer.Extend(buf.Size)\n\t\tbuffer.Resize(0, int32(n))", encoding="utf-8")
+            worker.write_text("h, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, udp.HubCapacity(256))\n\t\tpReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(16*1024))", encoding="utf-8")
+            inject.inject_udp_packet_size(root)
+            result = worker.read_text(encoding="utf-8")
+            self.assertIn("pipe.WithSizeLimit(4*1024*1024)", result)
+            self.assertNotIn("pipe.WithSizeLimit(16*1024)", result)
+            inject.inject_udp_packet_size(root)
+            self.assertEqual(worker.read_text(encoding="utf-8"), result)
+
     def test_unique_anchor_and_idempotence(self):
         original = "before\nanchor\nafter\n"
         patched = inject.replace_unique(original, "anchor", "registered\nanchor", "test")

@@ -37,6 +37,8 @@ def inject_udp_packet_size(xray_dir):
         ("\t\tbuffer.Resize(0, int32(n))", "\t\tif largePacket != nil {\n\t\t\tbuffer.Release()\n\t\t\tbuffer = buf.NewWithSize(int32(max(1, n)))\n\t\t\tcopy(buffer.Extend(int32(n)), rawBytes[:n])\n\t\t}\n\t\tbuffer.Resize(0, int32(n))"),
     ])
     worker = os.path.join(xray_dir, "app", "proxyman", "inbound", "worker.go")
+    # This buffer also covers ordinary UDP frontends (e.g. Dokodemo) routed to
+    # Chitanda. Reducing only non-Chitanda inbounds to 16 KiB regressed 200M UDP.
     patch_once(worker, "UDPPacketBufferSize()", [
         ("h, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, udp.HubCapacity(256))",
          "opts := []udp.HubOption{udp.HubCapacity(256)}\n\tif sized, ok := w.proxy.(interface{ UDPPacketBufferSize() int32 }); ok {\n\t\topts = append(opts, udp.HubPacketSize(sized.UDPPacketBufferSize()))\n\t}\n\th, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, opts...)"),

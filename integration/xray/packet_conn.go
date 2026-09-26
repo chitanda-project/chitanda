@@ -57,11 +57,7 @@ type packetLinkConn struct {
 
 func newPacketLinkConn(r buf.Reader, w buf.Writer, remote net.Addr) *packetLinkConn {
 	c := &packetLinkConn{packetReader: r, packetWriter: w, remote: remote}
-	c.packetReads = connio.NewReader(func() ([]byte, net.Addr, error) {
-		b := make([]byte, 65535)
-		n, a, err := c.readPacket(b)
-		return b[:n], a, err
-	}, func() error { _ = common.Interrupt(r); return common.Close(r) })
+	c.packetReads = connio.NewReader(c.readPacketOwned, func() error { _ = common.Interrupt(r); return common.Close(r) })
 	c.writes = connio.NewWriter(func(b []byte, _ net.Addr) (int, error) {
 		if err := w.WriteMultiBuffer(buf.MultiBuffer{ownedDatagram(b)}); err != nil {
 			return 0, err
@@ -82,7 +78,6 @@ func (c *packetLinkConn) WriteBatch(payloads [][]byte) error {
 	return c.packetWriter.WriteMultiBuffer(mb)
 }
 
-
 func (c *packetLinkConn) Read(p []byte) (int, error) {
 	n, _, err := c.ReadFrom(p)
 	return n, err
@@ -92,12 +87,12 @@ func (c *packetLinkConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	return c.packetReads.ReadPacket(p)
 }
 
-func (c *packetLinkConn) readPacket(p []byte) (int, net.Addr, error) {
+func (c *packetLinkConn) readPacketOwned() ([]byte, net.Addr, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 	for len(c.pending) == 0 {
 		if c.readErr != nil {
-			return 0, nil, c.readErr
+			return nil, nil, c.readErr
 		}
 		c.pending, c.readErr = c.packetReader.ReadMultiBuffer()
 	}
@@ -105,14 +100,14 @@ func (c *packetLinkConn) readPacket(p []byte) (int, net.Addr, error) {
 	c.pending[0] = nil
 	c.pending = c.pending[1:]
 	defer b.Release()
-	if len(p) < int(b.Len()) {
-		return 0, nil, io.ErrShortBuffer
+	if b.Len() > 65535 {
+		return nil, nil, io.ErrShortBuffer
 	}
 	addr := c.remote
 	if b.UDP != nil && b.UDP.IsValid() {
 		addr = packetAddress(b.UDP.NetAddr())
 	}
-	return copy(p, b.Bytes()), addr, nil
+	return append([]byte(nil), b.Bytes()...), addr, nil
 }
 
 func (c *packetLinkConn) Write(p []byte) (int, error) {
