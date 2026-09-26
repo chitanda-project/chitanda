@@ -27,6 +27,8 @@ type datagramStream interface {
 	SetWriteDeadline(time.Time) error
 	SendDatagram(b []byte) error
 	SendDatagrams(datagrams [][]byte) error
+	SendDatagramContext(context.Context, []byte) error
+	SendDatagramsContext(context.Context, [][]byte) error
 	ReceiveDatagram(ctx context.Context) ([]byte, error)
 
 	QUICStream() *quic.Stream
@@ -153,9 +155,18 @@ func (s *Stream) SendDatagram(b []byte) error {
 	return s.datagramStream.SendDatagram(b)
 }
 
+// SendDatagramContext cancels only while waiting for send queue capacity.
+func (s *Stream) SendDatagramContext(ctx context.Context, b []byte) error {
+	return s.datagramStream.SendDatagramContext(ctx, b)
+}
+
 // SendDatagrams atomically queues a batch of HTTP Datagrams.
 func (s *Stream) SendDatagrams(datagrams [][]byte) error {
 	return s.datagramStream.SendDatagrams(datagrams)
+}
+
+func (s *Stream) SendDatagramsContext(ctx context.Context, datagrams [][]byte) error {
+	return s.datagramStream.SendDatagramsContext(ctx, datagrams)
 }
 
 func (s *Stream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
@@ -298,9 +309,18 @@ func (s *RequestStream) SendDatagram(b []byte) error {
 	return s.str.SendDatagram(b)
 }
 
+// SendDatagramContext cancels only while waiting for send queue capacity.
+func (s *RequestStream) SendDatagramContext(ctx context.Context, b []byte) error {
+	return s.str.SendDatagramContext(ctx, b)
+}
+
 // SendDatagrams atomically queues a batch of HTTP Datagrams.
 func (s *RequestStream) SendDatagrams(datagrams [][]byte) error {
 	return s.str.SendDatagrams(datagrams)
+}
+
+func (s *RequestStream) SendDatagramsContext(ctx context.Context, datagrams [][]byte) error {
+	return s.str.SendDatagramsContext(ctx, datagrams)
 }
 
 // ReceiveDatagram receives HTTP Datagrams (RFC 9297).

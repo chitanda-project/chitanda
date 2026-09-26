@@ -15,6 +15,8 @@ grep -q 'maxDatagramSendQueueLen = 512' vendor/github.com/quic-go/quic-go/datagr
 go run ./scripts/patch-vendor.go
 git apply --check ./scripts/vendor-performance.patch
 git apply ./scripts/vendor-performance.patch
+git apply --check ./scripts/vendor-deadline.patch
+git apply ./scripts/vendor-deadline.patch
 cp ./scripts/vendor-tests/datagram_queue_test.go.txt \
   ./vendor/github.com/quic-go/quic-go/datagram_queue_test.go
 cp ./scripts/vendor-tests/send_conn_batch_linux_test.go.txt \

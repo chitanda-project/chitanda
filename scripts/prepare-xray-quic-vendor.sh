@@ -6,6 +6,7 @@ core_dir=${1:?usage: prepare-xray-quic-vendor.sh /path/to/chitanda}
 core_dir=$(cd "$core_dir" && pwd)
 test -f go.mod
 test -f "$core_dir/scripts/vendor-performance.patch"
+test -f "$core_dir/scripts/vendor-deadline.patch"
 test -f "$core_dir/scripts/patch-vendor.go"
 
 go mod tidy
@@ -33,6 +34,8 @@ sed -i 's/transportDefaultStreamFlow = 4 << 20/transportDefaultStreamFlow = 64 <
 go run "$core_dir/scripts/patch-vendor.go" --quic-only
 git apply --check --include='vendor/github.com/quic-go/quic-go/*' "$core_dir/scripts/vendor-performance.patch"
 git apply --include='vendor/github.com/quic-go/quic-go/*' "$core_dir/scripts/vendor-performance.patch"
+git apply --check "$core_dir/scripts/vendor-deadline.patch"
+git apply "$core_dir/scripts/vendor-deadline.patch"
 
 # The historical Xray workflow patched the global module cache. If that cache
 # is already patched, go mod vendor copies the complete H2 change. Otherwise

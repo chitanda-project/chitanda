@@ -50,11 +50,21 @@ func newDatagramQueue(hasData func(), logger utils.Logger) *datagramQueue {
 // Up to 32 DATAGRAM frames will be queued.
 // Once that limit is reached, Add blocks until the queue size has reduced.
 func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
+	return h.AddContext(context.Background(), f)
+}
+
+// AddContext only cancels while waiting for queue capacity. Once accepted,
+// the datagram belongs to the connection and cannot be withdrawn.
+func (h *datagramQueue) AddContext(ctx context.Context, f *wire.DatagramFrame) error {
 	h.sendMx.Lock()
 
 	for {
 		if h.sendClosed {
 			err := h.closeErr
+			h.sendMx.Unlock()
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			h.sendMx.Unlock()
 			return err
 		}
@@ -72,6 +82,8 @@ func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
 		select {
 		case <-h.closed:
 			return h.closeErr
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-h.sent:
 		}
 		h.sendMx.Lock()
@@ -81,8 +93,13 @@ func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
 // AddBatch atomically queues a batch of DATAGRAM frames and wakes the sender
 // once, allowing the packet packer to build a UDP GSO batch.
 func (h *datagramQueue) AddBatch(frames []*wire.DatagramFrame) error {
+	return h.AddBatchContext(context.Background(), frames)
+}
+
+// AddBatchContext atomically accepts or cancels the whole batch.
+func (h *datagramQueue) AddBatchContext(ctx context.Context, frames []*wire.DatagramFrame) error {
 	if len(frames) == 0 {
-		return nil
+		return ctx.Err()
 	}
 	if len(frames) > maxDatagramSendQueueLen {
 		return errors.New("too many datagrams in batch")
@@ -91,6 +108,10 @@ func (h *datagramQueue) AddBatch(frames []*wire.DatagramFrame) error {
 	for {
 		if h.sendClosed {
 			err := h.closeErr
+			h.sendMx.Unlock()
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			h.sendMx.Unlock()
 			return err
 		}
@@ -110,6 +131,8 @@ func (h *datagramQueue) AddBatch(frames []*wire.DatagramFrame) error {
 		select {
 		case <-h.closed:
 			return h.closeErr
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-h.sent:
 		}
 		h.sendMx.Lock()

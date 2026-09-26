@@ -25,13 +25,13 @@ const queuedDatagramAccountingOverhead = 32
 type stateTrackingStream struct {
 	*quic.Stream
 
-	sendDatagram  func([]byte) error
-	sendDatagrams func([][]byte) error
-	hasData       chan struct{}
-	recvClosed    chan struct{}
-	queue         [][]byte
-	queueHead     int
-	queueLen      int
+	sendDatagramContext  func(context.Context, []byte) error
+	sendDatagramsContext func(context.Context, [][]byte) error
+	hasData              chan struct{}
+	recvClosed           chan struct{}
+	queue                [][]byte
+	queueHead            int
+	queueLen             int
 
 	mx      sync.Mutex
 	sendErr error
@@ -51,16 +51,16 @@ type streamClearer interface {
 func newStateTrackingStream(
 	s *quic.Stream,
 	clearer streamClearer,
-	sendDatagram func([]byte) error,
-	sendDatagrams func([][]byte) error,
+	sendDatagramContext func(context.Context, []byte) error,
+	sendDatagramsContext func(context.Context, [][]byte) error,
 ) *stateTrackingStream {
 	t := &stateTrackingStream{
-		Stream:        s,
-		clearer:       clearer,
-		sendDatagram:  sendDatagram,
-		sendDatagrams: sendDatagrams,
-		hasData:       make(chan struct{}, 1),
-		recvClosed:    make(chan struct{}),
+		Stream:               s,
+		clearer:              clearer,
+		sendDatagramContext:  sendDatagramContext,
+		sendDatagramsContext: sendDatagramsContext,
+		hasData:              make(chan struct{}, 1),
+		recvClosed:           make(chan struct{}),
 	}
 
 	context.AfterFunc(s.Context(), func() {
@@ -140,6 +140,10 @@ func (s *stateTrackingStream) Read(b []byte) (int, error) {
 }
 
 func (s *stateTrackingStream) SendDatagram(b []byte) error {
+	return s.SendDatagramContext(context.Background(), b)
+}
+
+func (s *stateTrackingStream) SendDatagramContext(ctx context.Context, b []byte) error {
 	s.mx.Lock()
 	sendErr := s.sendErr
 	s.mx.Unlock()
@@ -147,17 +151,21 @@ func (s *stateTrackingStream) SendDatagram(b []byte) error {
 		return sendErr
 	}
 
-	return s.sendDatagram(b)
+	return s.sendDatagramContext(ctx, b)
 }
 
 func (s *stateTrackingStream) SendDatagrams(datagrams [][]byte) error {
+	return s.SendDatagramsContext(context.Background(), datagrams)
+}
+
+func (s *stateTrackingStream) SendDatagramsContext(ctx context.Context, datagrams [][]byte) error {
 	s.mx.Lock()
 	sendErr := s.sendErr
 	s.mx.Unlock()
 	if sendErr != nil {
 		return sendErr
 	}
-	return s.sendDatagrams(datagrams)
+	return s.sendDatagramsContext(ctx, datagrams)
 }
 
 func (s *stateTrackingStream) signalHasDatagram() {

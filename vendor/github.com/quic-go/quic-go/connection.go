@@ -3025,23 +3025,34 @@ func (c *Conn) onStreamCompleted(id protocol.StreamID) {
 // In addition, a datagram may be dropped before being sent out if the available packet size suddenly decreases.
 // If the payload is too large to be sent at the current time, a DatagramTooLargeError is returned.
 func (c *Conn) SendDatagram(p []byte) error {
-	return c.sendDatagram(p, true)
+	return c.sendDatagram(context.Background(), p, true)
 }
 
 // SendDatagramNoCopy transfers ownership of p to the connection. The caller
 // must not access p after this method returns.
 func (c *Conn) SendDatagramNoCopy(p []byte) error {
-	return c.sendDatagram(p, false)
+	return c.sendDatagram(context.Background(), p, false)
+}
+
+// SendDatagramNoCopyContext transfers ownership of p only if it is queued.
+// Cancellation while waiting for queue capacity leaves the datagram unsent.
+func (c *Conn) SendDatagramNoCopyContext(ctx context.Context, p []byte) error {
+	return c.sendDatagram(ctx, p, false)
 }
 
 // SendDatagramsNoCopy atomically queues a batch of DATAGRAM payloads. It
 // transfers ownership only when the entire batch is accepted.
 func (c *Conn) SendDatagramsNoCopy(payloads [][]byte) error {
+	return c.SendDatagramsNoCopyContext(context.Background(), payloads)
+}
+
+// SendDatagramsNoCopyContext atomically queues the batch or cancels it.
+func (c *Conn) SendDatagramsNoCopyContext(ctx context.Context, payloads [][]byte) error {
 	if !c.supportsDatagrams() {
 		return errors.New("datagram support disabled")
 	}
 	if len(payloads) == 0 {
-		return nil
+		return ctx.Err()
 	}
 	frames := make([]*wire.DatagramFrame, len(payloads))
 	for i, payload := range payloads {
@@ -3057,10 +3068,10 @@ func (c *Conn) SendDatagramsNoCopy(payloads [][]byte) error {
 		frame.Data = payload
 		frames[i] = frame
 	}
-	return c.datagramQueue.AddBatch(frames)
+	return c.datagramQueue.AddBatchContext(ctx, frames)
 }
 
-func (c *Conn) sendDatagram(p []byte, copyPayload bool) error {
+func (c *Conn) sendDatagram(ctx context.Context, p []byte, copyPayload bool) error {
 	if !c.supportsDatagrams() {
 		return errors.New("datagram support disabled")
 	}
@@ -3079,7 +3090,7 @@ func (c *Conn) sendDatagram(p []byte, copyPayload bool) error {
 		p = bytes.Clone(p)
 	}
 	f.Data = p
-	return c.datagramQueue.Add(f)
+	return c.datagramQueue.AddContext(ctx, f)
 }
 
 // ReceiveDatagram gets a message received in a QUIC datagram, as specified in RFC 9221.

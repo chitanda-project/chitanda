@@ -501,6 +501,8 @@ type quicPacketConn struct {
 	closed        bool
 	readDeadline  time.Time
 	writeDeadline time.Time
+	writeContext  context.Context
+	writeCancel   context.CancelFunc
 	readCancels   map[uint64]context.CancelFunc
 	nextReadID    uint64
 }
@@ -568,40 +570,20 @@ func (c *quicPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 }
 
 func (c *quicPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return 0, errors.New("use of closed network connection")
-	}
-	if !c.writeDeadline.IsZero() && time.Now().After(c.writeDeadline) {
-		c.mu.Unlock()
-		return 0, context.DeadlineExceeded
-	}
-	c.mu.Unlock()
-
 	address := addr.String()
 	packet, err := frame.EncodeDatagram(c.sequence.Add(1), address, p)
 	if err != nil {
 		return 0, err
 	}
-	if err := c.stream.SendDatagram(packet); err != nil {
+	if err := c.sendWithWriteDeadline(func(ctx context.Context) error {
+		return c.sendDatagram(ctx, packet)
+	}); err != nil {
 		return 0, err
 	}
 	return len(p), nil
 }
 
 func (c *quicPacketConn) WriteBatch(payloads [][]byte, addrs []net.Addr) error {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return errors.New("use of closed network connection")
-	}
-	if !c.writeDeadline.IsZero() && time.Now().After(c.writeDeadline) {
-		c.mu.Unlock()
-		return context.DeadlineExceeded
-	}
-	c.mu.Unlock()
-
 	if len(payloads) == 0 {
 		return nil
 	}
@@ -611,7 +593,9 @@ func (c *quicPacketConn) WriteBatch(payloads [][]byte, addrs []net.Addr) error {
 		if err != nil {
 			return err
 		}
-		return c.stream.SendDatagram(packet)
+		return c.sendWithWriteDeadline(func(ctx context.Context) error {
+			return c.sendDatagram(ctx, packet)
+		})
 	}
 
 	frames := make([][]byte, len(payloads))
@@ -623,15 +607,74 @@ func (c *quicPacketConn) WriteBatch(payloads [][]byte, addrs []net.Addr) error {
 		}
 		frames[i] = packet
 	}
-	if sender, ok := any(c.stream).(interface{ SendDatagrams([][]byte) error }); ok {
-		return sender.SendDatagrams(frames)
+	return c.sendWithWriteDeadline(func(ctx context.Context) error {
+		return c.sendDatagrams(ctx, frames)
+	})
+}
+
+func (c *quicPacketConn) sendDatagram(ctx context.Context, packet []byte) error {
+	if sender, ok := any(c.stream).(interface {
+		SendDatagramContext(context.Context, []byte) error
+	}); ok {
+		return sender.SendDatagramContext(ctx, packet)
 	}
-	for _, f := range frames {
-		if err := c.stream.SendDatagram(f); err != nil {
+	// The SDK also builds against stock quic-go. Only the injected Xray vendor
+	// provides cancellable queue admission; retain the legacy behavior here.
+	return c.stream.SendDatagram(packet)
+}
+
+func (c *quicPacketConn) sendDatagrams(ctx context.Context, packets [][]byte) error {
+	if sender, ok := any(c.stream).(interface {
+		SendDatagramsContext(context.Context, [][]byte) error
+	}); ok {
+		return sender.SendDatagramsContext(ctx, packets)
+	}
+	if sender, ok := any(c.stream).(interface{ SendDatagrams([][]byte) error }); ok {
+		return sender.SendDatagrams(packets)
+	}
+	for _, packet := range packets {
+		if err := c.stream.SendDatagram(packet); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// sendWithWriteDeadline retries only when SetWriteDeadline replaced the
+// context while a send was waiting for QUIC datagram queue capacity.
+func (c *quicPacketConn) sendWithWriteDeadline(send func(context.Context) error) error {
+	for {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return net.ErrClosed
+		}
+		if !c.writeDeadline.IsZero() && !time.Now().Before(c.writeDeadline) {
+			c.mu.Unlock()
+			return context.DeadlineExceeded
+		}
+		if c.writeContext == nil {
+			c.writeContext, c.writeCancel = context.WithCancel(c.ctx)
+		}
+		ctx := c.writeContext
+		c.mu.Unlock()
+
+		err := send(ctx)
+		if err == nil || ctx.Err() == nil {
+			return err
+		}
+		c.mu.Lock()
+		changed := c.writeContext != ctx
+		closed := c.closed
+		c.mu.Unlock()
+		if closed {
+			return net.ErrClosed
+		}
+		if changed {
+			continue
+		}
+		return err
+	}
 }
 
 func (c *quicPacketConn) Close() error {
@@ -671,7 +714,20 @@ func (c *quicPacketConn) SetReadDeadline(t time.Time) error {
 
 func (c *quicPacketConn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	var next context.Context
+	var cancel context.CancelFunc
+	if t.IsZero() {
+		next, cancel = context.WithCancel(c.ctx)
+	} else {
+		next, cancel = context.WithDeadline(c.ctx, t)
+	}
+	oldCancel := c.writeCancel
 	c.writeDeadline = t
+	c.writeContext = next
+	c.writeCancel = cancel
+	c.mu.Unlock()
+	if oldCancel != nil {
+		oldCancel()
+	}
 	return nil
 }

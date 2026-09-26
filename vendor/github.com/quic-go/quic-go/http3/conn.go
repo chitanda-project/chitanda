@@ -123,8 +123,10 @@ func (c *rawConn) TrackStream(str *quic.Stream) *stateTrackingStream {
 	hstr := newStateTrackingStream(
 		str,
 		c,
-		func(b []byte) error { return c.sendDatagram(str.StreamID(), b) },
-		func(datagrams [][]byte) error { return c.sendDatagrams(str.StreamID(), datagrams) },
+		func(ctx context.Context, b []byte) error { return c.sendDatagramContext(ctx, str.StreamID(), b) },
+		func(ctx context.Context, datagrams [][]byte) error {
+			return c.sendDatagramsContext(ctx, str.StreamID(), datagrams)
+		},
 	)
 
 	c.streamMx.Lock()
@@ -294,7 +296,7 @@ func (c *rawConn) closeDatagramReceivers(err error) {
 	}
 }
 
-func (c *rawConn) sendDatagram(streamID quic.StreamID, b []byte) error {
+func (c *rawConn) sendDatagramContext(ctx context.Context, streamID quic.StreamID, b []byte) error {
 	// TODO: this creates a lot of garbage and an additional copy
 	data := make([]byte, 0, len(b)+8)
 	quarterStreamID := uint64(streamID / 4)
@@ -309,10 +311,10 @@ func (c *rawConn) sendDatagram(streamID quic.StreamID, b []byte) error {
 			},
 		})
 	}
-	return c.conn.SendDatagramNoCopy(data)
+	return c.conn.SendDatagramNoCopyContext(ctx, data)
 }
 
-func (c *rawConn) sendDatagrams(streamID quic.StreamID, datagrams [][]byte) error {
+func (c *rawConn) sendDatagramsContext(ctx context.Context, streamID quic.StreamID, datagrams [][]byte) error {
 	quarterStreamID := uint64(streamID / 4)
 	prefix := quicvarint.Append(nil, quarterStreamID)
 	totalSize := 0
@@ -336,7 +338,7 @@ func (c *rawConn) sendDatagrams(streamID quic.StreamID, datagrams [][]byte) erro
 			})
 		}
 	}
-	return c.conn.SendDatagramsNoCopy(payloads)
+	return c.conn.SendDatagramsNoCopyContext(ctx, payloads)
 }
 
 func (c *rawConn) receiveDatagrams() error {

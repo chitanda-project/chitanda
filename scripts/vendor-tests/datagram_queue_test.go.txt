@@ -123,3 +123,54 @@ func TestDatagramQueueCloseConcurrentWithAddBatch(t *testing.T) {
 		}
 	}
 }
+
+func TestDatagramQueueContextCancelWhileFull(t *testing.T) {
+	queue := newDatagramQueue(func() {}, utils.DefaultLogger)
+	for range maxDatagramSendQueueLen {
+		queue.sendQueue.PushBack(&wire.DatagramFrame{Data: []byte("existing")})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- queue.AddContext(ctx, &wire.DatagramFrame{Data: []byte("new")})
+	}()
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled add = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("full queue did not wake on cancellation")
+	}
+	if got := queue.sendQueue.Len(); got != maxDatagramSendQueueLen {
+		t.Fatalf("canceled add changed queue length to %d", got)
+	}
+	queue.Pop()
+	if err := queue.AddContext(context.Background(), &wire.DatagramFrame{Data: []byte("later")}); err != nil {
+		t.Fatalf("queue did not recover: %v", err)
+	}
+}
+
+func TestDatagramQueueBatchContextCancelIsAtomic(t *testing.T) {
+	queue := newDatagramQueue(func() {}, utils.DefaultLogger)
+	for range maxDatagramSendQueueLen - 1 {
+		queue.sendQueue.PushBack(&wire.DatagramFrame{Data: []byte("existing")})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	frames := []*wire.DatagramFrame{{Data: []byte("one")}, {Data: []byte("two")}}
+	go func() { result <- queue.AddBatchContext(ctx, frames) }()
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled batch = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("full batch queue did not wake on cancellation")
+	}
+	if got := queue.sendQueue.Len(); got != maxDatagramSendQueueLen-1 {
+		t.Fatalf("canceled batch partially queued: %d", got)
+	}
+}

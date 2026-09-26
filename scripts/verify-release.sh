@@ -6,6 +6,7 @@ cd "$root"
 
 git diff --check
 git apply --reverse --check --whitespace=error-all scripts/vendor-performance.patch
+git apply --reverse --check --whitespace=error-all scripts/vendor-deadline.patch
 cmp scripts/vendor-tests/datagram_queue_test.go.txt vendor/github.com/quic-go/quic-go/datagram_queue_test.go
 cmp scripts/vendor-tests/send_conn_batch_linux_test.go.txt vendor/github.com/quic-go/quic-go/send_conn_batch_linux_test.go
 cmp scripts/vendor-tests/http3_state_tracking_stream_test.go.txt vendor/github.com/quic-go/quic-go/http3/state_tracking_stream_lazy_test.go
