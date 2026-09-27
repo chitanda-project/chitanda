@@ -1,6 +1,6 @@
 module github.com/violetaini/chitanda
 
-go 1.26
+go 1.24.0
 
 require (
 	github.com/metacubex/mihomo v1.19.31
