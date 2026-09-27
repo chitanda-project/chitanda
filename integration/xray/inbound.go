@@ -45,6 +45,7 @@ type InboundHandler struct {
 	userReplays  []udpReplayRegistry
 	dispatcher   routing.Dispatcher
 	dialICMP     func(ctx context.Context, address string) (net.PacketConn, error)
+	tcpTLSConfig *tls.Config
 	ctx          context.Context
 	cancel       context.CancelFunc
 	httpSlots    chan struct{}
@@ -200,6 +201,7 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 
 	var h3Server *http3.Server
 	var vconn *virtualPacketConn
+	var tcpTLSConfig *tls.Config
 	if config.Transport != "stream" && config.Transport != "h1" && config.Transport != "plain-h1" {
 		tlsConfig, err := buildServerTLSConfig(config)
 		if err != nil {
@@ -207,6 +209,8 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 			inCancel()
 			return nil, fmt.Errorf("build h3 tls config: %w", err)
 		}
+		tcpTLSConfig = tlsConfig.Clone()
+		tcpTLSConfig.NextProtos = []string{"h2", "http/1.1"}
 		vconn = newVirtualPacketConn()
 		h3Server = server.NewHTTP3Server(srv, tlsConfig, 0)
 		h3Server.ConnContext = func(ctx context.Context, conn *quic.Conn) context.Context {
@@ -229,6 +233,7 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 		userReplays:  userReplays,
 		dispatcher:   dispatcher,
 		dialICMP:     dialICMPFn,
+		tcpTLSConfig: tcpTLSConfig,
 		ctx:          inCtx,
 		cancel:       inCancel,
 		httpSlots:    make(chan struct{}, 1024),
@@ -342,6 +347,40 @@ func (h *InboundHandler) Process(ctx context.Context, network xnet.Network, conn
 	_ = conn.SetReadDeadline(time.Time{})
 
 	bconn := &bufferedConn{Conn: conn, br: br}
+
+	if len(prefix) > 0 && prefix[0] == 0x16 && h.tcpTLSConfig != nil {
+		tlsConn := tls.Server(bconn, h.tcpTLSConfig)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			return err
+		}
+		state := tlsConn.ConnectionState()
+		if state.NegotiatedProtocol == "h2" {
+			h2Server := newInboundH2Server()
+			h2Server.ServeConn(tlsConn, &http2.ServeConnOpts{
+				Handler: h.server,
+				Context: ctx,
+			})
+			return nil
+		}
+		sl := &singleListener{conn: tlsConn, done: make(chan struct{})}
+		httpServer := &http.Server{
+			Handler:           h.server,
+			BaseContext:       func(net.Listener) context.Context { return ctx },
+			ReadHeaderTimeout: 2 * time.Second,
+			MaxHeaderBytes:    16 << 10,
+			IdleTimeout:       30 * time.Second,
+		}
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = sl.Close()
+			case <-h.ctx.Done():
+				_ = sl.Close()
+			case <-sl.done:
+			}
+		}()
+		return httpServer.Serve(sl)
+	}
 
 	if string(prefix) == "PRI " {
 		// HTTP/2 Connection Preface
