@@ -22,6 +22,9 @@ an IP address. Xray's Chitanda outbound and Mihomo's Chitanda packet adapter
 translate this convention to the protocol's ICMP address. In Mihomo TUN mode,
 ICMP follows the selected routing rule when it resolves to a Chitanda node;
 unsupported proxy selections fail closed rather than silently using DIRECT.
+If a rule selects a Chitanda node with `udp: false`, ICMP is dropped rather
+than falling through to Mihomo's default DIRECT route or producing a local
+fake Echo Reply.
 If ICMP forwarding is disabled in Mihomo, its existing fake-ping behavior
 still takes precedence.
 

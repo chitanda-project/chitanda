@@ -40,9 +40,30 @@ def patch_tun_icmp_route(mihomo_dir):
         f.write(content.replace(original, patched, 1))
 
 
+def patch_tun_icmp_rule_selection(mihomo_dir):
+    # Synthetic TUN ICMP has zero ports. Keep an explicitly selected but
+    # UDP-disabled node visible to the ICMP opener so it fails closed; Mihomo's
+    # generic UDP filter would otherwise skip it and fall back to DIRECT.
+    tunnel_go = os.path.join(mihomo_dir, "tunnel", "tunnel.go")
+    with open(tunnel_go, "r", encoding="utf-8") as f:
+        content = f.read()
+    original = "if metadata.NetWork == C.UDP && !adapter.SupportUDP() {"
+    patched = (
+        "if metadata.NetWork == C.UDP && !adapter.SupportUDP() && "
+        "!(metadata.Type == C.TUN && metadata.SrcPort == 0 && metadata.DstPort == 0) {"
+    )
+    if content.count(patched) == 1:
+        return
+    if content.count(original) != 1:
+        raise RuntimeError(f"unexpected Mihomo UDP rule filter in {tunnel_go}")
+    with open(tunnel_go, "w", encoding="utf-8") as f:
+        f.write(content.replace(original, patched, 1))
+
+
 def inject_mihomo(mihomo_dir, chitanda_dir):
     print(f"[*] Injecting Chitanda adapter into Mihomo: {mihomo_dir}")
     patch_udp_sender_capacity(mihomo_dir)
+    patch_tun_icmp_rule_selection(mihomo_dir)
     adapter_dir = os.path.join(mihomo_dir, "adapter", "outbound")
     constant_dir = os.path.join(mihomo_dir, "constant")
     
@@ -59,6 +80,8 @@ def inject_mihomo(mihomo_dir, chitanda_dir):
     for src, dst in (
         (os.path.join(chitanda_dir, "integration", "mihomo_tunnel", "chitanda_icmp.go"),
          os.path.join(mihomo_dir, "tunnel", "chitanda_icmp.go")),
+        (os.path.join(chitanda_dir, "integration", "mihomo_tunnel", "chitanda_icmp_test.go"),
+         os.path.join(mihomo_dir, "tunnel", "chitanda_icmp_test.go")),
         (os.path.join(chitanda_dir, "integration", "mihomo_sing_tun", "chitanda_icmp.go"),
          os.path.join(mihomo_dir, "listener", "sing_tun", "chitanda_icmp.go")),
         (os.path.join(chitanda_dir, "integration", "mihomo_sing_tun", "chitanda_icmp_test.go"),

@@ -37,6 +37,16 @@ class PatchUDPSenderCapacityTest(unittest.TestCase):
             inject_mihomo.patch_tun_icmp_route(root)
             self.assertIn("h.prepareChitandaICMP", prepare.read_text(encoding="utf-8"))
 
+    def test_tun_icmp_rule_selection_keeps_disabled_proxy_visible(self):
+        with tempfile.TemporaryDirectory() as root:
+            tunnel = Path(root) / "tunnel" / "tunnel.go"
+            tunnel.parent.mkdir(parents=True)
+            tunnel.write_text("if metadata.NetWork == C.UDP && !adapter.SupportUDP() {\n", encoding="utf-8")
+            inject_mihomo.patch_tun_icmp_rule_selection(root)
+            inject_mihomo.patch_tun_icmp_rule_selection(root)
+            content = tunnel.read_text(encoding="utf-8")
+            self.assertIn("metadata.Type == C.TUN && metadata.SrcPort == 0 && metadata.DstPort == 0", content)
+
 
 if __name__ == "__main__":
     unittest.main()

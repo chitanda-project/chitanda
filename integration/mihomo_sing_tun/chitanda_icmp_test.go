@@ -1,14 +1,35 @@
 package sing_tun
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"net/netip"
 	"testing"
 	"time"
 
+	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/listener/sing"
+	tun "github.com/metacubex/sing-tun"
 	"github.com/metacubex/sing/common/buf"
 )
+
+type failingICMPTunnel struct{ C.Tunnel }
+
+func (failingICMPTunnel) OpenChitandaICMP(context.Context, netip.Addr, netip.Addr) (net.PacketConn, bool, error) {
+	return nil, false, errors.New("simulated proxy failure")
+}
+
+func TestChitandaICMPProxyFailureDropsInsteadOfFakeReply(t *testing.T) {
+	handler := &ListenerHandler{ListenerHandler: &sing.ListenerHandler{
+		ListenerConfig: sing.ListenerConfig{Tunnel: failingICMPTunnel{}},
+	}}
+	_, handled, err := handler.prepareChitandaICMP(netip.MustParseAddr("198.18.0.2"), netip.MustParseAddr("1.1.1.1"), nil, time.Second)
+	if !handled || !errors.Is(err, tun.ErrDrop) {
+		t.Fatalf("expected fail-closed ICMP drop, handled=%v err=%v", handled, err)
+	}
+}
 
 type testICMPPacketConn struct {
 	packet []byte

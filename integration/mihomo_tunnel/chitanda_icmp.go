@@ -30,7 +30,7 @@ func (t tunnel) OpenChitandaICMP(ctx context.Context, source, destination netip.
 	selected := proxy
 	for selected != nil {
 		if selected.Type() == C.Chitanda {
-			if capable, ok := selected.Adapter().(interface{ SupportICMP() bool }); !ok || !capable.SupportICMP() {
+			if !chitandaICMPSupported(selected) {
 				return nil, false, fmt.Errorf("Chitanda ICMP is disabled")
 			}
 			pc, err := proxy.ListenPacketContext(ctx, metadata)
@@ -45,4 +45,11 @@ func (t tunnel) OpenChitandaICMP(ctx context.Context, source, destination netip.
 		selected = selected.Unwrap(metadata, false)
 	}
 	return nil, false, fmt.Errorf("selected proxy %q does not support ICMP", proxy.Name())
+}
+
+func chitandaICMPSupported(proxy C.Proxy) bool {
+	// Mihomo wraps outbound adapters before exposing them through Adapter(),
+	// so an optional method on the concrete Chitanda type is not visible
+	// here. Chitanda's ICMP capability follows its UDP setting.
+	return proxy.Type() == C.Chitanda && proxy.SupportUDP()
 }

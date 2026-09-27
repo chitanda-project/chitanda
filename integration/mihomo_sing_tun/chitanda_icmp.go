@@ -31,7 +31,10 @@ func (h *ListenerHandler) prepareChitandaICMP(source, destination netip.Addr, ro
 	defer cancel()
 	conn, useProxy, err := opener.OpenChitandaICMP(ctx, source, destination)
 	if err != nil {
-		return nil, true, err
+		// sing-tun treats ordinary constructor errors as permission to produce
+		// a local fake Echo Reply. Drop instead, so a broken proxy is visible.
+		log.Warnln("[ICMP] %s --> %s Chitanda route failed: %v", source, destination, err)
+		return nil, true, tun.ErrDrop
 	}
 	if !useProxy {
 		return nil, false, nil
