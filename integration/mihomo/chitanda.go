@@ -2,18 +2,23 @@ package outbound
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/violetaini/chitanda/pkg/client"
 	"github.com/violetaini/chitanda/pkg/plugin/autoscaler"
 
 	C "github.com/metacubex/mihomo/constant"
+	tun "github.com/metacubex/sing-tun"
+	"github.com/metacubex/sing/common/buf"
 )
 
 type ChitandaOption struct {
@@ -252,3 +257,151 @@ func (c *Chitanda) Close() error {
 	}
 	return nil
 }
+
+func (c *Chitanda) CreateICMPDestination(sourceAddr, destinationAddr netip.Addr, routeContext tun.DirectRouteContext, timeout time.Duration) (tun.DirectRouteDestination, error) {
+	if c.option.UDP != nil && !*c.option.UDP {
+		return nil, errors.New("chitanda: udp/icmp is disabled for this node")
+	}
+
+	cli, err := c.getClient()
+	if err != nil {
+		return nil, fmt.Errorf("chitanda get client: %w", err)
+	}
+
+	pconn, err := cli.ListenPacket(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("chitanda listen icmp packet: %w", err)
+	}
+
+	dest := &chitandaICMPDestination{
+		pconn:        pconn,
+		clientIP:     sourceAddr,
+		targetIP:     destinationAddr,
+		routeContext: routeContext,
+		timeout:      timeout,
+		done:         make(chan struct{}),
+	}
+
+	go dest.loopRead()
+	return dest, nil
+}
+
+type chitandaICMPDestination struct {
+	pconn        net.PacketConn
+	clientIP     netip.Addr
+	targetIP     netip.Addr
+	routeContext tun.DirectRouteContext
+	timeout      time.Duration
+	closed       atomic.Bool
+	done         chan struct{}
+}
+
+func (d *chitandaICMPDestination) WritePacket(packet *buf.Buffer) error {
+	if d.closed.Load() {
+		return errors.New("chitanda icmp destination closed")
+	}
+	raw := packet.Bytes()
+	var icmpPayload []byte
+	if d.targetIP.Is4() {
+		if len(raw) < 20 {
+			return errors.New("chitanda icmp: ipv4 packet too short")
+		}
+		ihl := int(raw[0]&0x0f) * 4
+		if len(raw) < ihl+8 {
+			return errors.New("chitanda icmp: packet shorter than ihl+icmp")
+		}
+		icmpPayload = raw[ihl:]
+	} else {
+		if len(raw) < 48 {
+			return errors.New("chitanda icmp: ipv6 packet too short")
+		}
+		icmpPayload = raw[40:]
+	}
+
+	_ = d.pconn.SetWriteDeadline(time.Now().Add(d.timeout))
+	targetAddr := &client.ICMPAddr{IP: d.targetIP.AsSlice()}
+	_, err := d.pconn.WriteTo(icmpPayload, targetAddr)
+	return err
+}
+
+func (d *chitandaICMPDestination) loopRead() {
+	defer d.Close()
+	buf := make([]byte, 2048)
+	for {
+		if d.closed.Load() {
+			return
+		}
+		_ = d.pconn.SetReadDeadline(time.Now().Add(d.timeout))
+		n, _, err := d.pconn.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		if n < 8 {
+			continue
+		}
+		replyPkt := buf[:n]
+		var ipPacket []byte
+		if d.targetIP.Is4() {
+			ipPacket = buildIPv4Packet(d.targetIP, d.clientIP, replyPkt)
+		} else {
+			ipPacket = buildIPv6Packet(d.targetIP, d.clientIP, replyPkt)
+		}
+		_ = d.routeContext.WritePacket(ipPacket)
+	}
+}
+
+func (d *chitandaICMPDestination) Close() error {
+	if d.closed.CompareAndSwap(false, true) {
+		close(d.done)
+		return d.pconn.Close()
+	}
+	return nil
+}
+
+func (d *chitandaICMPDestination) IsClosed() bool {
+	return d.closed.Load()
+}
+
+func buildIPv4Packet(srcIP, dstIP netip.Addr, icmpPkt []byte) []byte {
+	totalLen := 20 + len(icmpPkt)
+	pkt := make([]byte, totalLen)
+	pkt[0] = 0x45 // Version 4, IHL 5
+	pkt[1] = 0
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(totalLen))
+	binary.BigEndian.PutUint16(pkt[4:6], 0)
+	binary.BigEndian.PutUint16(pkt[6:8], 0x4000) // DF
+	pkt[8] = 64                                  // TTL
+	pkt[9] = 1                                   // Protocol: ICMP
+	src4 := srcIP.As4()
+	dst4 := dstIP.As4()
+	copy(pkt[12:16], src4[:])
+	copy(pkt[16:20], dst4[:])
+
+	var sum uint32
+	for i := 0; i < 20; i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(pkt[i : i+2]))
+	}
+	for sum > 0xffff {
+		sum = (sum >> 16) + (sum & 0xffff)
+	}
+	binary.BigEndian.PutUint16(pkt[10:12], ^uint16(sum))
+
+	copy(pkt[20:], icmpPkt)
+	return pkt
+}
+
+func buildIPv6Packet(srcIP, dstIP netip.Addr, icmpPkt []byte) []byte {
+	totalLen := 40 + len(icmpPkt)
+	pkt := make([]byte, totalLen)
+	pkt[0] = 0x60
+	binary.BigEndian.PutUint16(pkt[4:6], uint16(len(icmpPkt)))
+	pkt[6] = 58 // ICMPv6
+	pkt[7] = 64 // Hop Limit
+	src16 := srcIP.As16()
+	dst16 := dstIP.As16()
+	copy(pkt[8:24], src16[:])
+	copy(pkt[24:40], dst16[:])
+	copy(pkt[40:], icmpPkt)
+	return pkt
+}
+
