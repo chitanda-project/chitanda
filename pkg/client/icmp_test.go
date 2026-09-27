@@ -340,3 +340,49 @@ func TestClient_Ping_Mock(t *testing.T) {
 	}
 }
 
+func TestClient_Ping_AllTransports(t *testing.T) {
+	transports := []string{
+		TCPTransportH3,
+		TCPTransportH2,
+		TCPTransportAuto,
+		TCPTransportH1,
+		TCPTransportPlainH1,
+		TCPTransportStream,
+	}
+
+	for _, transport := range transports {
+		t.Run(transport, func(t *testing.T) {
+			c, err := New(Config{
+				Server:       "127.0.0.1:11322",
+				ServerName:   "example.com",
+				Path:         "/sync",
+				PSK:          bytes.Repeat([]byte("k"), 32),
+				TCPTransport: transport,
+			})
+			if err != nil {
+				t.Fatalf("New client failed for transport %s: %v", transport, err)
+			}
+			defer c.Close()
+
+			c.SetListenPacketForTest(func(ctx context.Context) (net.PacketConn, error) {
+				return newMockEchoPacketConn(), nil
+			})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			payload := []byte("ping-" + transport)
+			resData, rtt, err := c.Ping(ctx, "8.8.8.8", 0x1122, 1, payload)
+			if err != nil {
+				t.Fatalf("Ping failed on transport %s: %v", transport, err)
+			}
+			if !bytes.Equal(resData, payload) {
+				t.Errorf("transport %s payload mismatch: got %q, want %q", transport, resData, payload)
+			}
+			if rtt < 0 {
+				t.Errorf("expected positive RTT duration, got %v", rtt)
+			}
+		})
+	}
+}
+

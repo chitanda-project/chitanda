@@ -10,6 +10,7 @@ import (
 
 	"github.com/violetaini/chitanda/internal/frame"
 	"github.com/violetaini/chitanda/internal/icmpmsg"
+	"github.com/violetaini/chitanda/internal/plainudp"
 )
 
 type mockDatagramStream struct {
@@ -238,5 +239,98 @@ func TestServer_SetDialICMP(t *testing.T) {
 	conn, err := srv.dialICMP(context.Background(), "1.1.1.1")
 	if err != nil || conn == nil || !called {
 		t.Fatalf("dialICMP failed: err=%v, called=%v", err, called)
+	}
+}
+
+func TestPlainUDPServer_ICMP(t *testing.T) {
+	psk := bytes.Repeat([]byte("p"), 32)
+	udpLn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpLn.Close()
+
+	srv, err := NewPlainUDPServer(udpLn, psk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	targetIP := net.ParseIP("8.8.8.8")
+	mockConn := newMockICMPPacketConn(targetIP)
+	srv.SetDialICMP(func(ctx context.Context, address string) (net.PacketConn, error) {
+		return mockConn, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = srv.Serve(ctx)
+	}()
+
+	clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
+
+	codec, err := plainudp.NewCodec(psk)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sessionID := uint64(0x9876543210abcdef)
+	echoReq := icmpmsg.BuildEchoRequest(0x3344, 1, []byte("plain-udp-ping"), false)
+	clientPacket, err := codec.EncodePacket(nil, plainudp.DirClientToServer, sessionID, "icmp:8.8.8.8", echoReq, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := clientConn.WriteToUDP(clientPacket, udpLn.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify mockConn received the Echo Request
+	select {
+	case written := <-mockConn.writeCh:
+		msg, err := icmpmsg.ParseEcho(written)
+		if err != nil {
+			t.Fatalf("ParseEcho on written data failed: %v", err)
+		}
+		if msg.ID != 0x3344 || msg.Seq != 1 {
+			t.Errorf("ID/Seq mismatch: got id=%x, seq=%d", msg.ID, msg.Seq)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for ICMP request written to raw socket")
+	}
+
+	// Send simulated Echo Reply back to server
+	echoReply := icmpmsg.BuildEchoReply(0x3344, 1, []byte("plain-udp-ping"), false)
+	mockConn.readCh <- echoReply
+
+	// Client receives the Plain-UDP response
+	recvBuf := make([]byte, 2048)
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _, err := clientConn.ReadFrom(recvBuf)
+	if err != nil {
+		t.Fatalf("client read reply failed: %v", err)
+	}
+
+	replySid, targetAddr, replyPayload, _, _, err := codec.DecodePacket(recvBuf[:n], plainudp.DirServerToClient, time.Now())
+	if err != nil {
+		t.Fatalf("DecodePacket failed: %v", err)
+	}
+	if replySid != sessionID {
+		t.Errorf("session ID mismatch: got %x, want %x", replySid, sessionID)
+	}
+	if targetAddr != "icmp:8.8.8.8" {
+		t.Errorf("target address mismatch: got %q, want 'icmp:8.8.8.8'", targetAddr)
+	}
+	echoMsg, err := icmpmsg.ParseEcho(replyPayload)
+	if err != nil {
+		t.Fatalf("ParseEcho on reply payload failed: %v", err)
+	}
+	if echoMsg.ID != 0x3344 || echoMsg.Seq != 1 || !bytes.Equal(echoMsg.Data, []byte("plain-udp-ping")) {
+		t.Errorf("unexpected echo reply: %+v", echoMsg)
 	}
 }

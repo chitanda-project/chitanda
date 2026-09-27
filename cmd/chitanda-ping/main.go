@@ -16,6 +16,7 @@ func main() {
 	path := flag.String("path", "/chitanda-test", "Path")
 	sni := flag.String("sni", "bench.invalid", "SNI")
 	target := flag.String("target", "1.1.1.1", "Ping target")
+	transport := flag.String("transport", "h3", "Transport (h3, h2, auto, h1, plain-h1, stream)")
 	rounds := flag.Int("rounds", 10, "Number of ping rounds")
 	flag.Parse()
 
@@ -24,7 +25,7 @@ func main() {
 		ServerName:         *sni,
 		PSK:                []byte(*psk),
 		Path:               *path,
-		TCPTransport:       client.TCPTransportH3,
+		TCPTransport:       *transport,
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
@@ -33,7 +34,7 @@ func main() {
 	}
 	defer c.Close()
 
-	fmt.Printf("PING %s via Chitanda H3 Proxy (%s)...\n", *target, *server)
+	fmt.Printf("PING %s via Chitanda %s Proxy (%s)...\n", *target, *transport, *server)
 	var totalRTT time.Duration
 	success := 0
 	for i := 1; i <= *rounds; i++ {

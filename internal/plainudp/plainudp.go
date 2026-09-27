@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -217,13 +218,22 @@ func DecodePacketMulti(codecs []*Codec, packet []byte, expectedDir Direction, no
 
 
 func appendTargetAddress(buf []byte, address string) ([]byte, error) {
-	host, portText, err := net.SplitHostPort(address)
-	if err != nil {
-		return nil, fmt.Errorf("invalid address %q: %w", address, err)
-	}
-	port, err := strconv.Atoi(portText)
-	if err != nil || port < 1 || port > 65535 {
-		return nil, fmt.Errorf("invalid port %q", portText)
+	var host string
+	var port int
+	if strings.HasPrefix(address, "icmp:") {
+		host = strings.TrimPrefix(address, "icmp:")
+		port = 0
+	} else {
+		var portText string
+		var err error
+		host, portText, err = net.SplitHostPort(address)
+		if err != nil {
+			return nil, fmt.Errorf("invalid address %q: %w", address, err)
+		}
+		port, err = strconv.Atoi(portText)
+		if err != nil || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("invalid port %q", portText)
+		}
 	}
 
 	if ip := net.ParseIP(host); ip != nil {
@@ -286,7 +296,11 @@ func decodeTargetAddress(data []byte) (targetAddress string, payload []byte, err
 	port := binary.BigEndian.Uint16(data[offset : offset+2])
 	offset += 2
 
-	targetAddress = net.JoinHostPort(host, strconv.Itoa(int(port)))
+	if port == 0 {
+		targetAddress = "icmp:" + host
+	} else {
+		targetAddress = net.JoinHostPort(host, strconv.Itoa(int(port)))
+	}
 	if len(data) > offset {
 		payload = data[offset:]
 	}
