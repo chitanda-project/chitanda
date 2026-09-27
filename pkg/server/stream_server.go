@@ -28,6 +28,7 @@ type StreamServer struct {
 	listenersMu  sync.Mutex
 	listeners    []net.Listener
 	udpServer    *PlainUDPServer
+	dialICMP     func(ctx context.Context, address string) (net.PacketConn, error)
 	replays      *auth.ReplayCache
 	closed       atomic.Bool
 	wg           sync.WaitGroup
@@ -121,6 +122,16 @@ func (s *StreamServer) SetReplayCache(cache *auth.ReplayCache) {
 	}
 }
 
+// SetDialICMP sets the custom dialer used to listen/dial ICMP packets on the attached UDP server.
+func (s *StreamServer) SetDialICMP(fn func(ctx context.Context, address string) (net.PacketConn, error)) {
+	s.listenersMu.Lock()
+	defer s.listenersMu.Unlock()
+	s.dialICMP = fn
+	if s.udpServer != nil {
+		s.udpServer.SetDialICMP(fn)
+	}
+}
+
 // AttachUDP binds a Native PlainUDP listener to this server and starts the UDP serve loop.
 func (s *StreamServer) AttachUDP(udpConn *net.UDPConn) error {
 	s.listenersMu.Lock()
@@ -131,6 +142,9 @@ func (s *StreamServer) AttachUDP(udpConn *net.UDPConn) error {
 	udpSrv, err := NewPlainUDPServerWithUsers(udpConn, s.users)
 	if err != nil {
 		return err
+	}
+	if s.dialICMP != nil {
+		udpSrv.SetDialICMP(s.dialICMP)
 	}
 	s.udpServer = udpSrv
 	go func() {

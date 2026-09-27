@@ -39,6 +39,7 @@ func Run(config *Config, listenAddr, adminListenAddr, quicListenAddr string) err
 	}
 
 	app := NewServer(path, psk, replays, fallback, config.UDPTargetBuffer)
+	app.SetAllowPrivateICMPTargets(config.AllowPrivateTargets)
 	if config.AllowPrivateTargets {
 		app.SetDialTargetForTest(func(ctx context.Context, address string) (net.Conn, error) {
 			dialer := net.Dialer{Timeout: 10 * time.Second}
@@ -121,6 +122,7 @@ func Run(config *Config, listenAddr, adminListenAddr, quicListenAddr string) err
 				return fmt.Errorf("init plain-UDP server: %w", err)
 			}
 			plainUDPServer = pServer
+			plainUDPServer.SetAllowPrivateICMPTargets(config.AllowPrivateTargets)
 			if config.AllowPrivateTargets {
 				plainUDPServer.SetResolveUDP(func(ctx context.Context, address string) (*net.UDPAddr, error) {
 					return net.ResolveUDPAddr("udp", address)
@@ -150,6 +152,9 @@ func Run(config *Config, listenAddr, adminListenAddr, quicListenAddr string) err
 					_ = uConn.SetReadBuffer(8 << 20)
 					_ = uConn.SetWriteBuffer(8 << 20)
 					_ = streamServer.AttachUDP(uConn)
+					if streamServer.UDPServer() != nil {
+						streamServer.UDPServer().SetAllowPrivateICMPTargets(config.AllowPrivateTargets)
+					}
 					if config.AllowPrivateTargets && streamServer.UDPServer() != nil {
 						streamServer.UDPServer().SetResolveUDP(func(ctx context.Context, address string) (*net.UDPAddr, error) {
 							return net.ResolveUDPAddr("udp", address)

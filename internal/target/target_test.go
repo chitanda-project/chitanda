@@ -1,6 +1,7 @@
 package target
 
 import (
+	"context"
 	"net"
 	"testing"
 )
@@ -29,5 +30,20 @@ func TestAllowed(t *testing.T) {
 		if got := allowed(net.ParseIP(test.address)); got != test.want {
 			t.Errorf("allowed(%s) = %v, want %v", test.address, got, test.want)
 		}
+	}
+}
+
+func TestResolveICMPIPPolicy(t *testing.T) {
+	if _, err := ResolveICMPIP(context.Background(), "127.0.0.1", false); err != ErrForbidden {
+		t.Fatalf("loopback was not blocked: %v", err)
+	}
+	if _, err := ResolveICMPIP(context.Background(), "10.0.0.1", false); err != ErrForbidden {
+		t.Fatalf("private IP was not blocked: %v", err)
+	}
+	if ip, err := ResolveICMPIP(context.Background(), "127.0.0.1", true); err != nil || !ip.IsLoopback() {
+		t.Fatalf("explicit loopback override failed: %v %v", ip, err)
+	}
+	if _, err := ResolveICMPIP(context.Background(), "224.0.0.1", true); err != ErrForbidden {
+		t.Fatalf("multicast was not blocked: %v", err)
 	}
 }

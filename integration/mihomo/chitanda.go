@@ -18,23 +18,23 @@ import (
 
 type ChitandaOption struct {
 	BasicOption
-	Name           string `proxy:"name"`
-	Server         string `proxy:"server"`
-	Port           int    `proxy:"port"`
-	PSK            string `proxy:"psk"`
-	Path           string `proxy:"path,omitempty"`
-	Transport      string `proxy:"transport,omitempty"` // "h2" (default), "h3", "auto", "h1", "stream", "plain-h1"
-	SNI            string `proxy:"sni,omitempty"`
-	ServerID       string `proxy:"server-id,omitempty"`
-	PoolSize       int    `proxy:"pool-size,omitempty"`
-	UDPPoolSize    int    `proxy:"udp-pool-size,omitempty"`
-	MaxPoolSize    int    `proxy:"max-pool-size,omitempty"`
-	AutoScale        *bool `proxy:"auto-scale,omitempty"`
-	ScaleUpThreshold int   `proxy:"scale-up-threshold,omitempty"`
-	ScaleDownIdle    int   `proxy:"scale-down-idle,omitempty"`
-	Cooldown         int   `proxy:"cooldown,omitempty"`
-	UDP              *bool `proxy:"udp,omitempty"`
-	SkipCertVerify   bool  `proxy:"skip-cert-verify,omitempty"`
+	Name             string `proxy:"name"`
+	Server           string `proxy:"server"`
+	Port             int    `proxy:"port"`
+	PSK              string `proxy:"psk"`
+	Path             string `proxy:"path,omitempty"`
+	Transport        string `proxy:"transport,omitempty"` // "h2" (default), "h3", "auto", "h1", "stream", "plain-h1"
+	SNI              string `proxy:"sni,omitempty"`
+	ServerID         string `proxy:"server-id,omitempty"`
+	PoolSize         int    `proxy:"pool-size,omitempty"`
+	UDPPoolSize      int    `proxy:"udp-pool-size,omitempty"`
+	MaxPoolSize      int    `proxy:"max-pool-size,omitempty"`
+	AutoScale        *bool  `proxy:"auto-scale,omitempty"`
+	ScaleUpThreshold int    `proxy:"scale-up-threshold,omitempty"`
+	ScaleDownIdle    int    `proxy:"scale-down-idle,omitempty"`
+	Cooldown         int    `proxy:"cooldown,omitempty"`
+	UDP              *bool  `proxy:"udp,omitempty"`
+	SkipCertVerify   bool   `proxy:"skip-cert-verify,omitempty"`
 }
 
 type Chitanda struct {
@@ -212,10 +212,40 @@ func (c *Chitanda) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 		return nil, fmt.Errorf("chitanda listen udp: %w", err)
 	}
 
-	return NewPacketConn(pconn, c), nil
+	return NewPacketConn(&chitandaICMPPacketConn{PacketConn: pconn}, c), nil
+}
+
+type chitandaICMPPacketConn struct{ net.PacketConn }
+
+func (c *chitandaICMPPacketConn) WriteTo(packet []byte, addr net.Addr) (int, error) {
+	if target, ok := addr.(*net.UDPAddr); ok && target.Port == 0 {
+		if target.IP == nil {
+			return 0, errors.New("chitanda: ICMP target IP is required")
+		}
+		if err := client.ValidateICMPEchoRequest(packet, target.IP.To4() == nil); err != nil {
+			return 0, err
+		}
+		return c.PacketConn.WriteTo(packet, &client.ICMPAddr{IP: target.IP})
+	}
+	return c.PacketConn.WriteTo(packet, addr)
+}
+
+func (c *chitandaICMPPacketConn) ReadFrom(packet []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(packet)
+	if from, ok := addr.(*client.ICMPAddr); ok && from.IP != nil {
+		return n, &net.UDPAddr{IP: from.IP, Port: 0}, err
+	}
+	return n, addr, err
 }
 
 func (c *Chitanda) SupportUDP() bool {
+	if c.option.UDP != nil {
+		return *c.option.UDP
+	}
+	return true
+}
+
+func (c *Chitanda) SupportICMP() bool {
 	if c.option.UDP != nil {
 		return *c.option.UDP
 	}

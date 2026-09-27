@@ -28,6 +28,15 @@ class PatchUDPSenderCapacityTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "unexpected Mihomo UDP sender capacity"):
                 inject_mihomo.patch_udp_sender_capacity(root)
 
+    def test_tun_icmp_route_patch_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as root:
+            prepare = Path(root) / "listener" / "sing_tun" / "prepare.go"
+            prepare.parent.mkdir(parents=True)
+            prepare.write_text('\t\tlog.Infoln("[ICMP] %s %s --> %s using DIRECT", network, source, destination)\n', encoding="utf-8")
+            inject_mihomo.patch_tun_icmp_route(root)
+            inject_mihomo.patch_tun_icmp_route(root)
+            self.assertIn("h.prepareChitandaICMP", prepare.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

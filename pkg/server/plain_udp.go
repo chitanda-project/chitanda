@@ -3,13 +3,16 @@ package server
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/violetaini/chitanda/internal/frame"
+	"github.com/violetaini/chitanda/internal/icmpmsg"
 	"github.com/violetaini/chitanda/internal/plainudp"
 	"github.com/violetaini/chitanda/internal/target"
 )
@@ -43,32 +46,49 @@ type plainUDPSessionKey struct {
 }
 
 type PlainUDPServer struct {
-	codec        *plainudp.Codec
-	codecs       []*plainudp.Codec
-	conn         *net.UDPConn
-	sessions     sync.Map // plainUDPSessionKey -> *plainUDPSession
-	sessionCount atomic.Int64
-	maxSessions  int64
-	workers      []chan udpTask
-	workerWg     sync.WaitGroup
-	upstreamWg   sync.WaitGroup
-	lifecycleMu  sync.Mutex
-	started      bool
-	done         chan struct{}
-	ctx          context.Context
-	cancel       context.CancelFunc
-	resolveMu    sync.RWMutex
-	resolveUDP   func(ctx context.Context, address string) (*net.UDPAddr, error)
-	closed       atomic.Bool
-	inFlightMem  atomic.Int64
-	maxMemBudget int64
+	codec            *plainudp.Codec
+	codecs           []*plainudp.Codec
+	conn             *net.UDPConn
+	sessions         sync.Map // plainUDPSessionKey -> *plainUDPSession
+	sessionCount     atomic.Int64
+	maxSessions      int64
+	workers          []chan udpTask
+	workerWg         sync.WaitGroup
+	upstreamWg       sync.WaitGroup
+	lifecycleMu      sync.Mutex
+	started          bool
+	done             chan struct{}
+	ctx              context.Context
+	cancel           context.CancelFunc
+	resolveMu        sync.RWMutex
+	resolveUDP       func(ctx context.Context, address string) (*net.UDPAddr, error)
+	dialICMPMu       sync.RWMutex
+	dialICMP         func(ctx context.Context, address string) (net.PacketConn, error)
+	allowPrivateICMP bool
+	closed           atomic.Bool
+	inFlightMem      atomic.Int64
+	maxMemBudget     int64
+}
+
+type plainICMPTarget struct {
+	address    string
+	targetIP   net.IP
+	packetConn net.PacketConn
+	tracker    icmpmsg.EchoTracker
+}
+
+func (t *plainICMPTarget) Close() error {
+	if t.packetConn != nil {
+		return t.packetConn.Close()
+	}
+	return nil
 }
 
 type plainUDPSession struct {
 	sessionID   uint64
 	codec       *plainudp.Codec
 	clientAddr  atomic.Pointer[net.UDPAddr]
-	targets     sync.Map // string(targetAddr) -> *net.UDPConn
+	targets     sync.Map // string(targetAddr) -> *net.UDPConn or *plainICMPTarget
 	targetCount atomic.Int64
 	lastActive  atomic.Int64
 	replayMu    sync.Mutex
@@ -137,6 +157,25 @@ func (s *PlainUDPServer) SetResolveUDP(fn func(ctx context.Context, address stri
 // SetResolveUDPForTest is kept for compatibility with existing SDK callers.
 func (s *PlainUDPServer) SetResolveUDPForTest(fn func(ctx context.Context, address string) (*net.UDPAddr, error)) {
 	s.SetResolveUDP(fn)
+}
+
+// SetDialICMP sets the custom dialer used to listen/dial ICMP packets on the server.
+func (s *PlainUDPServer) SetDialICMP(fn func(ctx context.Context, address string) (net.PacketConn, error)) {
+	s.dialICMPMu.Lock()
+	s.dialICMP = fn
+	s.dialICMPMu.Unlock()
+}
+
+func (s *PlainUDPServer) SetAllowPrivateICMPTargets(allow bool) {
+	s.dialICMPMu.Lock()
+	s.allowPrivateICMP = allow
+	s.dialICMPMu.Unlock()
+}
+
+func (s *PlainUDPServer) getDialICMP() func(ctx context.Context, address string) (net.PacketConn, error) {
+	s.dialICMPMu.RLock()
+	defer s.dialICMPMu.RUnlock()
+	return s.dialICMP
 }
 
 // Serve starts the worker pool and the UDP packet read loop.
@@ -288,6 +327,11 @@ func (s *PlainUDPServer) processTask(ctx context.Context, task udpTask) {
 	session.clientAddr.Store(task.clientAddr)
 	session.lastActive.Store(time.Now().Unix())
 
+	if strings.HasPrefix(task.targetAddr, "icmp:") {
+		s.processICMPTask(ctx, session, task)
+		return
+	}
+
 	targetConnVal, ok := session.targets.Load(task.targetAddr)
 	var upstreamConn *net.UDPConn
 	if !ok {
@@ -326,6 +370,112 @@ func (s *PlainUDPServer) processTask(ctx context.Context, task udpTask) {
 	}
 
 	_, _ = upstreamConn.Write(task.payload)
+}
+
+func (s *PlainUDPServer) processICMPTask(ctx context.Context, session *plainUDPSession, task udpTask) {
+	targetIPStr := strings.TrimPrefix(task.targetAddr, "icmp:")
+	s.dialICMPMu.RLock()
+	allowPrivate := s.allowPrivateICMP
+	s.dialICMPMu.RUnlock()
+	targetIP, err := target.ResolveICMPIP(ctx, targetIPStr, allowPrivate)
+	if err != nil {
+		return
+	}
+
+	targetConnVal, ok := session.targets.Load(task.targetAddr)
+	var icmpTarget *plainICMPTarget
+	if !ok {
+		if session.targetCount.Load() >= 32 {
+			return // Max targets reached for this session
+		}
+		dialICMP := s.getDialICMP()
+		var pconn net.PacketConn
+		if dialICMP != nil {
+			pconn, err = dialICMP(ctx, targetIP.String())
+		} else {
+			network := "ip4:icmp"
+			listenAddr := "0.0.0.0"
+			if targetIP.To4() == nil {
+				network = "ip6:ipv6-icmp"
+				listenAddr = "::"
+			}
+			pconn, err = net.ListenPacket(network, listenAddr)
+		}
+		if err != nil || ctx.Err() != nil {
+			if pconn != nil {
+				_ = pconn.Close()
+			}
+			return
+		}
+
+		target := &plainICMPTarget{
+			address:    task.targetAddr,
+			targetIP:   targetIP,
+			packetConn: pconn,
+		}
+		actual, loaded := session.targets.LoadOrStore(task.targetAddr, target)
+		if loaded {
+			_ = pconn.Close()
+			icmpTarget = actual.(*plainICMPTarget)
+		} else {
+			session.targetCount.Add(1)
+			icmpTarget = target
+			s.upstreamWg.Add(1)
+			go s.listenICMPUpstream(ctx, session, task.targetAddr, icmpTarget)
+		}
+	} else {
+		var okCast bool
+		icmpTarget, okCast = targetConnVal.(*plainICMPTarget)
+		if !okCast {
+			return
+		}
+	}
+
+	wire, err := icmpTarget.tracker.PrepareRequest(task.payload, targetIP.To4() == nil)
+	if err != nil {
+		return
+	}
+	_, _ = icmpTarget.packetConn.WriteTo(wire, &net.IPAddr{IP: targetIP})
+}
+
+func (s *PlainUDPServer) listenICMPUpstream(ctx context.Context, session *plainUDPSession, targetAddr string, target *plainICMPTarget) {
+	defer s.upstreamWg.Done()
+	defer target.Close()
+	buf := make([]byte, 64<<10)
+	for {
+		if s.closed.Load() || ctx.Err() != nil {
+			return
+		}
+		_ = target.packetConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		n, from, err := target.packetConn.ReadFrom(buf)
+		if err != nil {
+			if _, deleted := session.targets.LoadAndDelete(targetAddr); deleted {
+				session.targetCount.Add(-1)
+			}
+			_ = target.Close()
+			return
+		}
+
+		fromAddr, ok := from.(*net.IPAddr)
+		if !ok || !fromAddr.IP.Equal(target.targetIP) {
+			continue
+		}
+		payload, ok := target.tracker.RestoreReply(buf[:n], target.targetIP.To4() == nil)
+		if !ok {
+			continue
+		}
+
+		session.lastActive.Store(time.Now().Unix())
+		encrypted, err := session.codec.EncodePacket(nil, plainudp.DirServerToClient, session.sessionID, targetAddr, payload, time.Now())
+		if err != nil {
+			continue
+		}
+
+		clientAddr := session.clientAddr.Load()
+		if clientAddr != nil {
+			_, _ = s.conn.WriteToUDP(encrypted, clientAddr)
+		}
+	}
 }
 
 func (s *PlainUDPServer) listenUpstream(ctx context.Context, session *plainUDPSession, targetAddr string, upstreamConn *net.UDPConn) {
@@ -372,7 +522,9 @@ func (s *PlainUDPServer) cleaner(ctx context.Context) {
 				session := value.(*plainUDPSession)
 				if now-session.lastActive.Load() > 60 {
 					session.targets.Range(func(tKey, tVal any) bool {
-						_ = tVal.(*net.UDPConn).Close()
+						if closer, ok := tVal.(io.Closer); ok {
+							_ = closer.Close()
+						}
 						session.targets.Delete(tKey)
 						return true
 					})
@@ -408,7 +560,9 @@ func (s *PlainUDPServer) closeSessions() {
 	s.sessions.Range(func(key, value any) bool {
 		session := value.(*plainUDPSession)
 		session.targets.Range(func(tKey, tVal any) bool {
-			_ = tVal.(*net.UDPConn).Close()
+			if closer, ok := tVal.(io.Closer); ok {
+				_ = closer.Close()
+			}
 			return true
 		})
 		s.sessions.Delete(key)

@@ -62,6 +62,31 @@ func ResolveUDPAddr(ctx context.Context, address string) (*net.UDPAddr, error) {
 	return nil, ErrForbidden
 }
 
+// ResolveICMPIP resolves one ICMP destination and applies the same public-target
+// policy as TCP and UDP unless private targets were explicitly enabled.
+func ResolveICMPIP(ctx context.Context, host string, allowPrivate bool) (net.IP, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		if !allowPrivate && !allowed(ip) {
+			return nil, ErrForbidden
+		}
+		if !ip.IsGlobalUnicast() && !ip.IsLoopback() {
+			return nil, ErrForbidden
+		}
+		return ip, nil
+	}
+	resolver := net.Resolver{}
+	addresses, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	for _, candidate := range addresses {
+		if (allowPrivate || allowed(candidate.IP)) && (candidate.IP.IsGlobalUnicast() || candidate.IP.IsLoopback()) {
+			return candidate.IP, nil
+		}
+	}
+	return nil, ErrForbidden
+}
+
 func resolve(ctx context.Context, address string) (string, string, []net.IPAddr, error) {
 	host, portText, err := net.SplitHostPort(address)
 	if err != nil {

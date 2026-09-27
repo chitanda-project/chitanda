@@ -44,6 +44,7 @@ type InboundHandler struct {
 	replays      *auth.ReplayCache
 	userReplays  []udpReplayRegistry
 	dispatcher   routing.Dispatcher
+	dialICMP     func(ctx context.Context, address string) (net.PacketConn, error)
 	ctx          context.Context
 	cancel       context.CancelFunc
 	httpSlots    chan struct{}
@@ -164,6 +165,18 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 	srv.SetDialUDP(func(ctx context.Context, address string) (net.Conn, error) {
 		return dialTargetFn(ctx, "udp", address)
 	})
+	dialICMPFn := func(ctx context.Context, address string) (net.PacketConn, error) {
+		ip := net.ParseIP(address)
+		network := "ip4:icmp"
+		listenAddr := "0.0.0.0"
+		if ip != nil && ip.To4() == nil {
+			network = "ip6:ipv6-icmp"
+			listenAddr = "::"
+		}
+		return net.ListenPacket(network, listenAddr)
+	}
+	srv.SetDialICMP(dialICMPFn)
+	streamSrv.SetDialICMP(dialICMPFn)
 
 	var userCodecs []*server.PlainUDPCodec
 	var userReplays []udpReplayRegistry
@@ -215,6 +228,7 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 		replays:      replays,
 		userReplays:  userReplays,
 		dispatcher:   dispatcher,
+		dialICMP:     dialICMPFn,
 		ctx:          inCtx,
 		cancel:       inCancel,
 		httpSlots:    make(chan struct{}, 1024),
@@ -412,7 +426,7 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 		return fmt.Errorf("chitanda: plain-udp not initialized for transport %q", h.config.Transport)
 	}
 
-	routes := newUDPRoutes(ctx, dispatcher, userCodecs, conn)
+	routes := newUDPRoutes(ctx, dispatcher, userCodecs, conn, h.dialICMP)
 	defer routes.Close()
 
 	reader := newFullPacketReader(conn)
@@ -434,6 +448,12 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 				if matchedIdx < 0 || matchedIdx >= len(userReplays) || !userReplays[matchedIdx].accept(sessionID, seq, time.Now()) {
 					payload.Release()
 					continue // drop replayed packet across any connection/association!
+				}
+
+				if strings.HasPrefix(targetAddr, "icmp:") {
+					payload.Release()
+					_ = routes.WriteICMP(ctx, matchedIdx, sessionID, targetAddr, rawData)
+					continue
 				}
 
 				dest, err := xnet.ParseDestination("udp:" + targetAddr)

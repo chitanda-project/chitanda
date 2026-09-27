@@ -22,6 +22,24 @@ def patch_udp_sender_capacity(mihomo_dir):
     print(f"  [+] Patched {tunnel_go} UDP sender capacity for cold H3 associations")
 
 
+def patch_tun_icmp_route(mihomo_dir):
+    prepare_go = os.path.join(mihomo_dir, "listener", "sing_tun", "prepare.go")
+    with open(prepare_go, "r", encoding="utf-8") as f:
+        content = f.read()
+    original = '\t\tlog.Infoln("[ICMP] %s %s --> %s using DIRECT", network, source, destination)'
+    patched = (
+        '\t\tif action, handled, err := h.prepareChitandaICMP(source.Addr, destination.Addr, routeContext, timeout); handled {\n'
+        '\t\t\treturn action, err\n'
+        '\t\t}\n' + original
+    )
+    if content.count(patched) == 1:
+        return
+    if content.count(original) != 1:
+        raise RuntimeError(f"unexpected Mihomo ICMP route in {prepare_go}")
+    with open(prepare_go, "w", encoding="utf-8") as f:
+        f.write(content.replace(original, patched, 1))
+
+
 def inject_mihomo(mihomo_dir, chitanda_dir):
     print(f"[*] Injecting Chitanda adapter into Mihomo: {mihomo_dir}")
     patch_udp_sender_capacity(mihomo_dir)
@@ -38,6 +56,16 @@ def inject_mihomo(mihomo_dir, chitanda_dir):
     for fname in sorted(os.listdir(os.path.dirname(src_adapter))):
         if fname.endswith("_test.go"):
             shutil.copy2(os.path.join(os.path.dirname(src_adapter), fname), os.path.join(adapter_dir, fname))
+    for src, dst in (
+        (os.path.join(chitanda_dir, "integration", "mihomo_tunnel", "chitanda_icmp.go"),
+         os.path.join(mihomo_dir, "tunnel", "chitanda_icmp.go")),
+        (os.path.join(chitanda_dir, "integration", "mihomo_sing_tun", "chitanda_icmp.go"),
+         os.path.join(mihomo_dir, "listener", "sing_tun", "chitanda_icmp.go")),
+        (os.path.join(chitanda_dir, "integration", "mihomo_sing_tun", "chitanda_icmp_test.go"),
+         os.path.join(mihomo_dir, "listener", "sing_tun", "chitanda_icmp_test.go")),
+    ):
+        shutil.copy2(src, dst)
+    patch_tun_icmp_route(mihomo_dir)
     src_tests = os.path.join(chitanda_dir, "integration", "mihomo_config")
     if os.path.isdir(src_tests):
         for fname in sorted(os.listdir(src_tests)):

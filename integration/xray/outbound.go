@@ -2,6 +2,7 @@ package chitanda
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/violetaini/chitanda/pkg/client"
+	icmpmsg "github.com/violetaini/chitanda/pkg/icmp"
 	"github.com/violetaini/chitanda/pkg/plugin/autoscaler"
 
 	"github.com/xtls/xray-core/common"
@@ -313,11 +315,15 @@ func (h *OutboundHandler) processUDP(ctx context.Context, link *transport.Link, 
 						if b.UDP != nil && b.UDP.IsValid() {
 							addr = packetAddress(b.UDP.NetAddr())
 						}
+						addr, writeErr = icmpAddressForPacket(addr, b.Bytes())
+						if writeErr != nil {
+							break
+						}
 						payloads = append(payloads, b.Bytes())
 						addrs = append(addrs, addr)
 					}
 				}
-				if len(payloads) > 0 {
+				if len(payloads) > 0 && writeErr == nil {
 					writeErr = batchConn.WriteBatch(payloads, addrs)
 				}
 			} else {
@@ -325,6 +331,10 @@ func (h *OutboundHandler) processUDP(ctx context.Context, link *transport.Link, 
 					addr := target
 					if b.UDP != nil && b.UDP.IsValid() {
 						addr = packetAddress(b.UDP.NetAddr())
+					}
+					addr, writeErr = icmpAddressForPacket(addr, b.Bytes())
+					if writeErr != nil {
+						break
 					}
 					if _, writeErr = pconn.WriteTo(b.Bytes(), addr); writeErr != nil {
 						break
@@ -368,6 +378,9 @@ func (h *OutboundHandler) processUDP(ctx context.Context, link *transport.Link, 
 				}
 				dest := lastDest
 				b.UDP = &dest
+			} else if icmpAddr, ok := from.(*client.ICMPAddr); ok && icmpAddr.IP != nil {
+				dest := xnet.UDPDestination(xnet.IPAddress(icmpAddr.IP), xnet.Port(0))
+				b.UDP = &dest
 			} else if dest, err := xnet.ParseDestination("udp:" + from.String()); err == nil {
 				b.UDP = &dest
 			}
@@ -389,6 +402,26 @@ func (h *OutboundHandler) processUDP(ctx context.Context, link *transport.Link, 
 		return nil
 	}
 	return downloadErr
+}
+
+// Xray has no ICMP network enum; an explicitly addressed UDP port zero carrying
+// a valid Echo Request is the Chitanda ICMP convention.
+func icmpAddressForPacket(addr net.Addr, payload []byte) (net.Addr, error) {
+	if addr == nil {
+		return nil, errors.New("missing datagram destination")
+	}
+	host, port, err := net.SplitHostPort(addr.String())
+	if err != nil || port != "0" {
+		return addr, nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return nil, fmt.Errorf("ICMP destination must be an IP address: %q", host)
+	}
+	if err := icmpmsg.ValidateEchoRequest(payload, ip.To4() == nil); err != nil {
+		return nil, err
+	}
+	return &client.ICMPAddr{IP: ip}, nil
 }
 
 func (h *OutboundHandler) Close() error {

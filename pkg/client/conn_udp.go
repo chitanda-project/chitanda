@@ -487,9 +487,17 @@ func (c *rawH3Conn) SetWriteDeadline(t time.Time) error {
 	return c.stream.SetWriteDeadline(t)
 }
 
+type packetStream interface {
+	SendDatagram([]byte) error
+	ReceiveDatagram(context.Context) ([]byte, error)
+	CancelRead(quic.StreamErrorCode)
+	CancelWrite(quic.StreamErrorCode)
+	Close() error
+}
+
 // quicPacketConn wraps HTTP/3 extended CONNECT-UDP + Datagrams into standard net.PacketConn.
 type quicPacketConn struct {
-	stream        *http3.RequestStream
+	stream        packetStream
 	ctx           context.Context
 	cancel        context.CancelFunc
 	manager       *h3TransportManager
@@ -570,7 +578,7 @@ func (c *quicPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 }
 
 func (c *quicPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	address := addr.String()
+	address := formatDatagramAddress(addr)
 	packet, err := frame.EncodeDatagram(c.sequence.Add(1), address, p)
 	if err != nil {
 		return 0, err
@@ -588,7 +596,7 @@ func (c *quicPacketConn) WriteBatch(payloads [][]byte, addrs []net.Addr) error {
 		return nil
 	}
 	if len(payloads) == 1 {
-		address := addrs[0].String()
+		address := formatDatagramAddress(addrs[0])
 		packet, err := frame.EncodeDatagram(c.sequence.Add(1), address, payloads[0])
 		if err != nil {
 			return err
@@ -600,7 +608,7 @@ func (c *quicPacketConn) WriteBatch(payloads [][]byte, addrs []net.Addr) error {
 
 	frames := make([][]byte, len(payloads))
 	for i, p := range payloads {
-		address := addrs[i].String()
+		address := formatDatagramAddress(addrs[i])
 		packet, err := frame.EncodeDatagram(c.sequence.Add(1), address, p)
 		if err != nil {
 			return err

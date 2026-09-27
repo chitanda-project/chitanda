@@ -110,15 +110,17 @@ func ContextWithUser(ctx context.Context, user *UserKey) context.Context {
 
 // Server implements the my_xray inbound handler
 type Server struct {
-	path            string
-	psk             []byte
-	users           []UserKey
-	pskList         [][]byte
-	replays         *auth.ReplayCache
-	fallback        http.Handler
-	udpTargetBuffer int
-	dialTarget      func(ctx context.Context, address string) (net.Conn, error)
-	dialUDP         func(ctx context.Context, address string) (net.Conn, error)
+	path             string
+	psk              []byte
+	users            []UserKey
+	pskList          [][]byte
+	replays          *auth.ReplayCache
+	fallback         http.Handler
+	udpTargetBuffer  int
+	dialTarget       func(ctx context.Context, address string) (net.Conn, error)
+	dialUDP          func(ctx context.Context, address string) (net.Conn, error)
+	dialICMP         func(ctx context.Context, address string) (net.PacketConn, error)
+	allowPrivateICMP bool
 }
 
 // NewServer creates a new Server instance with a single PSK.
@@ -169,6 +171,17 @@ func (s *Server) SetDialTargetForTest(fn func(ctx context.Context, address strin
 // cores. Configure before serving. No direct socket/DNS fallback is used when set.
 func (s *Server) SetDialUDP(fn func(context.Context, string) (net.Conn, error)) {
 	s.dialUDP = fn
+}
+
+// SetDialICMP installs a packet-preserving ICMP packet dialer/listener. Configure before serving.
+func (s *Server) SetDialICMP(fn func(ctx context.Context, address string) (net.PacketConn, error)) {
+	s.dialICMP = fn
+}
+
+// SetAllowPrivateICMPTargets mirrors the explicit private-target override used
+// by the standalone TCP and UDP listeners. Configure before serving.
+func (s *Server) SetAllowPrivateICMPTargets(allow bool) {
+	s.allowPrivateICMP = allow
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
