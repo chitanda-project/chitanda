@@ -1,3 +1,4 @@
+// Package outbound implements the Chitanda protocol outbound adapter for Mihomo with native ICMP relay and UDP forwarding.
 package outbound
 
 import (

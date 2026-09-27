@@ -31,3 +31,7 @@ still takes precedence.
 For H2/auto clients, the ICMP datagram path uses the H3 UDP listener. The H3
 listener must be reachable at the configured node address/port even when TCP
 traffic uses H2. Stream and H1 use the plain-UDP listener.
+
+For intermediate L4 forwarders (such as IEPL port-forwarding with realm),
+ensure UDP forwarding is enabled alongside TCP for the node port so that
+Chitanda datagrams (UDP and ICMP) are seamlessly relayed to the landing server.
