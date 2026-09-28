@@ -16,11 +16,13 @@ def patch_udp_sender_queue(mihomo_dir):
 
     orig_qcap = "\tqueueCapacity  = 64  // chan capacity tcpQueue and udpQueue"
     patched_qcap = "\tqueueCapacity  = 2048 // chan capacity tcpQueue and udpQueue"
-    if orig_qcap in content:
+    if content.count(orig_qcap) == 1:
         content = content.replace(orig_qcap, patched_qcap, 1)
         with open(tunnel_go, "w", encoding="utf-8") as f:
             f.write(content)
         print(f"  [+] Patched {tunnel_go} queueCapacity=2048")
+    elif content.count(patched_qcap) != 1:
+        raise RuntimeError(f"unexpected Mihomo UDP ingress queue capacity in {tunnel_go}")
 
     connection_go = os.path.join(mihomo_dir, "tunnel", "connection.go")
     with open(connection_go, "r", encoding="utf-8") as f:
@@ -69,6 +71,30 @@ def patch_udp_sender_queue(mihomo_dir):
     print(f"  [+] Patched {connection_go} with bounded lazy UDP queue and batch drainage")
 
 
+def patch_udp_tracker_batch_accounting(mihomo_dir):
+    tracker_go = os.path.join(mihomo_dir, "tunnel", "statistic", "tracker.go")
+    with open(tracker_go, "r", encoding="utf-8") as f:
+        content = f.read()
+    anchor = "func (ut *udpTracker) Close() error {"
+    method = (
+        "// RecordChitandaBatchUpload accounts bytes sent by the Chitanda batch path.\n"
+        "// That path bypasses WriteTo but must preserve the tracker's accounting.\n"
+        "func (ut *udpTracker) RecordChitandaBatchUpload(n int) {\n"
+        "\tif n <= 0 { return }\n"
+        "\tupload := int64(n)\n"
+        "\tif ut.pushToManager { ut.manager.PushUploaded(upload) }\n"
+        "\tut.UploadTotal.Add(upload)\n"
+        "}\n\n"
+    )
+    if content.count(method) == 1:
+        return
+    if content.count(anchor) != 1 or "func (ut *udpTracker) RecordChitandaBatchUpload(" in content:
+        raise RuntimeError(f"unexpected Mihomo UDP tracker implementation in {tracker_go}")
+    with open(tracker_go, "w", encoding="utf-8") as f:
+        f.write(content.replace(anchor, method + anchor, 1))
+    print(f"  [+] Patched {tracker_go} with batch upload accounting")
+
+
 def patch_tun_icmp_route(mihomo_dir):
     prepare_go = os.path.join(mihomo_dir, "listener", "sing_tun", "prepare.go")
     with open(prepare_go, "r", encoding="utf-8") as f:
@@ -110,6 +136,7 @@ def patch_tun_icmp_rule_selection(mihomo_dir):
 def inject_mihomo(mihomo_dir, chitanda_dir):
     print(f"[*] Injecting Chitanda adapter into Mihomo: {mihomo_dir}")
     patch_udp_sender_queue(mihomo_dir)
+    patch_udp_tracker_batch_accounting(mihomo_dir)
     patch_tun_icmp_rule_selection(mihomo_dir)
     adapter_dir = os.path.join(mihomo_dir, "adapter", "outbound")
     constant_dir = os.path.join(mihomo_dir, "constant")

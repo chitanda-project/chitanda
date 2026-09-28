@@ -9,6 +9,7 @@ import (
 	"time"
 
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/tunnel/statistic"
 )
 
 type chitandaQueueTestPacket struct {
@@ -17,12 +18,13 @@ type chitandaQueueTestPacket struct {
 	dropped atomic.Int32
 }
 
-func (p *chitandaQueueTestPacket) Drop() { p.dropped.Add(1) }
+func (p *chitandaQueueTestPacket) Drop()        { p.dropped.Add(1) }
+func (p *chitandaQueueTestPacket) Data() []byte { return nil }
 
 func TestChitandaQueueGrowsOnlyOnBurstAndPreservesFIFO(t *testing.T) {
 	q := newChitandaPacketQueue()
-	if got := len(q.items); got != senderCapacity {
-		t.Fatalf("initial capacity = %d, want %d", got, senderCapacity)
+	if got := len(q.items); got != chitandaSenderInitialCapacity {
+		t.Fatalf("initial capacity = %d, want %d", got, chitandaSenderInitialCapacity)
 	}
 	packets := make([]*chitandaQueueTestPacket, 500)
 	for i := range packets {
@@ -40,7 +42,7 @@ func TestChitandaQueueGrowsOnlyOnBurstAndPreservesFIFO(t *testing.T) {
 	if q.pop() != nil {
 		t.Fatal("queue should be empty")
 	}
-	if got := len(q.items); got != senderCapacity {
+	if got := len(q.items); got != chitandaSenderInitialCapacity {
 		t.Fatalf("drained queue retained burst allocation: %d", got)
 	}
 	q.close()
@@ -151,14 +153,34 @@ type mockBatchPacketConn struct {
 	addrs   [][]net.Addr
 }
 
-func (m *mockBatchPacketConn) WriteBatch(payloads [][]byte, addrs []net.Addr) error {
+func (m *mockBatchPacketConn) ChitandaBatchWrite(payloads [][]byte, addrs []net.Addr) (int, error) {
 	m.batches = append(m.batches, payloads)
 	m.addrs = append(m.addrs, addrs)
-	return nil
+	var written int
+	for _, payload := range payloads {
+		written += len(payload)
+	}
+	return written, nil
 }
+
+func (*mockBatchPacketConn) RemoteDestination() string { return "example.org" }
+func (*mockBatchPacketConn) Chains() C.Chain           { return nil }
+func (*mockBatchPacketConn) ProviderChains() C.Chain   { return nil }
+func (*mockBatchPacketConn) Close() error              { return nil }
 
 func (m *mockBatchPacketConn) SetReadDeadline(t time.Time) error {
 	return nil
+}
+
+type mockUnaccountedUpstream struct{ C.PacketConn }
+
+func (w *mockUnaccountedUpstream) Upstream() any { return w.PacketConn }
+
+func TestChitandaSenderDoesNotBypassUnknownWrapper(t *testing.T) {
+	wrapped := &mockUnaccountedUpstream{PacketConn: &mockBatchPacketConn{}}
+	if got := unwrapBatchWriter(wrapped); got != nil {
+		t.Fatal("batch writer bypassed an unaccounted wrapper")
+	}
 }
 
 type mockDrainPacket struct {
@@ -168,9 +190,9 @@ type mockDrainPacket struct {
 	dropped  atomic.Int32
 }
 
-func (p *mockDrainPacket) Data() []byte { return p.data }
+func (p *mockDrainPacket) Data() []byte          { return p.data }
 func (p *mockDrainPacket) Metadata() *C.Metadata { return p.metadata }
-func (p *mockDrainPacket) Drop() { p.dropped.Add(1) }
+func (p *mockDrainPacket) Drop()                 { p.dropped.Add(1) }
 
 func TestChitandaSenderDrainBatch(t *testing.T) {
 	sender := newPacketSender().(*packetSender)
@@ -207,5 +229,84 @@ func TestChitandaSenderDrainBatch(t *testing.T) {
 	}
 	if sender.ch.length != 0 {
 		t.Fatalf("expected empty queue after drain, got %d", sender.ch.length)
+	}
+}
+
+func TestChitandaSenderBatchPreservesTrackerAccounting(t *testing.T) {
+	sender := newPacketSender().(*packetSender)
+	mockPC := &mockBatchPacketConn{}
+	meta := &C.Metadata{NetWork: C.UDP, DstIP: netip.MustParseAddr("1.2.3.4"), DstPort: 1234}
+	tracked := statistic.NewUDPTracker(mockPC, statistic.DefaultManager, meta, nil, 0, 0, true)
+	for i := 0; i < 2; i++ {
+		sender.ch.push(&mockDrainPacket{data: []byte{1, 2, 3}, metadata: meta})
+	}
+	sender.drainBatch(tracked, nil)
+	if len(mockPC.batches) != 1 || len(mockPC.batches[0]) != 2 {
+		t.Fatalf("batch not sent: %v", mockPC.batches)
+	}
+	if got := tracked.Info().UploadTotal.Load(); got != 6 {
+		t.Fatalf("tracked upload = %d, want 6", got)
+	}
+	_ = tracked.Close()
+}
+
+func TestChitandaQueueGlobalByteBudgetReleasesOnPopAndClose(t *testing.T) {
+	q := newChitandaPacketQueue()
+	q.budget = &chitandaQueueBudget{limit: 2048}
+	first := &mockDrainPacket{data: make([]byte, 900)}
+	second := &mockDrainPacket{data: make([]byte, 900)}
+	q.push(first)
+	q.push(second)
+	if second.dropped.Load() != 1 || q.length != 1 {
+		t.Fatalf("global byte limit not enforced: length=%d dropped=%d", q.length, second.dropped.Load())
+	}
+	if q.pop() != first || q.budget.used.Load() != 0 {
+		t.Fatal("pop did not release queued bytes")
+	}
+	q.push(second)
+	if q.length != 1 {
+		t.Fatal("budget was not reusable after pop")
+	}
+	q.close()
+	if q.budget.used.Load() != 0 {
+		t.Fatal("close did not release queued bytes")
+	}
+}
+
+func TestChitandaQueueGlobalByteBudgetSharedAcrossFlows(t *testing.T) {
+	budget := &chitandaQueueBudget{limit: 2048}
+	first := newChitandaPacketQueue()
+	second := newChitandaPacketQueue()
+	first.budget, second.budget = budget, budget
+	first.push(&mockDrainPacket{data: make([]byte, 900)})
+	blocked := &mockDrainPacket{data: make([]byte, 900)}
+	second.push(blocked)
+	if blocked.dropped.Load() != 1 || second.length != 0 {
+		t.Fatal("separate flows exceeded the shared budget")
+	}
+	first.close()
+	second.push(&mockDrainPacket{data: make([]byte, 900)})
+	if second.length != 1 {
+		t.Fatal("closing one flow did not release shared budget")
+	}
+	second.close()
+	if budget.used.Load() != 0 {
+		t.Fatal("shared budget leaked after closing both flows")
+	}
+}
+
+func TestChitandaQueuePerFlowByteLimit(t *testing.T) {
+	q := newChitandaPacketQueue()
+	q.budget = &chitandaQueueBudget{limit: chitandaSenderGlobalBytes}
+	first := &mockDrainPacket{data: make([]byte, 2<<20)}
+	second := &mockDrainPacket{data: make([]byte, 2<<20)}
+	q.push(first)
+	q.push(second)
+	if second.dropped.Load() != 1 || q.length != 1 {
+		t.Fatalf("per-flow byte limit not enforced: length=%d dropped=%d", q.length, second.dropped.Load())
+	}
+	q.close()
+	if q.budget.used.Load() != 0 {
+		t.Fatal("per-flow close leaked global budget")
 	}
 }

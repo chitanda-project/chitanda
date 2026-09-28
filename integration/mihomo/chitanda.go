@@ -231,28 +231,51 @@ func (c *chitandaICMPPacketConn) Upstream() any {
 	return c.PacketConn
 }
 
-func (c *chitandaICMPPacketConn) WriteBatch(payloads [][]byte, addrs []net.Addr) error {
+// ChitandaBatchWrite is deliberately implemented only by this adapter. The
+// tunnel must not batch through arbitrary Upstream wrappers, which may enforce
+// their own accounting or write policy.
+func (c *chitandaICMPPacketConn) ChitandaBatchWrite(payloads [][]byte, addrs []net.Addr) (int, error) {
+	if len(payloads) != len(addrs) {
+		return 0, errors.New("chitanda: batch payload/address count mismatch")
+	}
+	if len(payloads) == 0 {
+		return 0, nil
+	}
 	for _, addr := range addrs {
 		if target, ok := addr.(*net.UDPAddr); ok && target.Port == 0 {
-			for i, p := range payloads {
-				if _, err := c.WriteTo(p, addrs[i]); err != nil {
-					return err
-				}
-			}
-			return nil
+			return c.writeBatchIndividually(payloads, addrs)
 		}
 	}
 	if bw, ok := c.PacketConn.(interface {
 		WriteBatch([][]byte, []net.Addr) error
 	}); ok {
-		return bw.WriteBatch(payloads, addrs)
+		if err := bw.WriteBatch(payloads, addrs); err != nil {
+			return 0, err
+		}
+		var written int
+		for _, payload := range payloads {
+			written += len(payload)
+		}
+		return written, nil
 	}
+	return c.writeBatchIndividually(payloads, addrs)
+}
+
+func (c *chitandaICMPPacketConn) writeBatchIndividually(payloads [][]byte, addrs []net.Addr) (int, error) {
+	var written int
 	for i, payload := range payloads {
-		if _, err := c.WriteTo(payload, addrs[i]); err != nil {
-			return err
+		n, err := c.WriteTo(payload, addrs[i])
+		written += n
+		if err != nil {
+			return written, err
 		}
 	}
-	return nil
+	return written, nil
+}
+
+func (c *chitandaICMPPacketConn) WriteBatch(payloads [][]byte, addrs []net.Addr) error {
+	_, err := c.ChitandaBatchWrite(payloads, addrs)
+	return err
 }
 
 func (c *chitandaICMPPacketConn) WriteTo(packet []byte, addr net.Addr) (int, error) {

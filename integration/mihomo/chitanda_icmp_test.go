@@ -55,3 +55,20 @@ func TestMihomoICMPPortZeroMapsToProtocolAddress(t *testing.T) {
 		t.Fatal("invalid ICMP payload was accepted")
 	}
 }
+
+func TestMihomoChitandaBatchWriteCountsAndValidates(t *testing.T) {
+	underlying := &auditPacketSocket{}
+	conn := &chitandaICMPPacketConn{PacketConn: underlying}
+	request := []byte{8, 0, 0xf7, 0xff, 0, 0, 0, 0}
+	addrs := []net.Addr{
+		&net.UDPAddr{IP: net.IPv4(8, 8, 8, 8), Port: 0},
+		&net.UDPAddr{IP: net.IPv4(1, 1, 1, 1), Port: 53},
+	}
+	written, err := conn.ChitandaBatchWrite([][]byte{request, []byte("dns")}, addrs)
+	if err != nil || written != len(request)+3 {
+		t.Fatalf("batch write: bytes=%d err=%v", written, err)
+	}
+	if written, err = conn.ChitandaBatchWrite([][]byte{request}, addrs); err == nil || written != 0 {
+		t.Fatalf("mismatched batch accepted: bytes=%d err=%v", written, err)
+	}
+}

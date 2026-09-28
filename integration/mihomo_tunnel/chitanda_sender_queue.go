@@ -4,21 +4,58 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 )
 
-// chitandaPacketQueue keeps the original small per-flow allocation and grows
-// only when a cold outbound association actually accumulates a burst.
-// Sized to 8192 to match quic-go's datagram send queue and absorb high-throughput cold starts.
+// The packet-count limit protects one association; byte limits also protect a
+// router when many associations are waiting for an outbound handshake.
+const chitandaSenderInitialCapacity = 32
 const chitandaSenderMaxCapacity = 8192
 const chitandaSenderMaxAge = 3 * time.Second
+const chitandaSenderMaxFlowBytes int64 = 4 << 20
+const chitandaSenderGlobalBytes int64 = 64 << 20
+const chitandaSenderPacketOverhead int64 = 128
+
+type chitandaQueueBudget struct {
+	used  atomic.Int64
+	limit int64
+}
+
+var chitandaGlobalQueueBudget = &chitandaQueueBudget{limit: chitandaSenderGlobalBytes}
+
+func (b *chitandaQueueBudget) reserve(size int64) bool {
+	for {
+		used := b.used.Load()
+		if size > b.limit-used {
+			return false
+		}
+		if b.used.CompareAndSwap(used, used+size) {
+			return true
+		}
+	}
+}
+
+func (b *chitandaQueueBudget) release(size int64) {
+	b.used.Add(-size)
+}
+
+func chitandaPacketSize(packet C.PacketAdapter) int64 {
+	data := packet.Data()
+	size := len(data)
+	if cap(data) > size {
+		size = cap(data)
+	}
+	return int64(size) + chitandaSenderPacketOverhead
+}
 
 type chitandaQueuedPacket struct {
 	packet C.PacketAdapter
 	added  time.Time
+	size   int64
 }
 
 type chitandaPacketQueue struct {
@@ -26,15 +63,18 @@ type chitandaPacketQueue struct {
 	items        []chitandaQueuedPacket
 	head         int
 	length       int
+	bytes        int64
 	closed       bool
 	ready        chan struct{}
 	lastDeadline time.Time
+	budget       *chitandaQueueBudget
 }
 
 func newChitandaPacketQueue() *chitandaPacketQueue {
 	return &chitandaPacketQueue{
-		items: make([]chitandaQueuedPacket, senderCapacity),
-		ready: make(chan struct{}, 1),
+		items:  make([]chitandaQueuedPacket, chitandaSenderInitialCapacity),
+		ready:  make(chan struct{}, 1),
+		budget: chitandaGlobalQueueBudget,
 	}
 }
 
@@ -47,6 +87,7 @@ func (q *chitandaPacketQueue) signal() {
 
 func (q *chitandaPacketQueue) push(packet C.PacketAdapter) {
 	now := time.Now()
+	size := chitandaPacketSize(packet)
 	q.mu.Lock()
 	if q.closed {
 		q.mu.Unlock()
@@ -62,9 +103,19 @@ func (q *chitandaPacketQueue) push(packet C.PacketAdapter) {
 			return
 		}
 		expired = oldest.packet
+		q.bytes -= oldest.size
+		q.budget.release(oldest.size)
 		q.items[q.head] = chitandaQueuedPacket{}
 		q.head = (q.head + 1) % len(q.items)
 		q.length--
+	}
+	if size > chitandaSenderMaxFlowBytes-q.bytes || !q.budget.reserve(size) {
+		q.mu.Unlock()
+		packet.Drop()
+		if expired != nil {
+			expired.Drop()
+		}
+		return
 	}
 	if q.length == len(q.items) {
 		capacity := len(q.items) * 2
@@ -77,8 +128,9 @@ func (q *chitandaPacketQueue) push(packet C.PacketAdapter) {
 		}
 		q.items, q.head = grown, 0
 	}
-	q.items[(q.head+q.length)%len(q.items)] = chitandaQueuedPacket{packet: packet, added: now}
+	q.items[(q.head+q.length)%len(q.items)] = chitandaQueuedPacket{packet: packet, added: now, size: size}
 	q.length++
+	q.bytes += size
 	q.signal()
 	q.mu.Unlock()
 	if expired != nil {
@@ -97,10 +149,12 @@ func (q *chitandaPacketQueue) pop() C.PacketAdapter {
 		q.items[q.head] = chitandaQueuedPacket{}
 		q.head = (q.head + 1) % len(q.items)
 		q.length--
+		q.bytes -= item.size
+		q.budget.release(item.size)
 		if q.length > 0 {
 			q.signal()
-		} else if len(q.items) > senderCapacity {
-			q.items = make([]chitandaQueuedPacket, senderCapacity)
+		} else if len(q.items) > chitandaSenderInitialCapacity {
+			q.items = make([]chitandaQueuedPacket, chitandaSenderInitialCapacity)
 			q.head = 0
 		}
 		q.mu.Unlock()
@@ -133,6 +187,8 @@ func (q *chitandaPacketQueue) popBatch(max int) []C.PacketAdapter {
 			q.items[q.head] = chitandaQueuedPacket{}
 			q.head = (q.head + 1) % len(q.items)
 			q.length--
+			q.bytes -= item.size
+			q.budget.release(item.size)
 			if now.Sub(item.added) <= chitandaSenderMaxAge {
 				batch = append(batch, item.packet)
 			} else {
@@ -141,8 +197,8 @@ func (q *chitandaPacketQueue) popBatch(max int) []C.PacketAdapter {
 		}
 		if q.length > 0 {
 			q.signal()
-		} else if len(q.items) > senderCapacity {
-			q.items = make([]chitandaQueuedPacket, senderCapacity)
+		} else if len(q.items) > chitandaSenderInitialCapacity {
+			q.items = make([]chitandaQueuedPacket, chitandaSenderInitialCapacity)
 			q.head = 0
 		}
 		q.mu.Unlock()
@@ -160,7 +216,10 @@ func (q *chitandaPacketQueue) close() {
 	q.closed = true
 	items := make([]C.PacketAdapter, 0, q.length)
 	for q.length > 0 {
-		items = append(items, q.items[q.head].packet)
+		item := q.items[q.head]
+		items = append(items, item.packet)
+		q.bytes -= item.size
+		q.budget.release(item.size)
 		q.items[q.head] = chitandaQueuedPacket{}
 		q.head = (q.head + 1) % len(q.items)
 		q.length--
@@ -173,24 +232,23 @@ func (q *chitandaPacketQueue) close() {
 }
 
 type batchPacketWriter interface {
-	WriteBatch(payloads [][]byte, addrs []net.Addr) error
+	ChitandaBatchWrite(payloads [][]byte, addrs []net.Addr) (int, error)
 }
 
 func unwrapBatchWriter(pc any) batchPacketWriter {
-	for {
-		if bw, ok := pc.(batchPacketWriter); ok {
-			return bw
-		}
-		if u, ok := pc.(interface{ Upstream() any }); ok {
-			pc = u.Upstream()
-			continue
-		}
-		if u, ok := pc.(interface{ Unwrap() any }); ok {
-			pc = u.Unwrap()
-			continue
-		}
+	if bw, ok := pc.(batchPacketWriter); ok {
+		return bw
+	}
+	// Only bypass the tracker we explicitly account for. Walking arbitrary
+	// wrapper chains could skip a policy or a second accounting layer.
+	if _, ok := pc.(interface{ RecordChitandaBatchUpload(int) }); !ok {
 		return nil
 	}
+	if u, ok := pc.(interface{ Upstream() any }); ok {
+		bw, _ := u.Upstream().(batchPacketWriter)
+		return bw
+	}
+	return nil
 }
 
 func (s *packetSender) resolveTargetAddr(pc C.PacketConn, packet C.PacketAdapter) *net.UDPAddr {
@@ -247,7 +305,10 @@ func (s *packetSender) drainBatch(pc C.PacketConn, proxy C.WriteBackProxy) {
 			}
 		}
 		if len(payloads) > 0 {
-			_ = bw.WriteBatch(payloads, addrs)
+			written, _ := bw.ChitandaBatchWrite(payloads, addrs)
+			if recorder, ok := pc.(interface{ RecordChitandaBatchUpload(int) }); ok && written > 0 {
+				recorder.RecordChitandaBatchUpload(written)
+			}
 		}
 	} else {
 		for _, packet := range packets {

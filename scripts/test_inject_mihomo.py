@@ -16,7 +16,8 @@ class PatchUDPSenderQueueTest(unittest.TestCase):
         tunnel_dir = Path(root) / "tunnel"
         tunnel_dir.mkdir()
         (tunnel_dir / "tunnel.go").write_text(
-            f"\tsenderCapacity = {capacity} // chan capacity of PacketSender\n", encoding="utf-8"
+            f"\tsenderCapacity = {capacity} // chan capacity of PacketSender\n"
+            "\tqueueCapacity  = 64  // chan capacity tcpQueue and udpQueue\n", encoding="utf-8"
         )
         (tunnel_dir / "connection.go").write_text(
             "\tch     chan C.PacketAdapter\n"
@@ -68,6 +69,31 @@ class PatchUDPSenderQueueTest(unittest.TestCase):
             conn_text = (tunnel_dir / "connection.go").read_text(encoding="utf-8")
             self.assertIn("s.drainBatch(pc, proxy)", conn_text)
             self.assertIn("ch := newChitandaPacketQueue()", conn_text)
+
+    def test_rejects_changed_udp_ingress_capacity(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.write_upstream(root)
+            tunnel = Path(root) / "tunnel" / "tunnel.go"
+            tunnel.write_text(tunnel.read_text(encoding="utf-8").replace("queueCapacity  = 64", "queueCapacity  = 128"), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "unexpected Mihomo UDP ingress queue capacity"):
+                inject_mihomo.patch_udp_sender_queue(root)
+
+    def test_tracker_batch_accounting_patch_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as root:
+            tracker = Path(root) / "tunnel" / "statistic" / "tracker.go"
+            tracker.parent.mkdir(parents=True)
+            tracker.write_text("func (ut *udpTracker) Close() error {\n", encoding="utf-8")
+            inject_mihomo.patch_udp_tracker_batch_accounting(root)
+            inject_mihomo.patch_udp_tracker_batch_accounting(root)
+            self.assertEqual(tracker.read_text(encoding="utf-8").count("func (ut *udpTracker) RecordChitandaBatchUpload"), 1)
+
+    def test_rejects_changed_tracker_batch_accounting(self):
+        with tempfile.TemporaryDirectory() as root:
+            tracker = Path(root) / "tunnel" / "statistic" / "tracker.go"
+            tracker.parent.mkdir(parents=True)
+            tracker.write_text("func (ut *udpTracker) RecordChitandaBatchUpload(n int) {}\nfunc (ut *udpTracker) Close() error {\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "unexpected Mihomo UDP tracker implementation"):
+                inject_mihomo.patch_udp_tracker_batch_accounting(root)
 
     def test_tun_icmp_route_patch_is_idempotent(self):
         with tempfile.TemporaryDirectory() as root:
