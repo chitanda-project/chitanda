@@ -34,8 +34,11 @@
 | `skip-cert-verify`| Boolean| いいえ | `false` | TLS 証明書の検証をスキップするかどうか (本番環境では `false` を推奨) |
 | `pool-size` | Integer | いいえ | `4` | TCP コネクションプールのサイズ (`h2` モードのスループットおよびバースト耐性を最適化) |
 | `udp-pool-size` | Integer | いいえ | (`pool-size` と同一) | UDP コネクションプールのサイズ (H3 QUIC 独立キャリア数。ゲーム・DNS などの多重化および QoS 物理分離用) |
-| `auto-scale` | Boolean | いいえ | `false` | 動的プール拡張。明示的な `false` は `max-pool-size` による暗黙の有効化より優先 |
-| `max-pool-size` | Integer | いいえ | `8` | 動的拡張時のキャリア上限（最大 `16`）。初期プールより大きい値を単独指定した場合も拡張を有効化 |
+| `auto-scale` | Boolean | いいえ | `true` (`h2`/`h3`/`auto`) | 動的プール拡張。明示的な `false` で無効化。`stream`/`h1`/`plain-h1` では適用されない |
+| `max-pool-size` | Integer | いいえ | `8` | 動的拡張時のキャリア上限（最大 `16`）。`pool-size` 以下を指定すると、`auto-scale` を明示的に有効化しない限り拡張されない |
+| `scale-up-threshold` | Integer | いいえ | SDK 既定値 | 拡張判断に使用する最小アクティブ接続数 |
+| `scale-down-idle` | Integer (秒) | いいえ | SDK 既定値 | 縮小判断までのアイドル時間 |
+| `cooldown` | Integer (ミリ秒) | いいえ | SDK 既定値 | 拡張・縮小後の待機時間 |
 | `udp` | Boolean | いいえ | `true` | UDP パケット転送を有効にするかどうか |
 | `interface-name` | String | いいえ | - | アウトバウンドにバインドする NIC 名 (マルチインターフェース・ポリシールーティングに対応) |
 | `routing-mark` | Integer | いいえ | `0` | Linux アウトバウンドトラフィックの `fwmark` ルーティングマーク |

@@ -27,22 +27,41 @@ func (t tunnel) OpenChitandaICMP(ctx context.Context, source, destination netip.
 	if proxy == nil {
 		return nil, false, fmt.Errorf("ICMP route has no outbound proxy")
 	}
+	pc, handled, err := openChitandaICMPPacket(ctx, proxy, metadata)
+	if err != nil || !handled {
+		return nil, handled, err
+	}
+	return statistic.NewUDPTracker(pc, statistic.DefaultManager, metadata, rule, 0, 0, true), true, nil
+}
+
+func openChitandaICMPPacket(ctx context.Context, proxy C.Proxy, metadata *C.Metadata) (C.PacketConn, bool, error) {
 	selected := proxy
+	var groups []C.Proxy
 	for selected != nil {
 		if selected.Type() == C.Chitanda {
 			if !chitandaICMPSupported(selected) {
 				return nil, false, fmt.Errorf("Chitanda ICMP is disabled")
 			}
-			pc, err := proxy.ListenPacketContext(ctx, metadata)
+			// Dial the leaf that was checked. A proxy group may choose a different
+			// member on its next ListenPacketContext call (e.g. round robin).
+			pc, err := selected.ListenPacketContext(ctx, metadata)
 			if err != nil {
 				return nil, false, err
 			}
-			return statistic.NewUDPTracker(pc, statistic.DefaultManager, metadata, rule, 0, 0, true), true, nil
+			for i := len(groups) - 1; i >= 0; i-- {
+				pc.AppendToChains(groups[i])
+			}
+			return pc, true, nil
 		}
 		if selected.Type() == C.Direct {
 			return nil, false, nil
 		}
-		selected = selected.Unwrap(metadata, false)
+		group := selected
+		selected = group.Unwrap(metadata, true)
+		if selected == group {
+			return nil, false, fmt.Errorf("selected proxy %q unwraps to itself", group.Name())
+		}
+		groups = append(groups, group)
 	}
 	return nil, false, fmt.Errorf("selected proxy %q does not support ICMP", proxy.Name())
 }

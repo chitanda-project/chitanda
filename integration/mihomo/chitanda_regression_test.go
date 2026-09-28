@@ -115,3 +115,16 @@ func TestRegressionMihomoExplicitAutoScaleFalse(t *testing.T) {
 		t.Fatal("explicit auto-scale: true must enable scaling")
 	}
 }
+
+func TestRegressionMihomoAutoScaleTransportEligibility(t *testing.T) {
+	for _, transport := range []string{"h2", "h3", "auto"} {
+		if !transportSupportsAutoScale(transport) {
+			t.Fatalf("%s should support pooled carriers", transport)
+		}
+	}
+	for _, transport := range []string{"stream", "h1", "plain-h1"} {
+		if transportSupportsAutoScale(transport) {
+			t.Fatalf("%s must not start a no-op autoscaler", transport)
+		}
+	}
+}

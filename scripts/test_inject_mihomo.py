@@ -10,23 +10,36 @@ inject_mihomo = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(inject_mihomo)
 
 
-class PatchUDPSenderCapacityTest(unittest.TestCase):
+class PatchUDPSenderQueueTest(unittest.TestCase):
+    @staticmethod
+    def write_upstream(root, capacity=128):
+        tunnel_dir = Path(root) / "tunnel"
+        tunnel_dir.mkdir()
+        (tunnel_dir / "tunnel.go").write_text(
+            f"\tsenderCapacity = {capacity} // chan capacity of PacketSender\n", encoding="utf-8"
+        )
+        (tunnel_dir / "connection.go").write_text(
+            "\tch     chan C.PacketAdapter\n"
+            "ch := make(chan C.PacketAdapter, senderCapacity)\n"
+            "case packet := <-s.ch:\n"
+            "\tfor {\n\t\tselect {\n\t\tcase data := <-s.ch:\n\t\t\tdata.Drop() // drop all data still in chan\n\t\tdefault:\n\t\t\treturn // no data, exit goroutine\n\t\t}\n\t}\n"
+            "\tselect {\n\tcase s.ch <- packet:\n\t\t// put ok, so don't drop packet, will process by other side of chan\n\tcase <-s.ctx.Done():\n\t\tpacket.Drop() // sender closed when putting data to chan\n\tdefault:\n\t\tpacket.Drop() // chan is full\n\t}\n",
+            encoding="utf-8",
+        )
+
     def test_patches_once_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as root:
-            tunnel = Path(root) / "tunnel" / "tunnel.go"
-            tunnel.parent.mkdir()
-            tunnel.write_text("\tsenderCapacity = 128 // chan capacity of PacketSender\n", encoding="utf-8")
-            inject_mihomo.patch_udp_sender_capacity(root)
-            inject_mihomo.patch_udp_sender_capacity(root)
-            self.assertEqual(tunnel.read_text(encoding="utf-8"), "\tsenderCapacity = 4096 // chan capacity of PacketSender\n")
+            self.write_upstream(root)
+            inject_mihomo.patch_udp_sender_queue(root)
+            inject_mihomo.patch_udp_sender_queue(root)
+            self.assertIn("senderCapacity = 128", (Path(root) / "tunnel" / "tunnel.go").read_text(encoding="utf-8"))
+            self.assertIn("ch := newChitandaPacketQueue()", (Path(root) / "tunnel" / "connection.go").read_text(encoding="utf-8"))
 
     def test_rejects_changed_upstream_capacity(self):
         with tempfile.TemporaryDirectory() as root:
-            tunnel = Path(root) / "tunnel" / "tunnel.go"
-            tunnel.parent.mkdir()
-            tunnel.write_text("\tsenderCapacity = 256 // chan capacity of PacketSender\n", encoding="utf-8")
+            self.write_upstream(root, capacity=256)
             with self.assertRaisesRegex(RuntimeError, "unexpected Mihomo UDP sender capacity"):
-                inject_mihomo.patch_udp_sender_capacity(root)
+                inject_mihomo.patch_udp_sender_queue(root)
 
     def test_tun_icmp_route_patch_is_idempotent(self):
         with tempfile.TemporaryDirectory() as root:

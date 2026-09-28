@@ -117,7 +117,7 @@ func (c *Chitanda) getClient() (*client.Client, error) {
 	}
 
 	var scaler client.AutoscalerPlugin
-	if shouldAutoScale(c.option) {
+	if transportSupportsAutoScale(c.option.Transport) && shouldAutoScale(c.option) {
 		maxCarriers := c.option.MaxPoolSize
 		if maxCarriers <= 0 {
 			maxCarriers = 8
@@ -175,6 +175,15 @@ func shouldAutoScale(option *ChitandaOption) bool {
 		return false
 	}
 	return true
+}
+
+func transportSupportsAutoScale(transport string) bool {
+	switch transport {
+	case "h2", "h3", "auto":
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *Chitanda) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {

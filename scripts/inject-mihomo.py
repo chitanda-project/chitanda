@@ -4,22 +4,35 @@ import sys
 import shutil
 
 
-def patch_udp_sender_capacity(mihomo_dir):
-    """Buffer UDP packets while an outbound association is being established."""
+def patch_udp_sender_queue(mihomo_dir):
+    """Replace Mihomo's eager fixed channel with a bounded, lazy FIFO."""
     tunnel_go = os.path.join(mihomo_dir, "tunnel", "tunnel.go")
     with open(tunnel_go, "r", encoding="utf-8") as f:
         content = f.read()
 
     original = "\tsenderCapacity = 128 // chan capacity of PacketSender"
-    patched = "\tsenderCapacity = 4096 // chan capacity of PacketSender"
-    if content.count(patched) == 1 and original not in content:
-        return
-    if content.count(original) != 1 or patched in content:
+    if content.count(original) != 1:
         raise RuntimeError(f"unexpected Mihomo UDP sender capacity in {tunnel_go}")
 
-    with open(tunnel_go, "w", encoding="utf-8") as f:
-        f.write(content.replace(original, patched, 1))
-    print(f"  [+] Patched {tunnel_go} UDP sender capacity for cold H3 associations")
+    connection_go = os.path.join(mihomo_dir, "tunnel", "connection.go")
+    with open(connection_go, "r", encoding="utf-8") as f:
+        content = f.read()
+    changes = (
+        ("\tch     chan C.PacketAdapter", "\tch     *chitandaPacketQueue"),
+        ("ch := make(chan C.PacketAdapter, senderCapacity)", "ch := newChitandaPacketQueue()"),
+        ("case packet := <-s.ch:", "case <-s.ch.ready:\n\t\t\tpacket := s.ch.pop()\n\t\t\tif packet == nil {\n\t\t\t\tcontinue\n\t\t\t}"),
+        ("\tfor {\n\t\tselect {\n\t\tcase data := <-s.ch:\n\t\t\tdata.Drop() // drop all data still in chan\n\t\tdefault:\n\t\t\treturn // no data, exit goroutine\n\t\t}\n\t}", "\ts.ch.close()"),
+        ("\tselect {\n\tcase s.ch <- packet:\n\t\t// put ok, so don't drop packet, will process by other side of chan\n\tcase <-s.ctx.Done():\n\t\tpacket.Drop() // sender closed when putting data to chan\n\tdefault:\n\t\tpacket.Drop() // chan is full\n\t}", "\ts.ch.push(packet)"),
+    )
+    for before, after in changes:
+        if content.count(after) == 1 and before not in content:
+            continue
+        if content.count(before) != 1 or after in content:
+            raise RuntimeError(f"unexpected Mihomo UDP sender implementation in {connection_go}: {before[:48]!r}")
+        content = content.replace(before, after, 1)
+    with open(connection_go, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"  [+] Patched {connection_go} with bounded lazy UDP queue")
 
 
 def patch_tun_icmp_route(mihomo_dir):
@@ -62,7 +75,7 @@ def patch_tun_icmp_rule_selection(mihomo_dir):
 
 def inject_mihomo(mihomo_dir, chitanda_dir):
     print(f"[*] Injecting Chitanda adapter into Mihomo: {mihomo_dir}")
-    patch_udp_sender_capacity(mihomo_dir)
+    patch_udp_sender_queue(mihomo_dir)
     patch_tun_icmp_rule_selection(mihomo_dir)
     adapter_dir = os.path.join(mihomo_dir, "adapter", "outbound")
     constant_dir = os.path.join(mihomo_dir, "constant")
@@ -78,6 +91,10 @@ def inject_mihomo(mihomo_dir, chitanda_dir):
         if fname.endswith("_test.go"):
             shutil.copy2(os.path.join(os.path.dirname(src_adapter), fname), os.path.join(adapter_dir, fname))
     for src, dst in (
+        (os.path.join(chitanda_dir, "integration", "mihomo_tunnel", "chitanda_sender_queue.go"),
+         os.path.join(mihomo_dir, "tunnel", "chitanda_sender_queue.go")),
+        (os.path.join(chitanda_dir, "integration", "mihomo_tunnel", "chitanda_sender_queue_test.go"),
+         os.path.join(mihomo_dir, "tunnel", "chitanda_sender_queue_test.go")),
         (os.path.join(chitanda_dir, "integration", "mihomo_tunnel", "chitanda_icmp.go"),
          os.path.join(mihomo_dir, "tunnel", "chitanda_icmp.go")),
         (os.path.join(chitanda_dir, "integration", "mihomo_tunnel", "chitanda_icmp_test.go"),
