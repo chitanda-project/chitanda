@@ -91,4 +91,18 @@ func TestQUICPacketConnSetReadDeadline(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 		t.Fatalf("SetReadDeadline failed to invoke active readCancel within 200ms")
 	}
+
+	// Test 3: SetReadDeadline does NOT cancel when extending a valid future deadline
+	canceled2 := make(chan struct{})
+	pconn.readCancels = map[uint64]context.CancelFunc{2: func() {
+		close(canceled2)
+	}}
+	pconn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+	select {
+	case <-canceled2:
+		t.Fatalf("SetReadDeadline should not cancel active read when extending valid future deadline")
+	case <-time.After(50 * time.Millisecond):
+		// Succeeded: readCancel was not called
+	}
 }

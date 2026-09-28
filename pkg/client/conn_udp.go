@@ -712,9 +712,13 @@ func (c *quicPacketConn) SetDeadline(t time.Time) error {
 
 func (c *quicPacketConn) SetReadDeadline(t time.Time) error {
 	c.mu.Lock()
+	oldDl := c.readDeadline
 	c.readDeadline = t
-	for _, cancel := range c.readCancels {
-		cancel()
+	now := time.Now()
+	if t.IsZero() || oldDl.IsZero() || t.Before(oldDl) || !oldDl.After(now) {
+		for _, cancel := range c.readCancels {
+			cancel()
+		}
 	}
 	c.mu.Unlock()
 	return nil

@@ -227,6 +227,34 @@ func (c *Chitanda) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 
 type chitandaICMPPacketConn struct{ net.PacketConn }
 
+func (c *chitandaICMPPacketConn) Upstream() any {
+	return c.PacketConn
+}
+
+func (c *chitandaICMPPacketConn) WriteBatch(payloads [][]byte, addrs []net.Addr) error {
+	for _, addr := range addrs {
+		if target, ok := addr.(*net.UDPAddr); ok && target.Port == 0 {
+			for i, p := range payloads {
+				if _, err := c.WriteTo(p, addrs[i]); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
+	if bw, ok := c.PacketConn.(interface {
+		WriteBatch([][]byte, []net.Addr) error
+	}); ok {
+		return bw.WriteBatch(payloads, addrs)
+	}
+	for i, payload := range payloads {
+		if _, err := c.WriteTo(payload, addrs[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *chitandaICMPPacketConn) WriteTo(packet []byte, addr net.Addr) (int, error) {
 	if target, ok := addr.(*net.UDPAddr); ok && target.Port == 0 {
 		if target.IP == nil {

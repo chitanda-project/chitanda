@@ -14,9 +14,41 @@ def patch_udp_sender_queue(mihomo_dir):
     if content.count(original) != 1:
         raise RuntimeError(f"unexpected Mihomo UDP sender capacity in {tunnel_go}")
 
+    orig_qcap = "\tqueueCapacity  = 64  // chan capacity tcpQueue and udpQueue"
+    patched_qcap = "\tqueueCapacity  = 2048 // chan capacity tcpQueue and udpQueue"
+    if orig_qcap in content:
+        content = content.replace(orig_qcap, patched_qcap, 1)
+        with open(tunnel_go, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f"  [+] Patched {tunnel_go} queueCapacity=2048")
+
     connection_go = os.path.join(mihomo_dir, "tunnel", "connection.go")
     with open(connection_go, "r", encoding="utf-8") as f:
         content = f.read()
+
+    full_process = (
+        "case packet := <-s.ch:\n"
+        "\t\t\tif proxy != nil {\n"
+        "\t\t\t\tproxy.UpdateWriteBack(packet)\n"
+        "\t\t\t}\n"
+        "\t\t\ts.processPacket(pc, packet)"
+    )
+    patched_process = (
+        "case <-s.ch.ready:\n"
+        "\t\t\tpacket := s.ch.pop()\n"
+        "\t\t\tif packet == nil {\n"
+        "\t\t\t\tcontinue\n"
+        "\t\t\t}\n"
+        "\t\t\tif proxy != nil {\n"
+        "\t\t\t\tproxy.UpdateWriteBack(packet)\n"
+        "\t\t\t}\n"
+        "\t\t\ts.processPacket(pc, packet)\n"
+        "\t\t\ts.drainBatch(pc, proxy)"
+    )
+
+    if full_process in content:
+        content = content.replace(full_process, patched_process, 1)
+
     changes = (
         ("\tch     chan C.PacketAdapter", "\tch     *chitandaPacketQueue"),
         ("ch := make(chan C.PacketAdapter, senderCapacity)", "ch := newChitandaPacketQueue()"),
@@ -27,12 +59,14 @@ def patch_udp_sender_queue(mihomo_dir):
     for before, after in changes:
         if content.count(after) == 1 and before not in content:
             continue
+        if before == "case packet := <-s.ch:" and patched_process in content:
+            continue
         if content.count(before) != 1 or after in content:
             raise RuntimeError(f"unexpected Mihomo UDP sender implementation in {connection_go}: {before[:48]!r}")
         content = content.replace(before, after, 1)
     with open(connection_go, "w", encoding="utf-8") as f:
         f.write(content)
-    print(f"  [+] Patched {connection_go} with bounded lazy UDP queue")
+    print(f"  [+] Patched {connection_go} with bounded lazy UDP queue and batch drainage")
 
 
 def patch_tun_icmp_route(mihomo_dir):

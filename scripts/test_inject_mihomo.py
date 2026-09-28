@@ -41,6 +41,34 @@ class PatchUDPSenderQueueTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "unexpected Mihomo UDP sender capacity"):
                 inject_mihomo.patch_udp_sender_queue(root)
 
+    def test_patches_full_process_loop_with_drain_batch(self):
+        with tempfile.TemporaryDirectory() as root:
+            tunnel_dir = Path(root) / "tunnel"
+            tunnel_dir.mkdir()
+            (tunnel_dir / "tunnel.go").write_text(
+                "\tsenderCapacity = 128 // chan capacity of PacketSender\n"
+                "\tqueueCapacity  = 64  // chan capacity tcpQueue and udpQueue\n",
+                encoding="utf-8"
+            )
+            (tunnel_dir / "connection.go").write_text(
+                "\tch     chan C.PacketAdapter\n"
+                "ch := make(chan C.PacketAdapter, senderCapacity)\n"
+                "case packet := <-s.ch:\n"
+                "\t\t\tif proxy != nil {\n"
+                "\t\t\t\tproxy.UpdateWriteBack(packet)\n"
+                "\t\t\t}\n"
+                "\t\t\ts.processPacket(pc, packet)\n"
+                "\tfor {\n\t\tselect {\n\t\tcase data := <-s.ch:\n\t\t\tdata.Drop() // drop all data still in chan\n\t\tdefault:\n\t\t\treturn // no data, exit goroutine\n\t\t}\n\t}\n"
+                "\tselect {\n\tcase s.ch <- packet:\n\t\t// put ok, so don't drop packet, will process by other side of chan\n\tcase <-s.ctx.Done():\n\t\tpacket.Drop() // sender closed when putting data to chan\n\tdefault:\n\t\tpacket.Drop() // chan is full\n\t}\n",
+                encoding="utf-8",
+            )
+            inject_mihomo.patch_udp_sender_queue(root)
+            inject_mihomo.patch_udp_sender_queue(root)
+            self.assertIn("queueCapacity  = 2048", (tunnel_dir / "tunnel.go").read_text(encoding="utf-8"))
+            conn_text = (tunnel_dir / "connection.go").read_text(encoding="utf-8")
+            self.assertIn("s.drainBatch(pc, proxy)", conn_text)
+            self.assertIn("ch := newChitandaPacketQueue()", conn_text)
+
     def test_tun_icmp_route_patch_is_idempotent(self):
         with tempfile.TemporaryDirectory() as root:
             prepare = Path(root) / "listener" / "sing_tun" / "prepare.go"
