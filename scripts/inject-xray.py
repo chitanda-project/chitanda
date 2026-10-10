@@ -41,7 +41,7 @@ def inject_udp_packet_size(xray_dir):
     # Chitanda. Reducing only non-Chitanda inbounds to 16 KiB regressed 200M UDP.
     patch_once(worker, "UDPPacketBufferSize()", [
         ("h, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, udp.HubCapacity(256))",
-         "opts := []udp.HubOption{udp.HubCapacity(256)}\n\tif sized, ok := w.proxy.(interface{ UDPPacketBufferSize() int32 }); ok {\n\t\topts = append(opts, udp.HubPacketSize(sized.UDPPacketBufferSize()))\n\t}\n\th, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, opts...)"),
+         "opts := []udp.HubOption{udp.HubCapacity(8192)}\n\tif sized, ok := w.proxy.(interface{ UDPPacketBufferSize() int32 }); ok {\n\t\topts = append(opts, udp.HubPacketSize(sized.UDPPacketBufferSize()))\n\t}\n\th, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, opts...)"),
         ("pReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(16*1024))",
          "pReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(4*1024*1024))"),
     ])

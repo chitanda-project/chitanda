@@ -3,6 +3,7 @@ package chitanda
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"strings"
 	"sync"
@@ -15,7 +16,7 @@ import (
 	"github.com/xtls/xray-core/features/routing"
 )
 
-const maxUDPRoutes = 64
+const maxUDPRoutes = 1024
 const udpRouteIdle = time.Minute
 
 type udpRouteKey struct {
@@ -125,6 +126,45 @@ func (r *udpRoutes) expire(now time.Time) {
 	}
 }
 
+func (r *udpRoutes) evictOldestLocked() {
+	if len(r.entries)+len(r.icmpEntries) < maxUDPRoutes {
+		return
+	}
+	var oldestKey udpRouteKey
+	var oldestEntry *udpRoute
+	var oldestICMPKey udpRouteKey
+	var oldestICMPEntry *icmpRoute
+	var oldestTime int64 = math.MaxInt64
+
+	for k, e := range r.entries {
+		t := e.last.Load()
+		if t < oldestTime {
+			oldestTime = t
+			oldestKey = k
+			oldestEntry = e
+		}
+	}
+	for k, e := range r.icmpEntries {
+		t := e.last.Load()
+		if t < oldestTime {
+			oldestTime = t
+			oldestICMPKey = k
+			oldestICMPEntry = e
+			oldestEntry = nil
+		}
+	}
+
+	if oldestEntry != nil {
+		delete(r.entries, oldestKey)
+		oldestEntry.cancel()
+		_ = oldestEntry.conn.Close()
+	} else if oldestICMPEntry != nil {
+		delete(r.icmpEntries, oldestICMPKey)
+		oldestICMPEntry.cancel()
+		_ = oldestICMPEntry.pconn.Close()
+	}
+}
+
 func (r *udpRoutes) Write(ctx context.Context, userIndex int, sid uint64, dest xnet.Destination, payload []byte) error {
 	key := udpRouteKey{userIndex, sid, dest.NetAddr()}
 	r.mu.Lock()
@@ -134,10 +174,7 @@ func (r *udpRoutes) Write(ctx context.Context, userIndex int, sid uint64, dest x
 	}
 	entry := r.entries[key]
 	if entry == nil {
-		if len(r.entries)+len(r.icmpEntries) >= maxUDPRoutes {
-			r.mu.Unlock()
-			return fmt.Errorf("chitanda: UDP target limit reached")
-		}
+		r.evictOldestLocked()
 		// Preserve packet policy, but bind its lifetime to the association and
 		// give this session/target its own mutable routing and sniffing state.
 		flowCtx, cancel := context.WithCancel(udpRouteValueContext{Context: r.ctx, packet: ctx})
@@ -171,10 +208,7 @@ func (r *udpRoutes) WriteICMP(ctx context.Context, userIndex int, sid uint64, ta
 	}
 	entry := r.icmpEntries[key]
 	if entry == nil {
-		if len(r.entries)+len(r.icmpEntries) >= maxUDPRoutes {
-			r.mu.Unlock()
-			return fmt.Errorf("chitanda: UDP target limit reached")
-		}
+		r.evictOldestLocked()
 		targetIPStr := strings.TrimPrefix(targetAddr, "icmp:")
 		targetIP, err := icmpmsg.ResolveIP(ctx, targetIPStr, false)
 		if err != nil {

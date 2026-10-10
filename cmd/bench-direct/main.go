@@ -27,6 +27,7 @@ func main() {
 	server := flag.String("server", "170.9.59.149:11322", "server endpoint")
 	serverName := flag.String("server-name", "status.chitanda.org", "TLS server name")
 	pskFile := flag.String("psk-file", "", "path to PSK file")
+	pskStr := flag.String("psk", "", "PSK string")
 	pathFile := flag.String("path-file", "", "path to private path file")
 	pathStr := flag.String("path", "", "private path string")
 	tcpTransport := flag.String("tcp-transport", "h2", "TCP carrier: h2, auto or h3")
@@ -65,12 +66,19 @@ func main() {
 		return
 	}
 
-	if *pskFile == "" {
-		log.Fatal("-psk-file is required")
-	}
-	psk, err := auth.LoadPSK(*pskFile)
-	if err != nil {
-		log.Fatalf("load PSK: %v", err)
+	var psk []byte
+	if *pskFile != "" {
+		var err error
+		psk, err = auth.LoadPSK(*pskFile)
+		if err != nil {
+			log.Fatalf("load PSK: %v", err)
+		}
+	} else if *pskStr != "" {
+		psk = []byte(*pskStr)
+	} else if env := os.Getenv("CHITANDA_PSK"); env != "" {
+		psk = []byte(env)
+	} else {
+		log.Fatal("-psk-file, -psk, or CHITANDA_PSK is required")
 	}
 
 	p := *pathStr
@@ -274,6 +282,7 @@ func runTCPBenchmark(cli *client.Client, target string, duration time.Duration, 
 			for {
 				n, writeErr := conn.Write(buf)
 				if writeErr != nil {
+					log.Printf("worker %d write error: %v", workerID, writeErr)
 					break
 				}
 				totalBytes.Add(int64(n))
