@@ -558,7 +558,7 @@ func newPipeConn(reader buf.Reader, writer buf.Writer) *pipeConn {
 	if reader != nil {
 		c.reader = &buf.BufferedReader{Reader: reader}
 		c.reads = connio.NewReader(func() ([]byte, net.Addr, error) {
-			b := make([]byte, 32<<10)
+			b := make([]byte, 64<<10)
 			n, err := c.reader.Read(b)
 			return b[:n], nil, err
 		}, func() error { _ = common.Interrupt(reader); return common.Close(reader) })
@@ -682,11 +682,10 @@ type virtualPacketConn struct {
 	readDeadline    time.Time
 	deadlineChanged chan struct{}
 	contexts        map[string]context.Context
-	writeQueue      *connio.Writer
 }
 
 func newVirtualPacketConn() *virtualPacketConn {
-	c := &virtualPacketConn{
+	return &virtualPacketConn{
 		recvCh:          make(chan *packetItem, 8192),
 		closeCh:         make(chan struct{}),
 		localAddr:       &net.UDPAddr{IP: net.IPv4zero, Port: 0},
@@ -694,29 +693,6 @@ func newVirtualPacketConn() *virtualPacketConn {
 		contexts:        make(map[string]context.Context),
 		deadlineChanged: make(chan struct{}),
 	}
-	c.writeQueue = connio.NewWriter(func(p []byte, addr net.Addr) (int, error) {
-		c.mu.RLock()
-		conn := c.writers[addr.String()]
-		c.mu.RUnlock()
-		// A datagram accepted into the bounded send queue can be lost if its
-		// association disappears. Do not poison other QUIC peers on that loss.
-		if conn != nil {
-			_, _ = conn.Write(p)
-		}
-		return len(p), nil
-	}, nil, func() error {
-		c.mu.RLock()
-		connections := make([]stat.Connection, 0, len(c.writers))
-		for _, conn := range c.writers {
-			connections = append(connections, conn)
-		}
-		c.mu.RUnlock()
-		for _, conn := range connections {
-			_ = conn.Close()
-		}
-		return nil
-	})
-	return c
 }
 
 func (c *virtualPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
@@ -770,14 +746,22 @@ func (c *virtualPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if !ok || conn == nil {
 		return 0, fmt.Errorf("no active connection for %s", addr.String())
 	}
-	return c.writeQueue.WritePacket(p, addr)
+	return conn.Write(p)
 }
 
 func (c *virtualPacketConn) Close() error {
 	if c.closed.CompareAndSwap(false, true) {
 		close(c.closeCh)
 	}
-	_ = c.writeQueue.Close()
+	c.mu.RLock()
+	connections := make([]stat.Connection, 0, len(c.writers))
+	for _, conn := range c.writers {
+		connections = append(connections, conn)
+	}
+	c.mu.RUnlock()
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
 	return nil
 }
 
@@ -800,7 +784,7 @@ func (c *virtualPacketConn) SetReadDeadline(t time.Time) error {
 }
 
 func (c *virtualPacketConn) SetWriteDeadline(t time.Time) error {
-	return c.writeQueue.SetDeadline(t)
+	return nil
 }
 
 func (c *virtualPacketConn) feed(data []byte, addr net.Addr) {

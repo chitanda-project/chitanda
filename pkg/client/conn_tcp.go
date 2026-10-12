@@ -150,7 +150,7 @@ func (c *h2TransportClient) dialH2TCPOnce(ctx context.Context, target string) (n
 	})
 	defer stopCancel()
 
-	pipeReader, pipeWriter := newBufferedPipe(128 * 1024)
+	pipeReader, pipeWriter := newBufferedPipe(1024 * 1024)
 
 	request, err := http.NewRequestWithContext(streamCtx, http.MethodPost, c.requestURL, pipeReader)
 	if err != nil {
@@ -226,7 +226,7 @@ func newRawH2Conn(target string, body io.ReadCloser, pipeWriter pipeWriteCloser,
 		cancel:     cancel,
 		h2Client:   h2Client,
 		reads: connio.NewReader(func() ([]byte, net.Addr, error) {
-			b := make([]byte, 32<<10)
+			b := make([]byte, 64<<10)
 			n, err := body.Read(b)
 			return b[:n], nil, err
 		}, body.Close),

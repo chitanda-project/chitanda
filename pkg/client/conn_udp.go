@@ -376,10 +376,11 @@ func (m *h3TransportManager) createPacketConnOnce(ctx context.Context) (net.Pack
 
 	pconnCtx, pconnCancel := context.WithCancel(context.Background())
 	return &quicPacketConn{
-		stream:  stream,
-		ctx:     pconnCtx,
-		cancel:  pconnCancel,
-		manager: m,
+		stream:      stream,
+		ctx:         pconnCtx,
+		cancel:      pconnCancel,
+		manager:     m,
+		readCancels: make([]readEntry, 0, 2),
 	}, nil
 }
 
@@ -495,6 +496,11 @@ type packetStream interface {
 	Close() error
 }
 
+type readEntry struct {
+	id     uint64
+	cancel context.CancelFunc
+}
+
 // quicPacketConn wraps HTTP/3 extended CONNECT-UDP + Datagrams into standard net.PacketConn.
 type quicPacketConn struct {
 	stream        packetStream
@@ -511,7 +517,7 @@ type quicPacketConn struct {
 	writeDeadline time.Time
 	writeContext  context.Context
 	writeCancel   context.CancelFunc
-	readCancels   map[uint64]context.CancelFunc
+	readCancels   []readEntry
 	nextReadID    uint64
 }
 
@@ -521,8 +527,12 @@ func (c *quicPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 			return 0, nil, c.ctx.Err()
 		}
 		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return 0, nil, net.ErrClosed
+		}
 		readDl := c.readDeadline
-		if !readDl.IsZero() && time.Now().After(readDl) {
+		if !readDl.IsZero() && !time.Now().Before(readDl) {
 			c.mu.Unlock()
 			return 0, nil, context.DeadlineExceeded
 		}
@@ -533,28 +543,37 @@ func (c *quicPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		} else {
 			recvCtx, cancel = context.WithDeadline(c.ctx, readDl)
 		}
-		if c.readCancels == nil {
-			c.readCancels = make(map[uint64]context.CancelFunc)
-		}
 		c.nextReadID++
 		readID := c.nextReadID
-		c.readCancels[readID] = cancel
+		c.readCancels = append(c.readCancels, readEntry{id: readID, cancel: cancel})
 		c.mu.Unlock()
 
 		rawPacket, err := c.stream.ReceiveDatagram(recvCtx)
 		cancel()
 
 		c.mu.Lock()
-		delete(c.readCancels, readID)
+		for i, entry := range c.readCancels {
+			if entry.id == readID {
+				c.readCancels[i] = c.readCancels[len(c.readCancels)-1]
+				c.readCancels[len(c.readCancels)-1] = readEntry{}
+				c.readCancels = c.readCancels[:len(c.readCancels)-1]
+				break
+			}
+		}
 		currentDl := c.readDeadline
+		closed := c.closed
 		c.mu.Unlock()
+
+		if closed {
+			return 0, nil, net.ErrClosed
+		}
 
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				if c.ctx.Err() != nil {
 					return 0, nil, c.ctx.Err()
 				}
-				if !currentDl.IsZero() && time.Now().After(currentDl) {
+				if !currentDl.IsZero() && !time.Now().Before(currentDl) {
 					return 0, nil, context.DeadlineExceeded
 				}
 				// Deadline updated dynamically, loop and try with new deadline
@@ -695,6 +714,12 @@ func (c *quicPacketConn) Close() error {
 	if c.manager != nil {
 		c.manager.activeStreams.Add(-1)
 	}
+	for _, entry := range c.readCancels {
+		entry.cancel()
+	}
+	if c.writeCancel != nil {
+		c.writeCancel()
+	}
 	c.cancel()
 	c.stream.CancelRead(0)
 	c.stream.CancelWrite(0)
@@ -716,8 +741,8 @@ func (c *quicPacketConn) SetReadDeadline(t time.Time) error {
 	c.readDeadline = t
 	now := time.Now()
 	if t.IsZero() || oldDl.IsZero() || t.Before(oldDl) || !oldDl.After(now) {
-		for _, cancel := range c.readCancels {
-			cancel()
+		for _, entry := range c.readCancels {
+			entry.cancel()
 		}
 	}
 	c.mu.Unlock()

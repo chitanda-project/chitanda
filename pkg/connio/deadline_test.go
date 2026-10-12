@@ -115,3 +115,16 @@ func TestCloseWakesBlockedWriter(t *testing.T) {
 		t.Fatal("writer leaked on close")
 	}
 }
+
+func BenchmarkWriterWritePacket(b *testing.B) {
+	w := NewWriter(func(p []byte, _ net.Addr) (int, error) {
+		return len(p), nil
+	}, nil, nil)
+	defer w.Close()
+	data := make([]byte, 1400)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = w.WritePacket(data, nil)
+	}
+}

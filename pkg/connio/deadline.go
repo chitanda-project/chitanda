@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -47,10 +48,9 @@ func stopTimer(t *time.Timer) {
 }
 
 type packet struct {
-	data   []byte
-	addr   net.Addr
-	err    error
-	result chan writeResult
+	data []byte
+	addr net.Addr
+	err  error
 }
 type writeResult struct {
 	n   int
@@ -186,6 +186,46 @@ func (r *Reader) Close() error {
 	return nil
 }
 
+type writeRequest struct {
+	data   []byte
+	bufPtr *[]byte
+	addr   net.Addr
+	resCh  chan writeResult
+	refs   atomic.Int32
+}
+
+var writeRequestPool = sync.Pool{
+	New: func() any {
+		return &writeRequest{
+			resCh: make(chan writeResult, 1),
+		}
+	},
+}
+
+var packetBufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 65536)
+		return &b
+	},
+}
+
+func (r *writeRequest) release() {
+	if r.refs.Add(-1) != 0 {
+		return
+	}
+	if r.bufPtr != nil {
+		packetBufferPool.Put(r.bufPtr)
+		r.bufPtr = nil
+	}
+	r.data = nil
+	r.addr = nil
+	select {
+	case <-r.resCh:
+	default:
+	}
+	writeRequestPool.Put(r)
+}
+
 // Writer accepts owned chunks into a bounded queue, like a socket send buffer.
 // A successful write means accepted, not delivered. Timed-out, unaccepted bytes
 // are never enqueued later. finish must half-close; abort must unblock write.
@@ -197,7 +237,7 @@ type Writer struct {
 	closeOnce sync.Once
 	done      chan struct{}
 	exited    chan struct{}
-	queue     chan packet
+	queue     chan *writeRequest
 	dl        deadline
 	gate      chan struct{}
 	mu        sync.Mutex
@@ -206,7 +246,7 @@ type Writer struct {
 }
 
 func NewWriter(write func([]byte, net.Addr) (int, error), finish, abort func() error) *Writer {
-	w := &Writer{write: write, finish: finish, abort: abort, done: make(chan struct{}), exited: make(chan struct{}), queue: make(chan packet, 1), gate: make(chan struct{}, 1)}
+	w := &Writer{write: write, finish: finish, abort: abort, done: make(chan struct{}), exited: make(chan struct{}), queue: make(chan *writeRequest, 1), gate: make(chan struct{}, 1)}
 	w.gate <- struct{}{}
 	return w
 }
@@ -218,23 +258,25 @@ func (w *Writer) start() {
 				select {
 				case <-w.done:
 					return
-				case p, ok := <-w.queue:
+				case req, ok := <-w.queue:
 					if !ok {
 						if w.finish != nil {
 							w.setError(w.finish())
 						}
 						return
 					}
-					n, err := w.write(p.data, p.addr)
-					if err == nil && n != len(p.data) {
+					n, err := w.write(req.data, req.addr)
+					if err == nil && n != len(req.data) {
 						err = io.ErrShortWrite
 					}
 					if err != nil {
 						w.setError(err)
-						p.result <- writeResult{n, err}
+						req.resCh <- writeResult{n, err}
+						req.release()
 						return
 					}
-					p.result <- writeResult{n, nil}
+					req.resCh <- writeResult{n, nil}
+					req.release()
 				}
 			}
 		}()
@@ -292,13 +334,24 @@ func (w *Writer) WritePacket(p []byte, addr net.Addr) (int, error) {
 	if fin {
 		return 0, io.ErrClosedPipe
 	}
-	item := packet{data: append([]byte(nil), p...), addr: addr, result: make(chan writeResult, 1)}
+	req := writeRequestPool.Get().(*writeRequest)
+	bufPtr := packetBufferPool.Get().(*[]byte)
+	copy(*bufPtr, p)
+	req.data = (*bufPtr)[:len(p)]
+	req.bufPtr = bufPtr
+	req.addr = addr
+	req.refs.Store(2)
+
 	for {
 		at, changed := w.dl.watch()
 		select {
 		case <-w.done:
+			req.release()
+			req.release()
 			return 0, net.ErrClosed
 		case <-w.exited:
+			req.release()
+			req.release()
 			if err := w.result(); err != nil {
 				return 0, err
 			}
@@ -306,18 +359,24 @@ func (w *Writer) WritePacket(p []byte, addr net.Addr) (int, error) {
 		default:
 		}
 		if !at.IsZero() && !time.Now().Before(at) {
+			req.release()
+			req.release()
 			return 0, os.ErrDeadlineExceeded
 		}
 		timer, timeout := deadlineTimer(at)
 		select {
-		case w.queue <- item:
+		case w.queue <- req:
 			stopTimer(timer)
-			return w.awaitWrite(item)
+			return w.awaitWrite(req)
 		case <-w.done:
 			stopTimer(timer)
+			req.release()
+			req.release()
 			return 0, net.ErrClosed
 		case <-w.exited:
 			stopTimer(timer)
+			req.release()
+			req.release()
 			if err := w.result(); err != nil {
 				return 0, err
 			}
@@ -329,10 +388,11 @@ func (w *Writer) WritePacket(p []byte, addr net.Addr) (int, error) {
 	}
 }
 
-func (w *Writer) awaitWrite(item packet) (int, error) {
+func (w *Writer) awaitWrite(req *writeRequest) (int, error) {
+	defer req.release()
 	for {
 		select {
-		case result := <-item.result:
+		case result := <-req.resCh:
 			return result.n, result.err
 		default:
 		}
@@ -340,27 +400,27 @@ func (w *Writer) awaitWrite(item packet) (int, error) {
 		// Once accepted, those bytes may still be delivered. Report them in n
 		// on timeout so a caller never retries already-owned bytes as new data.
 		if !at.IsZero() && !time.Now().Before(at) {
-			return len(item.data), os.ErrDeadlineExceeded
+			return len(req.data), os.ErrDeadlineExceeded
 		}
 		timer, timeout := deadlineTimer(at)
 		select {
-		case result := <-item.result:
+		case result := <-req.resCh:
 			stopTimer(timer)
 			return result.n, result.err
 		case <-w.done:
 			stopTimer(timer)
-			return len(item.data), net.ErrClosed
+			return len(req.data), net.ErrClosed
 		case <-w.exited:
 			stopTimer(timer)
 			select {
-			case result := <-item.result:
+			case result := <-req.resCh:
 				return result.n, result.err
 			default:
 			}
 			if err := w.result(); err != nil {
-				return len(item.data), err
+				return len(req.data), err
 			}
-			return len(item.data), net.ErrClosed
+			return len(req.data), net.ErrClosed
 		case <-changed:
 			stopTimer(timer)
 		case <-timeout:
@@ -370,7 +430,7 @@ func (w *Writer) awaitWrite(item packet) (int, error) {
 func (w *Writer) Write(p []byte) (int, error) {
 	written := 0
 	for len(p) > 0 {
-		size := min(len(p), 32<<10)
+		size := min(len(p), 65535)
 		n, err := w.WritePacket(p[:size], nil)
 		written += n
 		p = p[n:]
