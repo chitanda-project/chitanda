@@ -1,6 +1,7 @@
 package outbound
 
 import (
+	"context"
 	"errors"
 	"net"
 	"os"
@@ -59,8 +60,10 @@ func (d *chitandaReadDeadline) set(t time.Time, apply func(time.Time) error) err
 }
 
 func (d *chitandaReadDeadline) retryTimeout(err error, apply func(time.Time) error) bool {
-	var ne net.Error
-	if !errors.Is(err, os.ErrDeadlineExceeded) && !(errors.As(err, &ne) && ne.Timeout()) {
+	// A transport timeout (e.g. QUIC idle/handshake timeout) is terminal.
+	// Retrying every net.Error.Timeout keeps a dead association alive and
+	// can spin on ReadFrom. Only local socket/SDK deadlines are recoverable.
+	if !errors.Is(err, os.ErrDeadlineExceeded) && !errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 	d.mu.Lock()

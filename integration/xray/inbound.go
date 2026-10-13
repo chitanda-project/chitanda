@@ -545,9 +545,11 @@ func (h *InboundHandler) Close() error {
 			_ = h.vconn.Close()
 		}
 		if h.streamServer != nil {
+			// StreamServer owns this handler's replay reference and releases
+			// it on Close. Releasing it again would close a peer inbound's
+			// shared cache while that inbound is still serving requests.
 			_ = h.streamServer.Close()
-		}
-		if h.replays != nil {
+		} else if h.replays != nil {
 			_ = h.replays.Close()
 		}
 	})

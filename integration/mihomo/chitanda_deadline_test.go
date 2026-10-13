@@ -1,11 +1,57 @@
 package outbound
 
 import (
+	"context"
+	"errors"
+	quic "github.com/quic-go/quic-go"
+	"net"
 	"os"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+type terminalTimeoutPacketConn struct {
+	net.PacketConn
+	reads int
+}
+
+func (c *terminalTimeoutPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	c.reads++
+	if c.reads > 1 {
+		return 0, nil, net.ErrClosed // Bound a broken retry loop in the test.
+	}
+	return 0, nil, &quic.IdleTimeoutError{}
+}
+
+func (c *terminalTimeoutPacketConn) SetReadDeadline(time.Time) error { return nil }
+
+func TestChitandaReadFromPropagatesTerminalTimeoutOnce(t *testing.T) {
+	pc := &terminalTimeoutPacketConn{}
+	c := &chitandaICMPPacketConn{PacketConn: pc}
+	c.SetReadDeadline(time.Now().Add(time.Minute))
+	_, _, err := c.ReadFrom(make([]byte, 1))
+	var timeout *quic.IdleTimeoutError
+	if !errors.As(err, &timeout) || pc.reads != 1 {
+		t.Fatalf("transport timeout not propagated: reads=%d err=%v", pc.reads, err)
+	}
+}
+
+func TestChitandaDeadlineDoesNotRetryTransportTimeout(t *testing.T) {
+	var d chitandaReadDeadline
+	apply := func(time.Time) error { return nil }
+	d.set(time.Now().Add(time.Minute), apply)
+	if d.retryTimeout(&quic.IdleTimeoutError{}, apply) {
+		t.Fatal("terminal QUIC idle timeout swallowed; dead association keeps retrying")
+	}
+	d.set(time.Time{}, apply)
+	if d.retryTimeout(&quic.HandshakeTimeoutError{}, apply) {
+		t.Fatal("terminal QUIC handshake timeout swallowed")
+	}
+	if !d.retryTimeout(context.DeadlineExceeded, apply) {
+		t.Fatal("stale SDK read deadline did not retry")
+	}
+}
 
 func TestChitandaDeadlineCoalescesExtensionsAndPreservesShortening(t *testing.T) {
 	var d chitandaReadDeadline
