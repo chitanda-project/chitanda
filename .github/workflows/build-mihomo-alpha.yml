@@ -220,6 +220,12 @@ jobs:
           name: "Mihomo Prerelease-Alpha (${{ steps.upstream_check.outputs.short_sha }})"
           body: |
             Automated build of **MetaCubeX/mihomo** `Alpha` branch with native **Chitanda Protocol** integrated.
+
+            ### 更新范围（2026-10-13 断线修复）
+            - **整体范围：双端，Mihomo 客户端 + Xray 服务端。** 本 Mihomo 包修复 QUIC 连接超时后 UDP 持续重试失效关联的问题；CMFA / Verge / OpenClash 等需更新其实际内核或包含新内核的应用。
+            - 服务端共享重放缓存误关闭问题需另外更新 Xray 服务端内核；Xray 客户端出站没有本次代码改动。
+            - 相对 `157f4d4` 无协议格式变化，可分步更新双端；从更早版本升级且使用非空 `server-id` 的 stream/h1 原生 UDP 时，仍须双端共同升级并保持 ID 一致。
+            - [完整修复及验证说明](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/DISCONNECTION_AUDIT_2026-10-13.md)。自动发布不等于实际节点已安装更新。
             
             ### Details:
             - **Upstream Alpha Commit**: `MetaCubeX/mihomo@${{ steps.upstream_check.outputs.alpha_commit }}`
