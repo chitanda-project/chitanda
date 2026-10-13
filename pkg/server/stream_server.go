@@ -139,7 +139,7 @@ func (s *StreamServer) AttachUDP(udpConn *net.UDPConn) error {
 	if s.closed.Load() || s.udpServer != nil {
 		return errors.New("stream server closed or UDP already attached")
 	}
-	udpSrv, err := NewPlainUDPServerWithUsers(udpConn, s.users)
+	udpSrv, err := NewPlainUDPServerWithUsers(udpConn, s.users, PlainUDPOptions{ServerID: s.serverID, Replays: s.replays})
 	if err != nil {
 		return err
 	}

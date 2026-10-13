@@ -225,7 +225,10 @@ func (c *Chitanda) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 	return NewPacketConn(&chitandaICMPPacketConn{PacketConn: pconn}, c), nil
 }
 
-type chitandaICMPPacketConn struct{ net.PacketConn }
+type chitandaICMPPacketConn struct {
+	net.PacketConn
+	deadline chitandaReadDeadline
+}
 
 func (c *chitandaICMPPacketConn) Upstream() any {
 	return c.PacketConn
@@ -292,11 +295,16 @@ func (c *chitandaICMPPacketConn) WriteTo(packet []byte, addr net.Addr) (int, err
 }
 
 func (c *chitandaICMPPacketConn) ReadFrom(packet []byte) (int, net.Addr, error) {
-	n, addr, err := c.PacketConn.ReadFrom(packet)
-	if from, ok := addr.(*client.ICMPAddr); ok && from.IP != nil {
-		return n, &net.UDPAddr{IP: from.IP, Port: 0}, err
+	for {
+		n, addr, err := c.PacketConn.ReadFrom(packet)
+		if n == 0 && c.deadline.retryTimeout(err, c.PacketConn.SetReadDeadline) {
+			continue
+		}
+		if from, ok := addr.(*client.ICMPAddr); ok && from.IP != nil {
+			return n, &net.UDPAddr{IP: from.IP, Port: 0}, err
+		}
+		return n, addr, err
 	}
-	return n, addr, err
 }
 
 func (c *Chitanda) SupportUDP() bool {

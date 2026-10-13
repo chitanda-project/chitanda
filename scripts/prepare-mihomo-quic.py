@@ -28,6 +28,10 @@ def prepare(mihomo_dir: Path, core_dir: Path) -> None:
         ("connection.go", "SendDatagramNoCopyContext"),
         ("datagram_queue.go", "AddBatchContext"),
         ("http3/stream.go", "SendDatagramsContext"),
+        ("connection.go", "ReceiveQueueStats"),
+        ("connection.go", "receivedPacketQueueClosed"),
+        ("http3/state_tracking_stream.go", "DatagramReceiveStats"),
+        ("http3/stream.go", "func (s *RequestStream) DatagramReceiveStats()"),
     ):
         if marker not in (source / relative).read_text(encoding="utf-8"):
             raise RuntimeError(f"missing deadline patch in {relative}")
@@ -41,6 +45,11 @@ def prepare(mihomo_dir: Path, core_dir: Path) -> None:
     shutil.copytree(source, destination)
     shutil.copy2(original / "go.mod", destination / "go.mod")
     shutil.copy2(original / "go.sum", destination / "go.sum")
+    for name, target in (
+        ("receive_queue_test.go.txt", "receive_queue_test.go"),
+        ("http3_state_tracking_stream_test.go.txt", "http3/state_tracking_stream_lazy_test.go"),
+    ):
+        shutil.copy2(core_dir / "scripts" / "vendor-tests" / name, destination / target)
 
     run(mihomo_dir, "go", "mod", "edit", f"-replace={MODULE}={destination.as_posix()}")
     run(mihomo_dir, "go", "mod", "tidy")

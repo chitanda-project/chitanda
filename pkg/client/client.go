@@ -398,7 +398,7 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 	}
 
 	if c.cfg.TCPTransport == TCPTransportPlainH1 || c.cfg.TCPTransport == TCPTransportH1 || c.cfg.TCPTransport == TCPTransportStream {
-		pconn, err := newPlainUDPConn(ctx, c.cfg.Server, c.cfg.PSK, c.cfg.ListenPacket, c.cfg.ResolveUDP, c.cfg.DialPacket)
+		pconn, err := newPlainUDPConn(ctx, c.cfg.Server, c.cfg.PSK, c.cfg.ServerID, c.cfg.ListenPacket, c.cfg.ResolveUDP, c.cfg.DialPacket)
 		if err != nil {
 			return nil, err
 		}

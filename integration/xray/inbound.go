@@ -49,6 +49,7 @@ type InboundHandler struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	httpSlots    chan struct{}
+	closeOnce    sync.Once
 }
 
 func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHandler, error) {
@@ -91,13 +92,18 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 
 	var replays *auth.ReplayCache
 	var err error
-	if config.ReplayFile != "" {
-		replays, err = auth.OpenReplayCache(config.ReplayFile, time.Now())
+	replayPath := config.ReplayFile
+	if replayPath == "" {
+		// Configuration edits (including adding/reordering users) must not
+		// reset recent replay admissions. Share a stable account-level store.
+		replayPath, err = auth.DefaultReplayPath("xray-auth-v3")
 		if err != nil {
-			return nil, fmt.Errorf("open replay cache: %w", err)
+			return nil, fmt.Errorf("default replay state: %w", err)
 		}
-	} else {
-		replays = auth.NewReplayCache()
+	}
+	replays, err = auth.OpenSharedReplayCache(replayPath, time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("open replay cache: %w", err)
 	}
 
 	var fbHandler http.Handler
@@ -185,7 +191,7 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 	if config.Transport == "stream" || config.Transport == "h1" || config.Transport == "plain-h1" {
 		userCodecs = make([]*server.PlainUDPCodec, 0, len(serverUsers))
 		for _, u := range serverUsers {
-			codec, err := server.NewPlainUDPCodec(u.PSK)
+			codec, err := server.NewPlainUDPCodec(u.PSK, config.ServerId)
 			if err != nil {
 				_ = replays.Close()
 				inCancel()
@@ -195,6 +201,8 @@ func NewInboundHandler(ctx context.Context, config *InboundConfig) (*InboundHand
 		}
 		userReplays = make([]udpReplayRegistry, len(serverUsers))
 		for i := range userReplays {
+			userReplays[i].cache = replays
+			userReplays[i].namespace = server.UDPReplayNamespace(serverUsers[i].PSK, config.ServerId)
 			go userReplays[i].run(inCtx)
 		}
 	}
@@ -482,9 +490,10 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 				continue
 			}
 
-			matchedIdx, sessionID, targetAddr, rawData, _, seq, err := server.DecodeClientPacketMulti(userCodecs, data, time.Now())
+			now := time.Now()
+			matchedIdx, sessionID, targetAddr, rawData, timestamp, seq, err := server.DecodeClientPacketMulti(userCodecs, data, now)
 			if err == nil {
-				if matchedIdx < 0 || matchedIdx >= len(userReplays) || !userReplays[matchedIdx].accept(sessionID, seq, time.Now()) {
+				if matchedIdx < 0 || matchedIdx >= len(userReplays) || !userReplays[matchedIdx].accept(sessionID, seq, now, timestamp) {
 					payload.Release()
 					continue // drop replayed packet across any connection/association!
 				}
@@ -527,19 +536,21 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 }
 
 func (h *InboundHandler) Close() error {
-	h.cancel()
-	if h.h3Server != nil {
-		_ = h.h3Server.Close()
-	}
-	if h.vconn != nil {
-		_ = h.vconn.Close()
-	}
-	if h.streamServer != nil {
-		_ = h.streamServer.Close()
-	}
-	if h.replays != nil {
-		_ = h.replays.Close()
-	}
+	h.closeOnce.Do(func() {
+		h.cancel()
+		if h.h3Server != nil {
+			_ = h.h3Server.Close()
+		}
+		if h.vconn != nil {
+			_ = h.vconn.Close()
+		}
+		if h.streamServer != nil {
+			_ = h.streamServer.Close()
+		}
+		if h.replays != nil {
+			_ = h.replays.Close()
+		}
+	})
 	return nil
 }
 
@@ -668,6 +679,20 @@ type packetItem struct {
 	addr net.Addr
 }
 
+var virtualQueuedBytes atomic.Int64
+
+func reserveVirtualBytes(size int64) bool {
+	for {
+		used := virtualQueuedBytes.Load()
+		if size > (64<<20)-used {
+			return false
+		}
+		if virtualQueuedBytes.CompareAndSwap(used, used+size) {
+			return true
+		}
+	}
+}
+
 type virtualPacketConn struct {
 	recvCh    chan *packetItem
 	closeCh   chan struct{}
@@ -675,8 +700,13 @@ type virtualPacketConn struct {
 	onFeed    func() // test hook; nil in production to avoid atomic overhead
 	localAddr net.Addr
 
-	mu      sync.RWMutex
-	writers map[string]stat.Connection
+	mu            sync.RWMutex
+	writers       map[string]stat.Connection
+	writeHelpers  map[string]*connio.Writer
+	writeDeadline time.Time
+	feedMu        sync.Mutex
+	queuedBytes   atomic.Int64
+	feedDrops     atomic.Uint64
 
 	deadlineMu      sync.Mutex
 	readDeadline    time.Time
@@ -690,6 +720,7 @@ func newVirtualPacketConn() *virtualPacketConn {
 		closeCh:         make(chan struct{}),
 		localAddr:       &net.UDPAddr{IP: net.IPv4zero, Port: 0},
 		writers:         make(map[string]stat.Connection),
+		writeHelpers:    make(map[string]*connio.Writer),
 		contexts:        make(map[string]context.Context),
 		deadlineChanged: make(chan struct{}),
 	}
@@ -714,6 +745,9 @@ func (c *virtualPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		}
 		select {
 		case pkt := <-c.recvCh:
+			cost := int64(len(pkt.data) + 64)
+			c.queuedBytes.Add(-cost)
+			virtualQueuedBytes.Add(-cost)
 			if timer != nil {
 				timer.Stop()
 			}
@@ -741,26 +775,39 @@ func (c *virtualPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		return 0, net.InvalidAddrError("nil UDP peer")
 	}
 	c.mu.RLock()
-	conn, ok := c.writers[addr.String()]
+	writer, ok := c.writeHelpers[addr.String()]
 	c.mu.RUnlock()
-	if !ok || conn == nil {
+	if !ok || writer == nil {
 		return 0, fmt.Errorf("no active connection for %s", addr.String())
 	}
-	return conn.Write(p)
+	return writer.WritePacket(p, addr)
 }
 
 func (c *virtualPacketConn) Close() error {
+	c.feedMu.Lock()
 	if c.closed.CompareAndSwap(false, true) {
 		close(c.closeCh)
+		for {
+			select {
+			case pkt := <-c.recvCh:
+				cost := int64(len(pkt.data) + 64)
+				c.queuedBytes.Add(-cost)
+				virtualQueuedBytes.Add(-cost)
+			default:
+				goto drained
+			}
+		}
 	}
+drained:
+	c.feedMu.Unlock()
 	c.mu.RLock()
-	connections := make([]stat.Connection, 0, len(c.writers))
-	for _, conn := range c.writers {
-		connections = append(connections, conn)
+	writers := make([]*connio.Writer, 0, len(c.writeHelpers))
+	for _, writer := range c.writeHelpers {
+		writers = append(writers, writer)
 	}
 	c.mu.RUnlock()
-	for _, conn := range connections {
-		_ = conn.Close()
+	for _, writer := range writers {
+		_ = writer.Close()
 	}
 	return nil
 }
@@ -784,40 +831,86 @@ func (c *virtualPacketConn) SetReadDeadline(t time.Time) error {
 }
 
 func (c *virtualPacketConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writeDeadline = t
+	for _, writer := range c.writeHelpers {
+		_ = writer.SetDeadline(t)
+	}
 	return nil
 }
 
 func (c *virtualPacketConn) feed(data []byte, addr net.Addr) {
+	c.feedMu.Lock()
+	defer c.feedMu.Unlock()
 	if c.closed.Load() {
 		return
 	}
 	if c.onFeed != nil {
 		c.onFeed()
 	}
+	cost := int64(len(data) + 64)
+	if cost > (16<<20)-c.queuedBytes.Load() || !reserveVirtualBytes(cost) {
+		c.feedDrops.Add(1)
+		return
+	}
+	c.queuedBytes.Add(cost)
 	buf := make([]byte, len(data))
 	copy(buf, data)
 	select {
 	case c.recvCh <- &packetItem{data: buf, addr: addr}:
 	default:
+		c.queuedBytes.Add(-cost)
+		virtualQueuedBytes.Add(-cost)
+		c.feedDrops.Add(1)
 	}
+}
+
+func (c *virtualPacketConn) receiveQueueStats() (int64, uint64) {
+	return c.queuedBytes.Load(), c.feedDrops.Load()
 }
 
 func (c *virtualPacketConn) registerConn(key string, conn stat.Connection, contexts ...context.Context) {
 	c.mu.Lock()
+	if c.closed.Load() {
+		c.mu.Unlock()
+		_ = conn.Close()
+		return
+	}
+	old := c.writeHelpers[key]
+	if c.writers[key] == conn {
+		if len(contexts) > 0 {
+			c.contexts[key] = context.WithoutCancel(contexts[0])
+		}
+		c.mu.Unlock()
+		return
+	}
+	writer := connio.NewWriter(func(p []byte, _ net.Addr) (int, error) { return conn.Write(p) }, nil, conn.Close)
+	_ = writer.SetDeadline(c.writeDeadline)
+	c.writeHelpers[key] = writer
 	c.writers[key] = conn
 	if len(contexts) > 0 {
 		c.contexts[key] = context.WithoutCancel(contexts[0])
 	}
 	c.mu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
 }
 
 func (c *virtualPacketConn) unregisterConn(key string, conn stat.Connection) {
 	c.mu.Lock()
+	var writer *connio.Writer
 	if c.writers[key] == conn {
+		writer = c.writeHelpers[key]
+		delete(c.writeHelpers, key)
 		delete(c.writers, key)
 		delete(c.contexts, key)
 	}
 	c.mu.Unlock()
+	if writer != nil {
+		_ = writer.Close()
+	}
 }
 
 type inboundValueContext struct {

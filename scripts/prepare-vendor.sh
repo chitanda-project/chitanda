@@ -17,8 +17,11 @@ git apply --check ./scripts/vendor-performance.patch
 git apply ./scripts/vendor-performance.patch
 git apply --check ./scripts/vendor-deadline.patch
 git apply ./scripts/vendor-deadline.patch
+go run ./scripts/patch-receive.go
 cp ./scripts/vendor-tests/datagram_queue_test.go.txt \
   ./vendor/github.com/quic-go/quic-go/datagram_queue_test.go
+cp ./scripts/vendor-tests/receive_queue_test.go.txt \
+  ./vendor/github.com/quic-go/quic-go/receive_queue_test.go
 cp ./scripts/vendor-tests/send_conn_batch_linux_test.go.txt \
   ./vendor/github.com/quic-go/quic-go/send_conn_batch_linux_test.go
 cp ./scripts/vendor-tests/http3_state_tracking_stream_test.go.txt \

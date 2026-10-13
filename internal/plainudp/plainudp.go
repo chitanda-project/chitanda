@@ -74,13 +74,22 @@ func DeriveDirectionalKeys(psk []byte) (c2sKey, s2cKey [32]byte) {
 
 // Codec provides bidirectional XChaCha20-Poly1305 AEAD encryption and decryption.
 type Codec struct {
-	c2sAEAD   cipher.AEAD
-	s2cAEAD   cipher.AEAD
-	sequence  atomic.Uint64
+	c2sAEAD  cipher.AEAD
+	s2cAEAD  cipher.AEAD
+	sequence atomic.Uint64
 }
 
 // NewCodec creates a persistent Codec instance holding initialized C2S and S2C AEAD ciphers.
-func NewCodec(psk []byte) (*Codec, error) {
+func NewCodec(psk []byte, serverIDs ...string) (*Codec, error) {
+	if len(serverIDs) > 1 {
+		return nil, errors.New("plainudp: multiple server IDs")
+	}
+	if len(serverIDs) == 1 && serverIDs[0] != "" {
+		mac := hmac.New(sha256.New, psk)
+		mac.Write([]byte("CHITANDA-PLAIN-UDP-SERVER-V3\x00"))
+		mac.Write([]byte(serverIDs[0]))
+		psk = mac.Sum(nil)
+	}
 	c2sKey, s2cKey := DeriveDirectionalKeys(psk)
 	c2sAEAD, err := chacha20poly1305.NewX(c2sKey[:])
 	if err != nil {
@@ -91,8 +100,8 @@ func NewCodec(psk []byte) (*Codec, error) {
 		return nil, err
 	}
 	return &Codec{
-		c2sAEAD:  c2sAEAD,
-		s2cAEAD:  s2cAEAD,
+		c2sAEAD: c2sAEAD,
+		s2cAEAD: s2cAEAD,
 	}, nil
 }
 
@@ -215,7 +224,6 @@ func DecodePacketMulti(codecs []*Codec, packet []byte, expectedDir Direction, no
 	}
 	return -1, 0, "", nil, 0, 0, ErrDecryptionFailed
 }
-
 
 func appendTargetAddress(buf []byte, address string) ([]byte, error) {
 	var host string

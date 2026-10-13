@@ -37,6 +37,7 @@ func newPlainUDPConn(
 	ctx context.Context,
 	server string,
 	psk []byte,
+	serverID string,
 	listenPacket func(ctx context.Context, network, addr string) (net.PacketConn, error),
 	resolveUDPFn func(ctx context.Context, network, addr string) (*net.UDPAddr, error),
 	dialPackets ...func(context.Context, *net.UDPAddr) (net.PacketConn, error),
@@ -72,7 +73,7 @@ func newPlainUDPConn(
 		_ = uc.SetWriteBuffer(8 << 20)
 	}
 
-	codec, err := plainudp.NewCodec(psk)
+	codec, err := plainudp.NewCodec(psk, serverID)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err

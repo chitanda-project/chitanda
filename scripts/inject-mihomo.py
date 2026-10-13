@@ -95,6 +95,38 @@ def patch_udp_tracker_batch_accounting(mihomo_dir):
     print(f"  [+] Patched {tracker_go} with batch upload accounting")
 
 
+def patch_udp_compaction(mihomo_dir):
+    """Explicitly detach SOCKS pooled payloads without invalidating WriteBack."""
+    changes = (
+        ("listener/socks/utils.go", "func (c *packet) Data() []byte {", '''// CompactChitandaData preserves endpoint state while recycling only data.
+func (c *packet) CompactChitandaData() {
+    if c.put == nil || cap(c.payload) <= max(2048, 2*len(c.payload)) { return }
+    data := make([]byte, len(c.payload))
+    copy(data, c.payload)
+    put := c.put
+    c.payload, c.put = data, nil
+    put()
+}
+
+func (c *packet) Data() []byte {'''),
+        ("constant/adapters.go", "func (s *packetAdapter) Metadata() *Metadata {", '''func (s *packetAdapter) CompactChitandaData() {
+    if compact, ok := s.UDPPacket.(interface{ CompactChitandaData() }); ok { compact.CompactChitandaData() }
+}
+
+func (s *packetAdapter) Metadata() *Metadata {'''),
+    )
+    for relative, before, after in changes:
+        path = os.path.join(mihomo_dir, relative)
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+        if content.count(after) == 1:
+            continue
+        if content.count(before) != 1 or "func (" + ("c *packet" if relative.startswith("listener") else "s *packetAdapter") + ") CompactChitandaData()" in content:
+            raise RuntimeError(f"unexpected UDP ownership hook in {path}")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content.replace(before, after, 1))
+
+
 def patch_tun_icmp_route(mihomo_dir):
     prepare_go = os.path.join(mihomo_dir, "listener", "sing_tun", "prepare.go")
     with open(prepare_go, "r", encoding="utf-8") as f:
@@ -136,6 +168,7 @@ def patch_tun_icmp_rule_selection(mihomo_dir):
 def inject_mihomo(mihomo_dir, chitanda_dir):
     print(f"[*] Injecting Chitanda adapter into Mihomo: {mihomo_dir}")
     patch_udp_sender_queue(mihomo_dir)
+    patch_udp_compaction(mihomo_dir)
     patch_udp_tracker_batch_accounting(mihomo_dir)
     patch_tun_icmp_rule_selection(mihomo_dir)
     adapter_dir = os.path.join(mihomo_dir, "adapter", "outbound")
@@ -149,7 +182,7 @@ def inject_mihomo(mihomo_dir, chitanda_dir):
     shutil.copy2(src_adapter, dst_adapter)
     print(f"  [+] Copied {src_adapter} -> {dst_adapter}")
     for fname in sorted(os.listdir(os.path.dirname(src_adapter))):
-        if fname.endswith("_test.go"):
+        if fname.endswith(".go") and fname != "chitanda.go":
             shutil.copy2(os.path.join(os.path.dirname(src_adapter), fname), os.path.join(adapter_dir, fname))
     for src, dst in (
         (os.path.join(chitanda_dir, "integration", "mihomo_tunnel", "chitanda_sender_queue.go"),
@@ -172,16 +205,21 @@ def inject_mihomo(mihomo_dir, chitanda_dir):
         for fname in sorted(os.listdir(src_tests)):
             if fname.endswith("_test.go"):
                 shutil.copy2(os.path.join(src_tests, fname), os.path.join(mihomo_dir, "config", fname))
+    for fname in sorted(os.listdir(os.path.join(chitanda_dir, "integration", "mihomo_socks"))):
+        if fname.endswith("_test.go"):
+            shutil.copy2(os.path.join(chitanda_dir, "integration", "mihomo_socks", fname), os.path.join(mihomo_dir, "listener", "socks", fname))
     
     # 2. Patch constant/adapters.go
     adapters_go = os.path.join(constant_dir, "adapters.go")
     if os.path.exists(adapters_go):
         with open(adapters_go, "r", encoding="utf-8") as f:
             content = f.read()
-        if 'Chitanda' not in content:
+        if '\tChitanda\n' not in content:
+            if content.count('\tShadowsocks\n') != 1 or content.count('case Shadowsocks:') != 1:
+                raise RuntimeError(f"unexpected Mihomo protocol enum in {adapters_go}")
             content = content.replace(
-                '\tShadowsocks',
-                '\tChitanda\n\tShadowsocks',
+                '\tShadowsocks\n',
+                '\tChitanda\n\tShadowsocks\n',
                 1
             )
             content = content.replace(
@@ -192,6 +230,8 @@ def inject_mihomo(mihomo_dir, chitanda_dir):
             with open(adapters_go, "w", encoding="utf-8") as f:
                 f.write(content)
             print(f"  [+] Patched {adapters_go} with Chitanda enum and Stringer")
+        elif 'case Chitanda:' not in content:
+            raise RuntimeError(f"incomplete Chitanda protocol enum in {adapters_go}")
             
     # 3. Patch adapter/parser.go
     parser_go = os.path.join(mihomo_dir, "adapter", "parser.go")

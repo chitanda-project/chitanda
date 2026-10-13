@@ -611,6 +611,20 @@ func (c *quicPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 }
 
 func (c *quicPacketConn) WriteBatch(payloads [][]byte, addrs []net.Addr) error {
+	if len(payloads) != len(addrs) {
+		return errors.New("chitanda: payload/address batch lengths differ")
+	}
+	for _, addr := range addrs {
+		if addr == nil {
+			return net.InvalidAddrError("nil datagram destination")
+		}
+		if udp, ok := addr.(*net.UDPAddr); ok && udp == nil {
+			return net.InvalidAddrError("nil UDP destination")
+		}
+		if icmp, ok := addr.(*ICMPAddr); ok && icmp == nil {
+			return net.InvalidAddrError("nil ICMP destination")
+		}
+	}
 	if len(payloads) == 0 {
 		return nil
 	}

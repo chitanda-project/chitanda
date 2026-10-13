@@ -1,0 +1,38 @@
+package quic
+
+import "testing"
+
+func TestReceiveQueueBurstBudgetAndDrops(t *testing.T) {
+    c:=&Conn{notifyReceivedPacket:make(chan struct{},1)}
+    c.receivedPackets.Init(8)
+    defer func() {
+        c.receivedPacketMx.Lock(); defer c.receivedPacketMx.Unlock()
+        for !c.receivedPackets.Empty() { p:=c.receivedPackets.PopFront(); c.receivedPacketBytes-=p.queueCost(); globalReceiveQueueBytes.Add(-p.queueCost()) }
+    }()
+    for i:=0;i<2048;i++ { c.handlePacket(receivedPacket{data:make([]byte,1024)}) }
+    n,bytes,drops:=c.ReceiveQueueStats()
+    if n!=2048 || bytes!=2048*(1024+128) || drops!=0 { t.Fatalf("queue = %d/%d/%d",n,bytes,drops) }
+    c.handlePacket(receivedPacket{data:make([]byte,1024)})
+    n,_,drops=c.ReceiveQueueStats()
+    if n!=2048 || drops!=1 { t.Fatal("packet count limit not enforced/observed") }
+    other:=&Conn{}
+    other.receivedPackets.Init(8)
+    huge:=make([]byte,1,8<<20)
+    other.handlePacket(receivedPacket{data:huge})
+    n,_,drops=other.ReceiveQueueStats()
+    if n!=0 || drops!=1 { t.Fatal("backing allocation budget not enforced") }
+}
+
+func TestClosedReceiveQueueDropsLatePacketAndReleasesOwnership(t *testing.T) {
+    baseline:=globalReceiveQueueBytes.Load()
+    c:=&Conn{receivedPacketQueueClosed:true}
+    c.receivedPackets.Init(8)
+    buffer:=getPacketBuffer()
+    buffer.Data=buffer.Data[:1200]
+    buffer.Split() // retain one independent reference to check ownership
+    c.handlePacket(receivedPacket{data:buffer.Data,buffer:buffer})
+    if buffer.refCount!=1 {t.Fatalf("drop retained the receive reference: %d",buffer.refCount)}
+    buffer.Release()
+    n,bytes,drops:=c.ReceiveQueueStats()
+    if n!=0 || bytes!=0 || drops!=1 || globalReceiveQueueBytes.Load()!=baseline {t.Fatal("closed queue retained a budget/packet")}
+}

@@ -116,7 +116,7 @@ func Run(config *Config, listenAddr, adminListenAddr, quicListenAddr string) err
 		} else {
 			_ = plainUDPLn.SetReadBuffer(8 << 20)
 			_ = plainUDPLn.SetWriteBuffer(8 << 20)
-			pServer, err := NewPlainUDPServer(plainUDPLn, psk)
+			pServer, err := NewPlainUDPServer(plainUDPLn, psk, PlainUDPOptions{ServerID: config.ServerID, Replays: replays})
 			if err != nil {
 				_ = plainUDPLn.Close()
 				return fmt.Errorf("init plain-UDP server: %w", err)

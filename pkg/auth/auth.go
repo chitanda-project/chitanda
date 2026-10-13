@@ -40,6 +40,11 @@ type ReplayCache struct {
 	currentTx   uint64
 	stopCh      chan struct{}
 	doneCh      chan struct{}
+	lockFile    *os.File
+	sharedPath  string
+	sharedRefs  int
+	stopOnce    sync.Once
+	closed      bool
 }
 
 type replayExpiry struct {
@@ -77,6 +82,16 @@ func OpenReplayCache(path string, now time.Time) (*ReplayCache, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("replay cache path is required")
 	}
+	lockFile, err := lockReplayFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("lock replay cache: %w", err)
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = lockFile.Close()
+		}
+	}()
 	_, statErr := os.Stat(path)
 	created := errors.Is(statErr, os.ErrNotExist)
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
@@ -96,6 +111,7 @@ func OpenReplayCache(path string, now time.Time) (*ReplayCache, error) {
 		persistent: true,
 		stopCh:     make(chan struct{}),
 		doneCh:     make(chan struct{}),
+		lockFile:   lockFile,
 	}
 	cache.cond = sync.NewCond(&cache.mu)
 	if err := cache.load(now); err != nil {
@@ -103,6 +119,7 @@ func OpenReplayCache(path string, now time.Time) (*ReplayCache, error) {
 		return nil, err
 	}
 	go cache.groupCommitLoop()
+	success = true
 	return cache, nil
 }
 
@@ -116,8 +133,11 @@ func (c *ReplayCache) groupCommitLoop() {
 		case <-c.stopCh:
 			c.mu.Lock()
 			if c.file != nil && c.currentTx > c.syncedTx {
-				_ = c.file.Sync()
-				c.syncedTx = c.currentTx
+				if err := c.file.Sync(); err != nil {
+					_ = c.markPersistenceFailure(err)
+				} else {
+					c.syncedTx = c.currentTx
+				}
 				c.cond.Broadcast()
 			}
 			c.mu.Unlock()
@@ -185,6 +205,9 @@ func (c *ReplayCache) Check(nonce string, now time.Time) bool {
 func (c *ReplayCache) Accept(nonce string, now time.Time) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return false, errors.New("replay cache is closed")
+	}
 	if c.persistErr != nil {
 		return false, c.persistErr
 	}
@@ -200,6 +223,9 @@ func (c *ReplayCache) Accept(nonce string, now time.Time) (bool, error) {
 	}
 	if _, exists := c.expires[nonce]; exists {
 		return false, nil
+	}
+	if len(c.expires) >= 200000 {
+		return false, errors.New("replay cache capacity exceeded")
 	}
 	var thisTx uint64
 	if c.file != nil {
@@ -235,6 +261,9 @@ func (c *ReplayCache) Accept(nonce string, now time.Time) (bool, error) {
 func (c *ReplayCache) markPersistenceFailure(err error) error {
 	if c.persistErr == nil {
 		c.persistErr = fmt.Errorf("replay cache persistence failed: %w", err)
+	}
+	if c.cond != nil {
+		c.cond.Broadcast()
 	}
 	return c.persistErr
 }
@@ -298,16 +327,33 @@ func syncDirectory(dir string) error {
 }
 
 func (c *ReplayCache) Close() error {
-	if c.stopCh != nil {
-		select {
-		case <-c.stopCh:
-		default:
-			close(c.stopCh)
-			<-c.doneCh
+	if c.sharedPath != "" {
+		sharedCaches.Lock()
+		defer sharedCaches.Unlock()
+		if c.sharedRefs <= 0 {
+			return nil
 		}
+		c.sharedRefs--
+		if c.sharedRefs > 0 {
+			return nil
+		}
+		delete(sharedCaches.entries, c.sharedPath)
+	}
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	if c.stopCh != nil {
+		c.stopOnce.Do(func() { close(c.stopCh) })
+		<-c.doneCh
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	defer func() {
+		if c.lockFile != nil {
+			_ = c.lockFile.Close()
+			c.lockFile = nil
+		}
+	}()
 	if c.file == nil {
 		return nil
 	}

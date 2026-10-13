@@ -16,7 +16,7 @@ import (
 const chitandaSenderInitialCapacity = 32
 const chitandaSenderMaxCapacity = 8192
 const chitandaSenderMaxAge = 3 * time.Second
-const chitandaSenderMaxFlowBytes int64 = 4 << 20
+const chitandaSenderMaxFlowBytes int64 = 12 << 20
 const chitandaSenderGlobalBytes int64 = 64 << 20
 const chitandaSenderPacketOverhead int64 = 128
 
@@ -68,6 +68,7 @@ type chitandaPacketQueue struct {
 	ready        chan struct{}
 	lastDeadline time.Time
 	budget       *chitandaQueueBudget
+	dropped      atomic.Uint64
 }
 
 func newChitandaPacketQueue() *chitandaPacketQueue {
@@ -86,10 +87,16 @@ func (q *chitandaPacketQueue) signal() {
 }
 
 func (q *chitandaPacketQueue) push(packet C.PacketAdapter) {
+	// Only explicit ownership-aware implementations may recycle backing
+	// storage early. Generic PacketAdapter.Drop may invalidate WriteBack.
+	if compact, ok := packet.(interface{ CompactChitandaData() }); ok {
+		compact.CompactChitandaData()
+	}
 	now := time.Now()
 	size := chitandaPacketSize(packet)
 	q.mu.Lock()
 	if q.closed {
+		q.dropped.Add(1)
 		q.mu.Unlock()
 		packet.Drop()
 		return
@@ -98,11 +105,13 @@ func (q *chitandaPacketQueue) push(packet C.PacketAdapter) {
 	if q.length == chitandaSenderMaxCapacity {
 		oldest := q.items[q.head]
 		if now.Sub(oldest.added) <= chitandaSenderMaxAge {
+			q.dropped.Add(1)
 			q.mu.Unlock()
 			packet.Drop()
 			return
 		}
 		expired = oldest.packet
+		q.dropped.Add(1)
 		q.bytes -= oldest.size
 		q.budget.release(oldest.size)
 		q.items[q.head] = chitandaQueuedPacket{}
@@ -110,6 +119,7 @@ func (q *chitandaPacketQueue) push(packet C.PacketAdapter) {
 		q.length--
 	}
 	if size > chitandaSenderMaxFlowBytes-q.bytes || !q.budget.reserve(size) {
+		q.dropped.Add(1)
 		q.mu.Unlock()
 		packet.Drop()
 		if expired != nil {
@@ -162,6 +172,7 @@ func (q *chitandaPacketQueue) pop() C.PacketAdapter {
 			return item.packet
 		}
 		item.packet.Drop()
+		q.dropped.Add(1)
 	}
 }
 
@@ -204,6 +215,7 @@ func (q *chitandaPacketQueue) popBatch(max int) []C.PacketAdapter {
 		q.mu.Unlock()
 		for _, p := range expired {
 			p.Drop()
+			q.dropped.Add(1)
 		}
 		if len(batch) > 0 {
 			return batch
@@ -305,7 +317,10 @@ func (s *packetSender) drainBatch(pc C.PacketConn, proxy C.WriteBackProxy) {
 			}
 		}
 		if len(payloads) > 0 {
-			written, _ := bw.ChitandaBatchWrite(payloads, addrs)
+			written, err := bw.ChitandaBatchWrite(payloads, addrs)
+			if err != nil {
+				log.Debugln("[UDP] Chitanda batch write failed: %s", err)
+			}
 			if recorder, ok := pc.(interface{ RecordChitandaBatchUpload(int) }); ok && written > 0 {
 				recorder.RecordChitandaBatchUpload(written)
 			}
@@ -317,7 +332,9 @@ func (s *packetSender) drainBatch(pc C.PacketConn, proxy C.WriteBackProxy) {
 			}
 			addr := s.resolveTargetAddr(pc, packet)
 			if addr != nil {
-				_, _ = pc.WriteTo(packet.Data(), addr)
+				if _, err := pc.WriteTo(packet.Data(), addr); err != nil {
+					log.Debugln("[UDP] Chitanda write failed: %s", err)
+				}
 			}
 		}
 	}

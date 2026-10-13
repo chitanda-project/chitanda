@@ -44,6 +44,11 @@ func testTLSConfig(t *testing.T, config *InboundConfig) *InboundConfig {
 
 func newTestInboundHandler(t *testing.T, ctx context.Context, cfg *InboundConfig) (*InboundHandler, error) {
 	t.Helper()
+	if cfg.ReplayFile == "" {
+		copyConfig := proto.Clone(cfg).(*InboundConfig)
+		copyConfig.ReplayFile = filepath.Join(t.TempDir(), "replay.cache")
+		cfg = copyConfig
+	}
 	if cfg.Transport != "stream" && cfg.Transport != "h1" && cfg.Transport != "plain-h1" {
 		cfg = testTLSConfig(t, cfg)
 	}

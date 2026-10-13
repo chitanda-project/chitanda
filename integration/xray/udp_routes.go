@@ -25,9 +25,11 @@ type udpRouteKey struct {
 	target    string
 }
 type udpRoute struct {
-	conn   *packetLinkConn
-	cancel context.CancelFunc
-	last   atomic.Int64
+	conn    *packetLinkConn
+	cancel  context.CancelFunc
+	last    atomic.Int64
+	once    sync.Once
+	release func()
 }
 type icmpRoute struct {
 	pconn   net.PacketConn
@@ -35,6 +37,33 @@ type icmpRoute struct {
 	tracker icmpmsg.EchoTracker
 	cancel  context.CancelFunc
 	last    atomic.Int64
+	once    sync.Once
+	release func()
+}
+
+func (e *udpRoute) close() {
+	e.once.Do(func() {
+		e.cancel()
+		_ = e.conn.Close()
+		if e.release != nil {
+			e.release()
+		}
+	})
+}
+func (e *icmpRoute) close() {
+	e.once.Do(func() {
+		e.cancel()
+		_ = e.pconn.Close()
+		if e.release != nil {
+			e.release()
+		}
+	})
+}
+
+type routeOpening struct {
+	done    chan struct{}
+	err     error
+	release func()
 }
 type udpRoutes struct {
 	ctx         context.Context
@@ -47,6 +76,7 @@ type udpRoutes struct {
 	closed      bool
 	entries     map[udpRouteKey]*udpRoute
 	icmpEntries map[udpRouteKey]*icmpRoute
+	opening     map[udpRouteKey]*routeOpening
 	dialICMP    func(ctx context.Context, address string) (net.PacketConn, error)
 	wg          sync.WaitGroup
 }
@@ -80,6 +110,7 @@ func newUDPRoutes(ctx context.Context, d routing.Dispatcher, codecs []*server.Pl
 		outer:       outer,
 		entries:     make(map[udpRouteKey]*udpRoute),
 		icmpEntries: make(map[udpRouteKey]*icmpRoute),
+		opening:     make(map[udpRouteKey]*routeOpening),
 		dialICMP:    dialICMPFn,
 	}
 	r.wg.Add(1)
@@ -117,18 +148,16 @@ func (r *udpRoutes) expire(now time.Time) {
 	}
 	r.mu.Unlock()
 	for _, entry := range expired {
-		entry.cancel()
-		_ = entry.conn.Close()
+		entry.close()
 	}
 	for _, entry := range expiredICMP {
-		entry.cancel()
-		_ = entry.pconn.Close()
+		entry.close()
 	}
 }
 
-func (r *udpRoutes) evictOldestLocked() {
-	if len(r.entries)+len(r.icmpEntries) < maxUDPRoutes {
-		return
+func (r *udpRoutes) evictOldestLocked() func() {
+	if len(r.entries)+len(r.icmpEntries)+len(r.opening) < maxUDPRoutes {
+		return nil
 	}
 	var oldestKey udpRouteKey
 	var oldestEntry *udpRoute
@@ -156,43 +185,129 @@ func (r *udpRoutes) evictOldestLocked() {
 
 	if oldestEntry != nil {
 		delete(r.entries, oldestKey)
-		oldestEntry.cancel()
-		_ = oldestEntry.conn.Close()
+		return oldestEntry.close
 	} else if oldestICMPEntry != nil {
 		delete(r.icmpEntries, oldestICMPKey)
-		oldestICMPEntry.cancel()
-		_ = oldestICMPEntry.pconn.Close()
+		return oldestICMPEntry.close
 	}
+	return nil
+}
+
+// beginRoute serializes only creation of the same target. No DNS, dispatch,
+// socket Close, or blocking wait executes under the association table lock.
+func (r *udpRoutes) beginRoute(ctx context.Context, key udpRouteKey) (*udpRoute, *icmpRoute, *routeOpening, error) {
+	for {
+		r.mu.Lock()
+		if r.closed || r.ctx.Err() != nil {
+			r.mu.Unlock()
+			return nil, nil, nil, net.ErrClosed
+		}
+		if e := r.entries[key]; e != nil {
+			r.mu.Unlock()
+			return e, nil, nil, nil
+		}
+		if e := r.icmpEntries[key]; e != nil {
+			r.mu.Unlock()
+			return nil, e, nil, nil
+		}
+		if pending := r.opening[key]; pending != nil {
+			r.mu.Unlock()
+			select {
+			case <-pending.done:
+				if pending.err != nil {
+					return nil, nil, nil, pending.err
+				}
+				continue
+			case <-ctx.Done():
+				return nil, nil, nil, ctx.Err()
+			case <-r.ctx.Done():
+				return nil, nil, nil, net.ErrClosed
+			}
+		}
+		if len(r.opening) >= maxUDPRoutes {
+			r.mu.Unlock()
+			return nil, nil, nil, fmt.Errorf("UDP route creation limit reached")
+		}
+		evicted := r.evictOldestLocked()
+		pending := &routeOpening{done: make(chan struct{})}
+		r.opening[key] = pending
+		r.wg.Add(1)
+		r.mu.Unlock()
+		if evicted != nil {
+			evicted()
+		}
+		user := "invalid"
+		if key.userIndex >= 0 && key.userIndex < len(r.codecs) && r.codecs[key.userIndex] != nil {
+			user = r.codecs[key.userIndex].ReplayNamespace()
+		}
+		release, ok := reserveNativeRoute(user)
+		if !ok {
+			err := fmt.Errorf("native UDP route budget exhausted")
+			r.finishRoute(key, pending, nil, nil, err)
+			return nil, nil, nil, err
+		}
+		pending.release = release
+		return nil, nil, pending, nil
+	}
+}
+
+func (r *udpRoutes) finishRoute(key udpRouteKey, pending *routeOpening, udp *udpRoute, icmp *icmpRoute, err error) error {
+	r.mu.Lock()
+	if r.closed || r.ctx.Err() != nil {
+		err = net.ErrClosed
+	}
+	if err == nil {
+		if udp != nil {
+			r.entries[key] = udp
+			r.wg.Add(1)
+			go r.receive(key, udp)
+		}
+		if icmp != nil {
+			r.icmpEntries[key] = icmp
+			r.wg.Add(1)
+			go r.receiveICMP(key, icmp)
+		}
+	}
+	pending.err = err
+	delete(r.opening, key)
+	close(pending.done)
+	r.mu.Unlock()
+	if err != nil {
+		if udp != nil {
+			udp.close()
+		}
+		if icmp != nil {
+			icmp.close()
+		}
+		if pending.release != nil {
+			pending.release()
+		}
+	}
+	r.wg.Done()
+	return err
 }
 
 func (r *udpRoutes) Write(ctx context.Context, userIndex int, sid uint64, dest xnet.Destination, payload []byte) error {
 	key := udpRouteKey{userIndex, sid, dest.NetAddr()}
-	r.mu.Lock()
-	if r.closed || r.ctx.Err() != nil {
-		r.mu.Unlock()
-		return net.ErrClosed
+	entry, _, pending, err := r.beginRoute(ctx, key)
+	if err != nil {
+		return err
 	}
-	entry := r.entries[key]
-	if entry == nil {
-		r.evictOldestLocked()
-		// Preserve packet policy, but bind its lifetime to the association and
-		// give this session/target its own mutable routing and sniffing state.
+	if pending != nil {
 		flowCtx, cancel := context.WithCancel(udpRouteValueContext{Context: r.ctx, packet: ctx})
-		link, err := r.dispatcher.Dispatch(requestContext(flowCtx), dest)
-		if err != nil {
+		link, dispatchErr := r.dispatcher.Dispatch(requestContext(flowCtx), dest)
+		if dispatchErr != nil {
 			cancel()
-			r.mu.Unlock()
+			return r.finishRoute(key, pending, nil, nil, dispatchErr)
+		}
+		entry = &udpRoute{conn: newPacketLinkConn(link.Reader, link.Writer, packetAddress(dest.NetAddr())), cancel: cancel, release: pending.release}
+		entry.last.Store(time.Now().UnixNano())
+		if err := r.finishRoute(key, pending, entry, nil, nil); err != nil {
 			return err
 		}
-		entry = &udpRoute{conn: newPacketLinkConn(link.Reader, link.Writer, packetAddress(dest.NetAddr())), cancel: cancel}
-		r.entries[key] = entry
-		entry.last.Store(time.Now().UnixNano())
-		r.wg.Add(1)
-		go r.receive(key, entry)
 	}
 	entry.last.Store(time.Now().UnixNano())
-	r.mu.Unlock()
-	_, err := entry.conn.Write(payload)
+	_, err = entry.conn.Write(payload)
 	if err != nil {
 		r.remove(key, entry)
 	}
@@ -201,46 +316,38 @@ func (r *udpRoutes) Write(ctx context.Context, userIndex int, sid uint64, dest x
 
 func (r *udpRoutes) WriteICMP(ctx context.Context, userIndex int, sid uint64, targetAddr string, payload []byte) error {
 	key := udpRouteKey{userIndex, sid, targetAddr}
-	r.mu.Lock()
-	if r.closed || r.ctx.Err() != nil {
-		r.mu.Unlock()
-		return net.ErrClosed
+	_, entry, pending, err := r.beginRoute(ctx, key)
+	if err != nil {
+		return err
 	}
-	entry := r.icmpEntries[key]
-	if entry == nil {
-		r.evictOldestLocked()
-		targetIPStr := strings.TrimPrefix(targetAddr, "icmp:")
-		targetIP, err := icmpmsg.ResolveIP(ctx, targetIPStr, false)
-		if err != nil {
-			r.mu.Unlock()
-			return fmt.Errorf("chitanda: invalid icmp target %q: %w", targetAddr, err)
+	if pending != nil {
+		flowCtx, cancel := context.WithCancel(udpRouteValueContext{Context: r.ctx, packet: ctx})
+		targetIP, resolveErr := icmpmsg.ResolveIP(flowCtx, strings.TrimPrefix(targetAddr, "icmp:"), false)
+		if resolveErr != nil {
+			cancel()
+			return r.finishRoute(key, pending, nil, nil, resolveErr)
 		}
 		var pconn net.PacketConn
 		if r.dialICMP != nil {
-			pconn, err = r.dialICMP(ctx, targetIP.String())
+			pconn, err = r.dialICMP(flowCtx, targetIP.String())
 		} else {
-			network := "ip4:icmp"
-			listenAddr := "0.0.0.0"
+			network, addr := "ip4:icmp", "0.0.0.0"
 			if targetIP.To4() == nil {
-				network = "ip6:ipv6-icmp"
-				listenAddr = "::"
+				network, addr = "ip6:ipv6-icmp", "::"
 			}
-			pconn, err = net.ListenPacket(network, listenAddr)
+			pconn, err = net.ListenPacket(network, addr)
 		}
 		if err != nil {
-			r.mu.Unlock()
+			cancel()
+			return r.finishRoute(key, pending, nil, nil, err)
+		}
+		entry = &icmpRoute{pconn: pconn, target: targetIP, cancel: cancel, release: pending.release}
+		entry.last.Store(time.Now().UnixNano())
+		if err := r.finishRoute(key, pending, nil, entry, nil); err != nil {
 			return err
 		}
-		_, cancel := context.WithCancel(r.ctx)
-		entry = &icmpRoute{pconn: pconn, target: targetIP, cancel: cancel}
-		r.icmpEntries[key] = entry
-		entry.last.Store(time.Now().UnixNano())
-		r.wg.Add(1)
-		go r.receiveICMP(key, entry)
 	}
 	entry.last.Store(time.Now().UnixNano())
-	r.mu.Unlock()
-
 	wire, err := entry.tracker.PrepareRequest(payload, entry.target.To4() == nil)
 	if err != nil {
 		return err
@@ -258,8 +365,7 @@ func (r *udpRoutes) remove(key udpRouteKey, entry *udpRoute) {
 		delete(r.entries, key)
 	}
 	r.mu.Unlock()
-	entry.cancel()
-	_ = entry.conn.Close()
+	entry.close()
 }
 
 func (r *udpRoutes) removeICMP(key udpRouteKey, entry *icmpRoute) {
@@ -268,8 +374,7 @@ func (r *udpRoutes) removeICMP(key udpRouteKey, entry *icmpRoute) {
 		delete(r.icmpEntries, key)
 	}
 	r.mu.Unlock()
-	entry.cancel()
-	_ = entry.pconn.Close()
+	entry.close()
 }
 
 func (r *udpRoutes) receive(key udpRouteKey, entry *udpRoute) {
@@ -354,12 +459,10 @@ func (r *udpRoutes) Close() {
 	// before joining readers; Close is also safe after EOF/caller cancellation.
 	_ = r.outer.Close()
 	for _, entry := range entries {
-		entry.cancel()
-		_ = entry.conn.Close()
+		entry.close()
 	}
 	for _, entry := range icmpEntries {
-		entry.cancel()
-		_ = entry.pconn.Close()
+		entry.close()
 	}
 	r.wg.Wait()
 }

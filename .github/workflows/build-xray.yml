@@ -5,10 +5,12 @@ on:
     branches: [ main ]
     paths:
       - 'integration/xray/**'
+      - 'integration/xray_udp_hub/**'
       - 'scripts/inject-xray.py'
       - 'scripts/test_inject_xray.py'
       - 'scripts/prepare-xray-quic-vendor.sh'
       - 'scripts/patch-vendor.go'
+      - 'scripts/patch-receive.go'
       - 'scripts/vendor-performance.patch'
       - 'scripts/vendor-tests/**'
       - 'pkg/**'
@@ -89,7 +91,7 @@ jobs:
 
       - name: Test Xray injector invariants
         if: steps.upstream_check.outputs.should_build == 'true'
-        run: python3 -m unittest discover -s scripts -p test_inject_xray.py
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
 
       - name: Inject Chitanda Protocol Adapter
         if: steps.upstream_check.outputs.should_build == 'true'
@@ -108,6 +110,7 @@ jobs:
           cd upstream_src
           go test -mod=vendor -race ./proxy/chitanda -count=1 -timeout 180s
           go test -mod=vendor -race ./infra/conf -run Chitanda -count=1 -timeout 120s
+          go test -mod=vendor -race ./transport/internet/udp -run Chitanda -count=1 -timeout 120s
 
       - name: Test Chitanda SDK regressions
         if: steps.upstream_check.outputs.should_build == 'true'

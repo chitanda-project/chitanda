@@ -7,9 +7,12 @@ on:
       - 'integration/mihomo/**'
       - 'integration/mihomo_tunnel/**'
       - 'integration/mihomo_sing_tun/**'
+      - 'integration/mihomo_socks/**'
       - 'scripts/inject-mihomo.py'
       - 'scripts/test_inject_mihomo.py'
       - 'scripts/prepare-mihomo-quic.py'
+      - 'scripts/test_*.py'
+      - 'scripts/vendor-tests/**'
       - 'vendor/github.com/quic-go/quic-go/**'
       - 'releases/mihomo/**'
       - 'pkg/**'
@@ -100,7 +103,9 @@ jobs:
           cd upstream_src
           go mod tidy
           python3 "$GITHUB_WORKSPACE/scripts/prepare-mihomo-quic.py" "$PWD" "$GITHUB_WORKSPACE"
-          go test -race ./config ./adapter/outbound ./listener/sing_tun ./tunnel -run 'Chitanda|RegressionMihomo' -count=1 -timeout 120s
+          python3 -m unittest discover -s "$GITHUB_WORKSPACE/scripts" -p 'test_*.py'
+          go test -race ./config ./adapter/outbound ./listener/sing_tun ./listener/socks ./tunnel -run 'Chitanda|RegressionMihomo' -count=1 -timeout 120s
+          go test -race github.com/quic-go/quic-go github.com/quic-go/quic-go/http3 -count=1 -timeout 120s
 
       - name: Build Multi-Architecture Binaries
         if: steps.upstream_check.outputs.should_build == 'true'

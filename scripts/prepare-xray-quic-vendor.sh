@@ -36,6 +36,7 @@ git apply --check --include='vendor/github.com/quic-go/quic-go/*' "$core_dir/scr
 git apply --include='vendor/github.com/quic-go/quic-go/*' "$core_dir/scripts/vendor-performance.patch"
 git apply --check "$core_dir/scripts/vendor-deadline.patch"
 git apply "$core_dir/scripts/vendor-deadline.patch"
+go run "$core_dir/scripts/patch-receive.go"
 
 # The historical Xray workflow patched the global module cache. If that cache
 # is already patched, go mod vendor copies the complete H2 change. Otherwise
@@ -49,7 +50,7 @@ else
     git apply --include='vendor/golang.org/x/net/*' "$core_dir/scripts/vendor-performance.patch"
 fi
 
-# Verify the high-BDP performance parameters required for 200M+ zero-loss UDP
+# Verify performance parameters; zero-loss is a measured condition, not a guarantee.
 sender=vendor/github.com/quic-go/quic-go/internal/congestion/cubic_sender.go
 test "$(grep -c 'minCongestionWindowPackets = 1536' "$sender")" -eq 1
 test "$(grep -c 'initialCongestionWindow    = 4096' "$sender")" -eq 1
@@ -57,6 +58,7 @@ test "$(grep -c 'maxDatagramSendQueueLen = 8192' "$queue")" -eq 1
 test "$(grep -c 'MaxDataPadding int' vendor/golang.org/x/net/http2/transport_common.go)" -eq 1
 
 cp "$core_dir/scripts/vendor-tests/datagram_queue_test.go.txt" vendor/github.com/quic-go/quic-go/datagram_queue_test.go
+cp "$core_dir/scripts/vendor-tests/receive_queue_test.go.txt" vendor/github.com/quic-go/quic-go/receive_queue_test.go
 cp "$core_dir/scripts/vendor-tests/send_conn_batch_linux_test.go.txt" vendor/github.com/quic-go/quic-go/send_conn_batch_linux_test.go
 cp "$core_dir/scripts/vendor-tests/http3_state_tracking_stream_test.go.txt" vendor/github.com/quic-go/quic-go/http3/state_tracking_stream_lazy_test.go
 go test -mod=vendor github.com/quic-go/quic-go github.com/quic-go/quic-go/http3 golang.org/x/net/http2

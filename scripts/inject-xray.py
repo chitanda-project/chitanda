@@ -30,6 +30,21 @@ def inject_udp_packet_size(xray_dir):
     # Opt-in only: normal upstream protocols retain their existing allocation
     # strategy. Chitanda must receive the entire authenticated UDP record.
     hub = os.path.join(xray_dir, "transport", "internet", "udp", "hub.go")
+    with open(hub, encoding="utf-8") as f:
+        current = f.read()
+    if "func (h *Hub) ReleaseQueuedPacket(" in current:
+        # The later budget patch expands the earlier Hub/worker anchors.
+        # Validate the composed state rather than expecting the intermediate.
+        required = ("func HubPacketSize(", "packetSize int32", "var largePacket []byte",
+                    "rawBytes = largePacket", "buffer = buf.NewWithSize(int32(max(1, n)))")
+        if any(current.count(marker) != 1 for marker in required):
+            raise RuntimeError(f"Incomplete composed packet-size integration in {hub}")
+        worker = os.path.join(xray_dir, "app", "proxyman", "inbound", "worker.go")
+        with open(worker, encoding="utf-8") as f:
+            current_worker = f.read()
+        if current_worker.count("udp.HubPacketSize(sized.UDPPacketBufferSize())") != 1 or current_worker.count("pipe.WithSizeLimit(4*1024*1024)") != 1:
+            raise RuntimeError(f"Incomplete composed worker integration in {worker}")
+        return
     patch_once(hub, "func HubPacketSize(", [
         ("type Hub struct {", "func HubPacketSize(size int32) HubOption {\n\treturn func(h *Hub) { if size > buf.Size && size <= 65535 { h.packetSize = size } }\n}\n\ntype Hub struct {\n\tpacketSize int32"),
         ("\toobBytes := make([]byte, 256)", "\toobBytes := make([]byte, 256)\n\tvar largePacket []byte\n\tif h.packetSize > buf.Size { largePacket = make([]byte, h.packetSize) }"),
@@ -47,9 +62,59 @@ def inject_udp_packet_size(xray_dir):
     ])
 
 
+def inject_udp_byte_budget(xray_dir):
+    hub = os.path.join(xray_dir, "transport", "internet", "udp", "hub.go")
+    patch_once(hub, "func (h *Hub) ReleaseQueuedPacket(", [
+        ('"context"', '"context"\n "sync/atomic"'),
+        ("type Hub struct {", "func HubQueueBudget() HubOption { return func(h *Hub) { h.budgeted = true } }\n\ntype Hub struct {\n budgeted bool\n queueBytes int64\n queueDrops uint64"),
+        ("\t\tif largePacket != nil {\n\t\t\tbuffer.Release()", "\t\tif !h.reserveQueueBytes(int64(max(int(buf.Size), 1<<bits.Len(uint(max(1, n)-1))))+128) { buffer.Release(); atomic.AddUint64(&h.queueDrops, 1); continue }\n\t\tif largePacket != nil {\n\t\t\tbuffer.Release()"),
+        ("\t\tif buffer.IsEmpty() {\n\t\t\tbuffer.Release()", "\t\tif buffer.IsEmpty() {\n\t\t\th.ReleaseQueuedPacket(&udp.Packet{Payload: buffer})\n\t\t\tbuffer.Release()"),
+        ("\t\tdefault:\n\t\t\tbuffer.Release()", "\t\tdefault:\n\t\t\th.ReleaseQueuedPacket(payload)\n\t\t\tatomic.AddUint64(&h.queueDrops, 1)\n\t\t\tbuffer.Release()"),
+        ('"sync/atomic"', '"sync/atomic"\n "math/bits"'),
+        ("func (h *Hub) Receive() <-chan *udp.Packet {", '''var globalUDPQueueBytes int64
+
+func (h *Hub) reserveQueueBytes(size int64) bool {
+    if !h.budgeted { return true }
+    for {
+        used := atomic.LoadInt64(&h.queueBytes)
+        if size > (16<<20)-used { return false }
+        if atomic.CompareAndSwapInt64(&h.queueBytes, used, used+size) { break }
+    }
+    for {
+        used := atomic.LoadInt64(&globalUDPQueueBytes)
+        if size > (64<<20)-used { atomic.AddInt64(&h.queueBytes,-size); return false }
+        if atomic.CompareAndSwapInt64(&globalUDPQueueBytes, used, used+size) { return true }
+    }
+}
+
+func (h *Hub) ReleaseQueuedPacket(p *udp.Packet) {
+    if !h.budgeted { return }
+    // Standard buffers retain buf.Size; large native records use the next
+    // bytespool size class. Reserve and release exactly the same amount.
+    size := int64(max(int(buf.Size), 1<<bits.Len(uint(max(1,int(p.Payload.Len()))-1))))+128
+    atomic.AddInt64(&h.queueBytes,-size)
+    atomic.AddInt64(&globalUDPQueueBytes,-size)
+}
+
+func (h *Hub) QueueStats() (int64,uint64) { return atomic.LoadInt64(&h.queueBytes),atomic.LoadUint64(&h.queueDrops) }
+
+func (h *Hub) Receive() <-chan *udp.Packet {'''),
+    ])
+    worker = os.path.join(xray_dir, "app", "proxyman", "inbound", "worker.go")
+    patch_once(worker, "w.hub.ReleaseQueuedPacket(payload)", [
+        ("udp.HubCapacity(8192)", "udp.HubCapacity(8192), udp.HubQueueBudget()"),
+        ("for payload := range receive {", "for payload := range receive {\n\t\tw.hub.ReleaseQueuedPacket(payload)"),
+    ])
+
+
 def inject_xray(xray_dir, chitanda_dir):
     print(f"[*] Injecting Chitanda protocol into Xray-core: {xray_dir}")
     inject_udp_packet_size(xray_dir)
+    inject_udp_byte_budget(xray_dir)
+    for fname in sorted(os.listdir(os.path.join(chitanda_dir, "integration", "xray_udp_hub"))):
+        if fname.endswith("_test.go"):
+            shutil.copy2(os.path.join(chitanda_dir, "integration", "xray_udp_hub", fname),
+                         os.path.join(xray_dir, "transport", "internet", "udp", fname))
     proxy_dir = os.path.join(xray_dir, "proxy", "chitanda")
     conf_dir = os.path.join(xray_dir, "infra", "conf")
     os.makedirs(proxy_dir, exist_ok=True)

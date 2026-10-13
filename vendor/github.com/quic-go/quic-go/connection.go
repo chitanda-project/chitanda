@@ -171,10 +171,13 @@ type Conn struct {
 	oneRTTStream        *cryptoStream // only set for the server
 	cryptoStreamHandler cryptoStreamHandler
 
-	notifyReceivedPacket chan struct{}
-	sendingScheduled     chan struct{}
-	receivedPacketMx     sync.Mutex
-	receivedPackets      ringbuffer.RingBuffer[receivedPacket]
+	notifyReceivedPacket      chan struct{}
+	sendingScheduled          chan struct{}
+	receivedPacketMx          sync.Mutex
+	receivedPackets           ringbuffer.RingBuffer[receivedPacket]
+	receivedPacketBytes       int64
+	receivedPacketDrops       uint64
+	receivedPacketQueueClosed bool
 
 	// closeChan is used to notify the run loop that it should terminate
 	closeChan chan struct{}
@@ -566,10 +569,13 @@ func (c *Conn) run() (err error) {
 	defer func() {
 		// drain queued packets that will never be processed
 		c.receivedPacketMx.Lock()
+		c.receivedPacketQueueClosed = true
 		defer c.receivedPacketMx.Unlock()
 
 		for !c.receivedPackets.Empty() {
 			p := c.receivedPackets.PopFront()
+			c.receivedPacketBytes -= p.queueCost()
+			globalReceiveQueueBytes.Add(-p.queueCost())
 			p.buffer.Decrement()
 			p.buffer.MaybeRelease()
 		}
@@ -1013,6 +1019,8 @@ func (c *Conn) handlePackets() (wasProcessed bool, _ error) {
 	var hasMorePackets bool
 	for range maxPacketsToProcess {
 		p := c.receivedPackets.PopFront()
+		c.receivedPacketBytes -= p.queueCost()
+		globalReceiveQueueBytes.Add(-p.queueCost())
 		c.receivedPacketMx.Unlock()
 
 		var datagramPayloadChecksum qlog.DatagramPayloadChecksum
@@ -1955,7 +1963,9 @@ func (c *Conn) handlePacket(p receivedPacket) {
 	c.receivedPacketMx.Lock()
 	// Discard packets once the amount of queued packets is larger than
 	// the channel size, protocol.MaxConnUnprocessedPackets
-	if c.receivedPackets.Len() >= protocol.MaxConnUnprocessedPackets {
+	cost := p.queueCost()
+	if c.receivedPacketQueueClosed || c.receivedPackets.Len() >= protocol.MaxConnUnprocessedPackets || cost > (4<<20)-c.receivedPacketBytes || !reserveReceiveQueueBytes(cost) {
+		c.receivedPacketDrops++
 		if c.qlogger != nil {
 			var datagramPayloadChecksum qlog.DatagramPayloadChecksum
 			if wire.IsLongHeaderPacket(p.data[0]) {
@@ -1968,8 +1978,13 @@ func (c *Conn) handlePacket(p receivedPacket) {
 			})
 		}
 		c.receivedPacketMx.Unlock()
+		if p.buffer != nil {
+			p.buffer.Decrement()
+			p.buffer.MaybeRelease()
+		}
 		return
 	}
+	c.receivedPacketBytes += cost
 	c.receivedPackets.PushBack(p)
 	c.receivedPacketMx.Unlock()
 
@@ -3205,4 +3220,32 @@ func (c *Conn) NextConnection(ctx context.Context) (*Conn, error) {
 // connection ID length), and the size of the encryption tag.
 func estimateMaxPayloadSize(mtu protocol.ByteCount) protocol.ByteCount {
 	return mtu - 1 /* type byte */ - 20 /* maximum connection ID length */ - 16 /* tag size */
+}
+
+var globalReceiveQueueBytes atomic.Int64
+
+func reserveReceiveQueueBytes(size int64) bool {
+	for {
+		used := globalReceiveQueueBytes.Load()
+		if size <= 0 || size > (64<<20)-used {
+			return false
+		}
+		if globalReceiveQueueBytes.CompareAndSwap(used, used+size) {
+			return true
+		}
+	}
+}
+
+func (p receivedPacket) queueCost() int64 {
+	if p.buffer != nil {
+		return int64(p.buffer.Cap()) + 128
+	}
+	return int64(cap(p.data)) + 128
+}
+
+// ReceiveQueueStats exposes actual queued allocations and cumulative drops.
+func (c *Conn) ReceiveQueueStats() (packets int, bytes int64, drops uint64) {
+	c.receivedPacketMx.Lock()
+	defer c.receivedPacketMx.Unlock()
+	return c.receivedPackets.Len(), c.receivedPacketBytes, c.receivedPacketDrops
 }

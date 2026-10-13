@@ -22,7 +22,7 @@ func TestPlainUDPServer_ConcurrentResolverUpdate(t *testing.T) {
 	}
 	// The resolver fails before a codec is used; one slot makes this a valid
 	// authenticated worker task without changing the resolver race under test.
-	s := &PlainUDPServer{resolveUDP: resolve, codecs: make([]*plainudp.Codec, 1)}
+	s := &PlainUDPServer{resolveUDP: resolve, codecs: make([]*plainudp.Codec, 1), namespaces: []string{"test"}}
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(5)
@@ -39,7 +39,7 @@ func TestPlainUDPServer_ConcurrentResolverUpdate(t *testing.T) {
 			<-start
 			for seq := uint64(1); seq <= 2000; seq++ {
 				s.processTask(context.Background(), udpTask{
-					sessionID: id, seq: seq, targetAddr: "example.invalid:53",
+					sessionID: id, seq: seq, timestamp: uint64(time.Now().Unix()), targetAddr: "example.invalid:53",
 					clientAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345},
 				})
 			}
@@ -53,7 +53,7 @@ func TestPlainUDPServer_ConcurrentResolverUpdate(t *testing.T) {
 }
 
 func TestPlainUDPServer_ResolverCanUpdateItself(t *testing.T) {
-	s := &PlainUDPServer{codecs: make([]*plainudp.Codec, 1)}
+	s := &PlainUDPServer{codecs: make([]*plainudp.Codec, 1), namespaces: []string{"test"}}
 	s.SetResolveUDP(func(context.Context, string) (*net.UDPAddr, error) {
 		// A resolver must not execute while the configuration lock is held.
 		s.SetResolveUDP(nil)
@@ -61,7 +61,7 @@ func TestPlainUDPServer_ResolverCanUpdateItself(t *testing.T) {
 	})
 	done := make(chan struct{})
 	go func() {
-		s.processTask(context.Background(), udpTask{sessionID: 1, seq: 1, targetAddr: "example.invalid:53"})
+		s.processTask(context.Background(), udpTask{sessionID: 1, seq: 1, timestamp: uint64(time.Now().Unix()), targetAddr: "example.invalid:53"})
 		close(done)
 	}()
 	select {

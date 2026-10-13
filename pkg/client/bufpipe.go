@@ -6,14 +6,15 @@ import (
 )
 
 type bufferedPipe struct {
-	mu     sync.Mutex
-	cond   sync.Cond
-	buf    []byte
-	head   int
-	tail   int
-	count  int
-	closed bool
-	err    error
+	mu       sync.Mutex
+	cond     sync.Cond
+	buf      []byte
+	capacity int
+	head     int
+	tail     int
+	count    int
+	closed   bool
+	err      error
 }
 
 type bufferedPipeReader struct {
@@ -29,7 +30,7 @@ func newBufferedPipe(capacity int) (*bufferedPipeReader, *bufferedPipeWriter) {
 		capacity = 128 * 1024
 	}
 	p := &bufferedPipe{
-		buf: make([]byte, capacity),
+		capacity: capacity,
 	}
 	p.cond.L = &p.mu
 	return &bufferedPipeReader{pipe: p}, &bufferedPipeWriter{pipe: p}
@@ -104,6 +105,22 @@ func (w *bufferedPipeWriter) Write(b []byte) (int, error) {
 	written := 0
 
 	for written < total {
+		if p.err != nil {
+			return written, p.err
+		}
+		if p.closed {
+			return written, io.ErrClosedPipe
+		}
+		if len(p.buf) < p.capacity && p.count+total-written > len(p.buf) {
+			capacity := min(p.capacity, max(16*1024, max(len(p.buf)*2, p.count+total-written)))
+			grown := make([]byte, capacity)
+			if p.count > 0 {
+				first := min(p.count, len(p.buf)-p.head)
+				copy(grown, p.buf[p.head:p.head+first])
+				copy(grown[first:], p.buf[:p.count-first])
+			}
+			p.buf, p.head, p.tail = grown, 0, p.count%capacity
+		}
 		for p.count == len(p.buf) {
 			if p.err != nil {
 				return written, p.err

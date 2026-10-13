@@ -298,8 +298,8 @@ func TestChitandaQueueGlobalByteBudgetSharedAcrossFlows(t *testing.T) {
 func TestChitandaQueuePerFlowByteLimit(t *testing.T) {
 	q := newChitandaPacketQueue()
 	q.budget = &chitandaQueueBudget{limit: chitandaSenderGlobalBytes}
-	first := &mockDrainPacket{data: make([]byte, 2<<20)}
-	second := &mockDrainPacket{data: make([]byte, 2<<20)}
+	first := &mockDrainPacket{data: make([]byte, chitandaSenderMaxFlowBytes/2)}
+	second := &mockDrainPacket{data: make([]byte, chitandaSenderMaxFlowBytes/2)}
 	q.push(first)
 	q.push(second)
 	if second.dropped.Load() != 1 || q.length != 1 {
@@ -308,5 +308,21 @@ func TestChitandaQueuePerFlowByteLimit(t *testing.T) {
 	q.close()
 	if q.budget.used.Load() != 0 {
 		t.Fatal("per-flow close leaked global budget")
+	}
+}
+
+type compactQueuePacket struct{ mockDrainPacket }
+
+func (p *compactQueuePacket) CompactChitandaData() { p.data = append([]byte(nil), p.data...) }
+
+func TestChitandaQueueRealPayloadCountFitsWithinByteBudget(t *testing.T) {
+	q := newChitandaPacketQueue()
+	q.budget = &chitandaQueueBudget{limit: chitandaSenderGlobalBytes}
+	defer q.close()
+	for i := 0; i < 8192; i++ {
+		q.push(&compactQueuePacket{mockDrainPacket: mockDrainPacket{data: make([]byte, 1200, 16<<10)}})
+	}
+	if q.length != 8192 || q.dropped.Load() != 0 || q.bytes > chitandaSenderMaxFlowBytes {
+		t.Fatalf("real payload budget = %d/%d/%d", q.length, q.dropped.Load(), q.bytes)
 	}
 }

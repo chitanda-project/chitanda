@@ -9,7 +9,7 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-const streamDatagramQueueLen = 256
+const streamDatagramQueueLen = 2048
 
 // Account for the queue slot and slice metadata as well as payload bytes in
 // the connection-wide budget. This also bounds streams full of empty frames.
@@ -32,6 +32,7 @@ type stateTrackingStream struct {
 	queue                [][]byte
 	queueHead            int
 	queueLen             int
+	droppedDatagrams     uint64
 
 	mx      sync.Mutex
 	sendErr error
@@ -187,6 +188,7 @@ func (s *stateTrackingStream) enqueueDatagrams(datagrams [][]byte) {
 	for _, data := range datagrams {
 		accountedSize := len(data) + queuedDatagramAccountingOverhead
 		if s.recvErr != nil || s.queueLen >= streamDatagramQueueLen || !s.clearer.reserveDatagram(accountedSize) {
+			s.droppedDatagrams++
 			continue
 		}
 		if s.queue == nil {
@@ -264,4 +266,10 @@ start:
 
 func (s *stateTrackingStream) QUICStream() *quic.Stream {
 	return s.Stream
+}
+
+func (s *stateTrackingStream) DatagramReceiveStats() (int, uint64) {
+	s.mx.Lock()
+	defer s.mx.Unlock()
+	return s.queueLen, s.droppedDatagrams
 }

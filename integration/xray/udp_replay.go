@@ -2,6 +2,7 @@ package chitanda
 
 import (
 	"context"
+	"github.com/violetaini/chitanda/pkg/auth"
 	"github.com/violetaini/chitanda/pkg/server"
 	"sync"
 	"time"
@@ -18,12 +19,14 @@ type udpReplayEntry struct {
 	last   time.Time
 }
 type udpReplayRegistry struct {
-	mu      sync.Mutex
-	entries map[uint64]*udpReplayEntry
-	closed  bool
+	mu        sync.Mutex
+	entries   map[uint64]*udpReplayEntry
+	closed    bool
+	cache     *auth.ReplayCache
+	namespace string
 }
 
-func (r *udpReplayRegistry) accept(id, seq uint64, now time.Time) bool {
+func (r *udpReplayRegistry) accept(id, seq uint64, now time.Time, timestamps ...uint64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
@@ -38,10 +41,16 @@ func (r *udpReplayRegistry) accept(id, seq uint64, now time.Time) bool {
 		if len(r.entries) >= maxUDPReplaySessions {
 			return false
 		}
-		e = &udpReplayEntry{window: server.NewUDPReplayWindow()}
+		e = &udpReplayEntry{window: server.NewPersistentUDPReplayWindow(r.cache, r.namespace, id)}
 		r.entries[id] = e
 	}
-	if !e.window.Accept(seq) {
+	accepted := false
+	if len(timestamps) > 0 {
+		accepted = e.window.AcceptAuthenticated(seq, timestamps[0], now)
+	} else {
+		accepted = e.window.Accept(seq)
+	}
+	if !accepted {
 		return false
 	}
 	e.last = now

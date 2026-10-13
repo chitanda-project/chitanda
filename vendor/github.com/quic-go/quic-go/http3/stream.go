@@ -460,3 +460,15 @@ func (r *tracingReader) Read(b []byte) (int, error) {
 	}
 	return n, err
 }
+
+// DatagramReceiveStats exposes tracked HTTP Datagram queue length and drops.
+func (s *Stream) DatagramReceiveStats() (int, uint64) {
+	if tracked, ok := s.datagramStream.(interface{ DatagramReceiveStats() (int, uint64) }); ok {
+		return tracked.DatagramReceiveStats()
+	}
+	return 0, 0
+}
+
+func (s *RequestStream) DatagramReceiveStats() (int, uint64) {
+	return s.str.DatagramReceiveStats()
+}

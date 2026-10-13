@@ -30,7 +30,7 @@
 | `path` | String | いいえ | `/api/v1/sync` | 偽装リクエストパス。一般的な API パスを推奨 (`stream` モードでは不要) |
 | `transport` | String | いいえ | `h2` | キャリアモード: `h2` (デフォルト)、`stream`、`h3`、`auto`、`h1` (または `plain-h1`) |
 | `sni` | String | いいえ | (`server` と同一) | TLS SNI ドメイン。TLS モードでは有効なドメインが必須、`stream`/`h1` モードでは省略可 |
-| `server-id` | String | いいえ | - | サーバーノード識別子 (ノード身元バインド、`stream` 専用線モードでクロスノードリプレイ攻撃を防御) |
+| `server-id` | String | いいえ | - | ノード識別子。`stream` の TCP と `stream` / `h1` の Plain-UDP で使用。各ノードに固有かつ安定した非空 ID を設定し、両端を同時更新すること。空 ID はノード間分離を提供しない。 |
 | `skip-cert-verify`| Boolean| いいえ | `false` | TLS 証明書の検証をスキップするかどうか (本番環境では `false` を推奨) |
 | `pool-size` | Integer | いいえ | `4` | TCP コネクションプールのサイズ (`h2` モードのスループットおよびバースト耐性を最適化) |
 | `udp-pool-size` | Integer | いいえ | (`pool-size` と同一) | UDP コネクションプールのサイズ (H3 QUIC 独立キャリア数。ゲーム・DNS などの多重化および QoS 物理分離用) |
@@ -276,7 +276,7 @@ Xray-core において、`chitanda` は **Inbound (サーバーインバウン�
 | `transport` | String | いいえ | `h2` | キャリアモード (`h2` / `h3` / `auto` / `stream` / `h1`) |
 | `fallback` | String | いいえ | - | プローブ耐性フォールバック先 (例: `127.0.0.1:8080`、`unix:/run/nginx.sock`、外部 Web サイト等) |
 | `strict_sni` | String | いいえ | - | 厳格な SNI 検証ドメイン (指定 SNI と一致しない場合は強制フォールバック) |
-| `server_id` | String | いいえ | - | サーバーノード識別子 (`stream` モードでのクロスノードリプレイ攻撃防御) |
+| `server_id` | String | いいえ | - | ノード識別子。`stream` TCP および `stream` / `h1` Plain-UDP に使用。非空 ID はクライアント側と一致させる。 |
 | `replay_file` | String | いいえ | - | 永続化リプレイ防止キャッシュのファイルパス (例: `/var/log/chitanda/replay.db`) |
 
 ---
@@ -413,7 +413,7 @@ Xray-core において、`chitanda` は **Inbound (サーバーインバウン�
 | `pool_size` | Integer | いいえ | `4` | TCP 物理コネクションプールサイズ (`h2` / `auto` モードで有効) |
 | `auto_scale` | Boolean | いいえ | `false` | 動的キャリア拡張を有効化 |
 | `max_pool_size` | Integer | いいえ | `8` | 拡張時のキャリア上限（最大 `16`）。初期プールより大きい値を単独指定した場合も拡張を有効化 |
-| `server_id` | String | いいえ | - | サーバー識別子バインド (`stream` モード専用、クロスノードリプレイ防御) |
+| `server_id` | String | いいえ | - | ノード識別子。`stream` TCP および `stream` / `h1` Plain-UDP に使用。非空 ID はサーバー側と一致させる。 |
 | `allow_insecure` | Boolean | いいえ | `false` | TLS 証明書検証をスキップするかどうか (デフォルト `false`、自己署名証明書テスト用) |
 
 ---

@@ -15,6 +15,7 @@ import (
 	"github.com/violetaini/chitanda/internal/icmpmsg"
 	"github.com/violetaini/chitanda/internal/plainudp"
 	"github.com/violetaini/chitanda/internal/target"
+	"github.com/violetaini/chitanda/pkg/auth"
 )
 
 const (
@@ -38,6 +39,7 @@ type udpTask struct {
 	rawBuf     *[]byte
 	rawLen     int
 	seq        uint64
+	timestamp  uint64
 }
 
 type plainUDPSessionKey struct {
@@ -68,6 +70,8 @@ type PlainUDPServer struct {
 	closed           atomic.Bool
 	inFlightMem      atomic.Int64
 	maxMemBudget     int64
+	replays          *auth.ReplayCache
+	namespaces       []string
 }
 
 type plainICMPTarget struct {
@@ -93,16 +97,31 @@ type plainUDPSession struct {
 	lastActive  atomic.Int64
 	replayMu    sync.Mutex
 	replay      frame.ReplayWindow
+	guard       *UDPReplayWindow
+}
+
+// PlainUDPOptions binds native UDP to the same identity and durable replay
+// cache as TCP. A nil cache is explicitly memory-only SDK mode.
+type PlainUDPOptions struct {
+	ServerID string
+	Replays  *auth.ReplayCache
 }
 
 // NewPlainUDPServer creates a new plain-udp listener with a bounded worker pool and memory budget.
-func NewPlainUDPServer(conn *net.UDPConn, psk []byte) (*PlainUDPServer, error) {
-	return NewPlainUDPServerWithUsers(conn, []UserKey{{PSK: psk}})
+func NewPlainUDPServer(conn *net.UDPConn, psk []byte, options ...PlainUDPOptions) (*PlainUDPServer, error) {
+	return NewPlainUDPServerWithUsers(conn, []UserKey{{PSK: psk}}, options...)
 }
 
 // NewPlainUDPServerWithUsers keeps each user's authenticated UDP sessions and
 // response cipher separate, even when clients choose the same session ID.
-func NewPlainUDPServerWithUsers(conn *net.UDPConn, users []UserKey) (*PlainUDPServer, error) {
+func NewPlainUDPServerWithUsers(conn *net.UDPConn, users []UserKey, options ...PlainUDPOptions) (*PlainUDPServer, error) {
+	var option PlainUDPOptions
+	if len(options) > 1 {
+		return nil, errors.New("plainudp: multiple options")
+	}
+	if len(options) == 1 {
+		option = options[0]
+	}
 	if conn == nil {
 		return nil, errors.New("plainudp: listener is required")
 	}
@@ -111,7 +130,7 @@ func NewPlainUDPServerWithUsers(conn *net.UDPConn, users []UserKey) (*PlainUDPSe
 	}
 	codecs := make([]*plainudp.Codec, 0, len(users))
 	for _, user := range users {
-		codec, err := plainudp.NewCodec(user.PSK)
+		codec, err := plainudp.NewCodec(user.PSK, option.ServerID)
 		if err != nil {
 			return nil, err
 		}
@@ -138,6 +157,8 @@ func NewPlainUDPServerWithUsers(conn *net.UDPConn, users []UserKey) (*PlainUDPSe
 		workers:      workers,
 		maxMemBudget: DefaultUDPMemoryBudget,
 		maxSessions:  10000,
+		replays:      option.Replays,
+		namespaces:   udpReplayNamespaces(users, option.ServerID),
 		resolveUDP:   target.ResolveUDPAddr,
 	}, nil
 }
@@ -236,13 +257,13 @@ func (s *PlainUDPServer) Serve(ctx context.Context) error {
 
 		now := time.Now()
 		var userIndex int
-		var sessionID, seq uint64
+		var sessionID, seq, timestamp uint64
 		var targetAddr string
 		var payload []byte
 		if len(s.codecs) == 1 {
-			sessionID, targetAddr, payload, _, seq, err = s.codecs[0].DecodePacket((*rawBufPtr)[:n], plainudp.DirClientToServer, now)
+			sessionID, targetAddr, payload, timestamp, seq, err = s.codecs[0].DecodePacket((*rawBufPtr)[:n], plainudp.DirClientToServer, now)
 		} else {
-			userIndex, sessionID, targetAddr, payload, _, seq, err = plainudp.DecodePacketMulti(s.codecs, (*rawBufPtr)[:n], plainudp.DirClientToServer, now)
+			userIndex, sessionID, targetAddr, payload, timestamp, seq, err = plainudp.DecodePacketMulti(s.codecs, (*rawBufPtr)[:n], plainudp.DirClientToServer, now)
 		}
 		if err != nil {
 			s.inFlightMem.Add(-bufCap)
@@ -260,6 +281,7 @@ func (s *PlainUDPServer) Serve(ctx context.Context) error {
 			rawBuf:     rawBufPtr,
 			rawLen:     n,
 			seq:        seq,
+			timestamp:  timestamp,
 		}
 
 		select {
@@ -307,7 +329,7 @@ func (s *PlainUDPServer) processTask(ctx context.Context, task udpTask) {
 		if s.maxSessions > 0 && s.sessionCount.Load() >= s.maxSessions {
 			return // Session limit reached, drop task
 		}
-		newSession := &plainUDPSession{sessionID: task.sessionID, codec: s.codecs[task.userIndex]}
+		newSession := &plainUDPSession{sessionID: task.sessionID, codec: s.codecs[task.userIndex], guard: NewPersistentUDPReplayWindow(s.replays, s.namespaces[task.userIndex], task.sessionID)}
 		actual, loadedActual := s.sessions.LoadOrStore(key, newSession)
 		if !loadedActual {
 			s.sessionCount.Add(1)
@@ -317,9 +339,7 @@ func (s *PlainUDPServer) processTask(ctx context.Context, task udpTask) {
 	session := val.(*plainUDPSession)
 
 	// Anti-Replay verification MUST succeed BEFORE updating clientAddr
-	session.replayMu.Lock()
-	accepted := session.replay.Accept(task.seq)
-	session.replayMu.Unlock()
+	accepted := session.guard.AcceptAuthenticated(task.seq, task.timestamp, time.Now())
 	if !accepted {
 		return
 	}
@@ -572,16 +592,23 @@ func (s *PlainUDPServer) closeSessions() {
 
 // PlainUDPCodec wraps plainudp.Codec for external integrators (e.g. Xray).
 type PlainUDPCodec struct {
-	codec *plainudp.Codec
+	codec     *plainudp.Codec
+	namespace string
 }
 
-func NewPlainUDPCodec(psk []byte) (*PlainUDPCodec, error) {
-	c, err := plainudp.NewCodec(psk)
+func NewPlainUDPCodec(psk []byte, serverIDs ...string) (*PlainUDPCodec, error) {
+	c, err := plainudp.NewCodec(psk, serverIDs...)
 	if err != nil {
 		return nil, err
 	}
-	return &PlainUDPCodec{codec: c}, nil
+	serverID := ""
+	if len(serverIDs) > 0 {
+		serverID = serverIDs[0]
+	}
+	return &PlainUDPCodec{codec: c, namespace: UDPReplayNamespace(psk, serverID)}, nil
 }
+
+func (c *PlainUDPCodec) ReplayNamespace() string { return c.namespace }
 
 func (c *PlainUDPCodec) DecodeClientPacket(packet []byte, now time.Time) (sessionID uint64, targetAddr string, payload []byte, timestamp uint64, seq uint64, err error) {
 	return c.codec.DecodePacket(packet, plainudp.DirClientToServer, now)
@@ -615,8 +642,12 @@ func DecodeClientPacketMulti(codecs []*PlainUDPCodec, packet []byte, now time.Ti
 
 // UDPReplayWindow provides anti-replay window tracking for datagrams.
 type UDPReplayWindow struct {
-	mu     sync.Mutex
-	window frame.ReplayWindow
+	mu        sync.Mutex
+	window    frame.ReplayWindow
+	cache     *auth.ReplayCache
+	namespace string
+	sessionID uint64
+	buckets   map[uint64]time.Time
 }
 
 func NewUDPReplayWindow() *UDPReplayWindow {
