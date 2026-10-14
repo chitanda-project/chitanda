@@ -238,7 +238,7 @@ func (r *udpRoutes) beginRoute(ctx context.Context, key udpRouteKey) (*udpRoute,
 		}
 		user := "invalid"
 		if key.userIndex >= 0 && key.userIndex < len(r.codecs) && r.codecs[key.userIndex] != nil {
-			user = r.codecs[key.userIndex].ReplayNamespace()
+			user = r.codecs[key.userIndex].ResourceIdentity()
 		}
 		release, ok := reserveNativeRoute(user)
 		if !ok {

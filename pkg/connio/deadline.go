@@ -48,10 +48,20 @@ func stopTimer(t *time.Timer) {
 }
 
 type packet struct {
-	data []byte
-	addr net.Addr
-	err  error
+	data    []byte
+	addr    net.Addr
+	err     error
+	release func()
 }
+
+func (p *packet) free() {
+	if p.release != nil {
+		p.release()
+		p.release = nil
+	}
+	p.data = nil
+}
+
 type writeResult struct {
 	n   int
 	err error
@@ -61,6 +71,7 @@ type writeResult struct {
 // current partial chunk. next must return owned data, and interrupt must wake it.
 type Reader struct {
 	next      func() ([]byte, net.Addr, error)
+	nextOwned func() ([]byte, net.Addr, func(), error)
 	interrupt func() error
 	once      sync.Once
 	closeOnce sync.Once
@@ -75,6 +86,15 @@ type Reader struct {
 func NewReader(next func() ([]byte, net.Addr, error), interrupt func() error) *Reader {
 	return &Reader{next: next, interrupt: interrupt, done: make(chan struct{}), exited: make(chan struct{}), queue: make(chan packet, 1)}
 }
+
+// NewOwnedReader returns a buffer lease only after all bytes are copied to the
+// consumer (including partial reads), or after shutdown/discard. next may run
+// ahead of consumption and must not reuse a buffer until release is called.
+func NewOwnedReader(next func() ([]byte, net.Addr, func(), error), interrupt func() error) *Reader {
+	r := NewReader(nil, interrupt)
+	r.nextOwned = next
+	return r
+}
 func (r *Reader) start() {
 	r.once.Do(func() {
 		go func() {
@@ -85,13 +105,19 @@ func (r *Reader) start() {
 					return
 				default:
 				}
-				b, a, e := r.next()
+				var item packet
+				if r.nextOwned != nil {
+					item.data, item.addr, item.release, item.err = r.nextOwned()
+				} else {
+					item.data, item.addr, item.err = r.next()
+				}
 				select {
-				case r.queue <- packet{data: b, addr: a, err: e}:
+				case r.queue <- item:
 				case <-r.done:
+					item.free()
 					return
 				}
-				if e != nil {
+				if item.err != nil {
 					return
 				}
 			}
@@ -136,6 +162,7 @@ func (r *Reader) Read(p []byte) (int, error) {
 	default:
 	}
 	for len(r.pending.data) == 0 {
+		r.pending.free()
 		if r.pending.err != nil {
 			return 0, r.pending.err
 		}
@@ -152,6 +179,9 @@ func (r *Reader) Read(p []byte) (int, error) {
 	}
 	n := copy(p, r.pending.data)
 	r.pending.data = r.pending.data[n:]
+	if len(r.pending.data) == 0 {
+		r.pending.free()
+	}
 	return n, nil
 }
 func (r *Reader) ReadPacket(p []byte) (int, net.Addr, error) {
@@ -164,6 +194,7 @@ func (r *Reader) ReadPacket(p []byte) (int, net.Addr, error) {
 	if err != nil {
 		return 0, nil, err
 	}
+	defer item.free()
 	r.pending.err = item.err
 	if len(item.data) == 0 && item.err != nil {
 		return 0, nil, item.err
@@ -183,7 +214,17 @@ func (r *Reader) Close() error {
 	})
 	r.start()
 	<-r.exited
-	return nil
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pending.free()
+	for {
+		select {
+		case item := <-r.queue:
+			item.free()
+		default:
+			return nil
+		}
+	}
 }
 
 type writeRequest struct {

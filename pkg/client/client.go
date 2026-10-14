@@ -341,9 +341,10 @@ func (c *Client) pickBestH3Manager() *h3TransportManager {
 	}
 	if n == 1 {
 		mgr := c.h3Managers[0]
+		active := mgr.activeStreams.Add(1)
 		c.carrierMu.RUnlock()
 		if c.autoscaler != nil {
-			c.autoscaler.OnActivity("h3", mgr.activeStreams.Load(), 1)
+			c.autoscaler.OnActivity("h3", active, 1)
 		}
 		return mgr
 	}
@@ -361,10 +362,11 @@ func (c *Client) pickBestH3Manager() *h3TransportManager {
 			best = manager
 		}
 	}
+	best.activeStreams.Add(1)
 	c.carrierMu.RUnlock()
 
 	if c.autoscaler != nil {
-		c.autoscaler.OnActivity("h3", minActive, n)
+		c.autoscaler.OnActivity("h3", minActive+1, n)
 	}
 	return best
 }
@@ -375,11 +377,7 @@ func (c *Client) reserveH3Manager() *h3TransportManager {
 	if c.closed {
 		return nil
 	}
-	manager := c.pickBestH3Manager()
-	if manager != nil {
-		manager.activeStreams.Add(1)
-	}
-	return manager
+	return c.pickBestH3Manager()
 }
 
 // ListenPacket creates a net.PacketConn for native UDP proxying over QUIC Datagrams (or Plain-UDP Datagrams).

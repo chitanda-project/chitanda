@@ -19,7 +19,7 @@ var sharedCaches = struct {
 func DefaultReplayPath(identity string) (string, error) {
 	dir := os.Getenv("CHITANDA_STATE_DIR")
 	if dir == "" {
-		base, err := os.UserConfigDir()
+		base, err := persistentConfigDir()
 		if err != nil {
 			return "", err
 		}

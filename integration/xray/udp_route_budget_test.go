@@ -1,7 +1,9 @@
 package chitanda
 
 import (
+	"bytes"
 	"context"
+	"github.com/violetaini/chitanda/pkg/server"
 	"net"
 	"testing"
 	"time"
@@ -34,6 +36,41 @@ func TestNativeRouteBudgetReleaseIsExactlyOnce(t *testing.T) {
 		t.Fatal("release did not restore capacity")
 	}
 	release()
+}
+
+func TestNativeRouteSharesIdentityBudgetWithSDKH3Targets(t *testing.T) {
+	codec, err := server.NewPlainUDPCodec(bytes.Repeat([]byte{0x91}, 32), "budget-shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var leases []func()
+	defer func() {
+		for _, release := range leases {
+			release()
+		}
+	}()
+	for range server.MaxUserUDPTargets - 1 {
+		release, ok := server.ReserveUDPTarget(codec.ResourceIdentity())
+		if !ok {
+			t.Fatal("early quota exhaustion")
+		}
+		leases = append(leases, release)
+	}
+	a, b := net.Pipe()
+	defer b.Close()
+	r := newUDPRoutes(context.Background(), nil, []*server.PlainUDPCodec{codec}, a)
+	defer r.Close()
+	key := udpRouteKey{0, 1, "first"}
+	_, _, pending, err := r.beginRoute(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, extra, err := r.beginRoute(context.Background(), udpRouteKey{0, 2, "second"})
+	if err == nil {
+		r.finishRoute(udpRouteKey{0, 2, "second"}, extra, nil, nil, net.ErrClosed)
+		t.Error("native route bypassed SDK target budget")
+	}
+	r.finishRoute(key, pending, nil, nil, net.ErrClosed)
 }
 
 func TestNativeRouteOpeningDoesNotHoldTableLock(t *testing.T) {

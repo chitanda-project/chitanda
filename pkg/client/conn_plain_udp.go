@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/violetaini/chitanda/internal/frame"
 	"github.com/violetaini/chitanda/internal/plainudp"
 )
 
@@ -30,7 +29,7 @@ type plainUDPConn struct {
 	codec      *plainudp.Codec
 	closed     atomic.Bool
 	replayMu   sync.Mutex
-	replay     frame.ReplayWindow
+	replay     plainudp.ResponseReplayWindow
 }
 
 func newPlainUDPConn(
@@ -115,7 +114,7 @@ func (c *plainUDPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 			}
 		}
 
-		sessionID, targetAddrStr, payload, _, seq, err := c.codec.DecodePacket((*bufPtr)[:readN], plainudp.DirServerToClient, time.Now())
+		sessionID, targetAddrStr, payload, timestamp, seq, err := c.codec.DecodePacket((*bufPtr)[:readN], plainudp.DirServerToClient, time.Now())
 		if err != nil {
 			continue // Drop corrupt, unauthenticated, replayed, reflected, or expired datagrams
 		}
@@ -124,7 +123,11 @@ func (c *plainUDPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		}
 
 		c.replayMu.Lock()
-		accepted := c.replay.Accept(seq)
+		if c.closed.Load() {
+			c.replayMu.Unlock()
+			return 0, nil, net.ErrClosed
+		}
+		accepted := c.replay.Accept(seq, timestamp)
 		c.replayMu.Unlock()
 		if !accepted {
 			continue // Drop replayed responses
@@ -155,7 +158,11 @@ func (c *plainUDPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 func (c *plainUDPConn) Close() error {
 	c.closed.Store(true)
-	return c.conn.Close()
+	err := c.conn.Close()
+	c.replayMu.Lock()
+	c.replay = plainudp.ResponseReplayWindow{}
+	c.replayMu.Unlock()
+	return err
 }
 
 func (c *plainUDPConn) LocalAddr() net.Addr {

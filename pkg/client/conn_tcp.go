@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,6 +19,11 @@ import (
 )
 
 type h2TransportClient struct {
+	lifecycleMu   sync.Mutex
+	closed        bool
+	lifetime      context.Context
+	stop          context.CancelFunc
+	streams       map[*rawH2Conn]struct{}
 	server        string
 	serverName    string
 	rootURL       string
@@ -98,7 +104,11 @@ func newH2TransportClient(server, serverName, rootURL, requestURL, path string, 
 		f.SetInt(64)
 	}
 
+	lifetime, stop := context.WithCancel(context.Background())
 	return &h2TransportClient{
+		lifetime:   lifetime,
+		stop:       stop,
+		streams:    make(map[*rawH2Conn]struct{}),
 		server:     server,
 		serverName: serverName,
 		rootURL:    rootURL,
@@ -111,6 +121,9 @@ func newH2TransportClient(server, serverName, rootURL, requestURL, path string, 
 }
 
 func (c *h2TransportClient) prewarm(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(c.lifetime, cancel)
+	defer func() { stop(); cancel() }()
 	request, err := http.NewRequestWithContext(ctx, http.MethodHead, c.rootURL, nil)
 	if err != nil {
 		return err
@@ -144,7 +157,15 @@ func (c *h2TransportClient) dialH2TCP(ctx context.Context, target string) (net.C
 }
 
 func (c *h2TransportClient) dialH2TCPOnce(ctx context.Context, target string) (net.Conn, error) {
-	streamCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	c.lifecycleMu.Lock()
+	closed := c.closed
+	c.lifecycleMu.Unlock()
+	if closed {
+		return nil, net.ErrClosed
+	}
+	streamCtx, cancelStream := context.WithCancel(context.WithoutCancel(ctx))
+	stopLifecycle := context.AfterFunc(c.lifetime, cancelStream)
+	cancel := func() { stopLifecycle(); cancelStream() }
 	stopCancel := context.AfterFunc(ctx, func() {
 		cancel()
 	})
@@ -194,7 +215,19 @@ func (c *h2TransportClient) dialH2TCPOnce(ctx context.Context, target string) (n
 	if response.Header.Get("X-Session-Framing") == "1" {
 		body = &framedResponseBody{Reader: frame.NewStreamReader(body), Closer: body}
 	}
-	return newRawH2Conn(target, body, pipeWriter, cancel, c), nil
+	conn := newRawH2Conn(target, body, pipeWriter, cancel, c)
+	c.lifecycleMu.Lock()
+	if c.closed {
+		c.lifecycleMu.Unlock()
+		// The unsuccessful caller releases its reservation; this connection
+		// was never registered and must not decrement the counter a second time.
+		conn.h2Client = nil
+		_ = conn.Close()
+		return nil, net.ErrClosed
+	}
+	c.streams[conn] = struct{}{}
+	c.lifecycleMu.Unlock()
+	return conn, nil
 }
 
 type framedResponseBody struct {
@@ -203,6 +236,21 @@ type framedResponseBody struct {
 }
 
 func (c *h2TransportClient) close() {
+	c.lifecycleMu.Lock()
+	if c.closed {
+		c.lifecycleMu.Unlock()
+		return
+	}
+	c.closed = true
+	c.stop()
+	streams := make([]*rawH2Conn, 0, len(c.streams))
+	for stream := range c.streams {
+		streams = append(streams, stream)
+	}
+	c.lifecycleMu.Unlock()
+	for _, stream := range streams {
+		_ = stream.Close()
+	}
 	c.transport.CloseIdleConnections()
 }
 
@@ -218,6 +266,8 @@ type rawH2Conn struct {
 	writes     *connio.Writer
 }
 
+var h2ReadPool = sync.Pool{New: func() any { b := make([]byte, 64<<10); return &b }}
+
 func newRawH2Conn(target string, body io.ReadCloser, pipeWriter pipeWriteCloser, cancel context.CancelFunc, h2Client *h2TransportClient) *rawH2Conn {
 	return &rawH2Conn{
 		target:     target,
@@ -225,10 +275,10 @@ func newRawH2Conn(target string, body io.ReadCloser, pipeWriter pipeWriteCloser,
 		pipeWriter: pipeWriter,
 		cancel:     cancel,
 		h2Client:   h2Client,
-		reads: connio.NewReader(func() ([]byte, net.Addr, error) {
-			b := make([]byte, 64<<10)
-			n, err := body.Read(b)
-			return b[:n], nil, err
+		reads: connio.NewOwnedReader(func() ([]byte, net.Addr, func(), error) {
+			b := h2ReadPool.Get().(*[]byte)
+			n, err := body.Read(*b)
+			return (*b)[:n], nil, func() { h2ReadPool.Put(b) }, err
 		}, body.Close),
 		writes: connio.NewWriter(func(b []byte, _ net.Addr) (int, error) { return pipeWriter.Write(b) }, pipeWriter.Close, func() error { return pipeWriter.CloseWithError(net.ErrClosed) }),
 	}
@@ -260,6 +310,9 @@ func (c *rawH2Conn) Close() error {
 		return nil
 	}
 	if c.h2Client != nil {
+		c.h2Client.lifecycleMu.Lock()
+		delete(c.h2Client.streams, c)
+		c.h2Client.lifecycleMu.Unlock()
 		c.h2Client.activeStreams.Add(-1)
 	}
 	if c.cancel != nil {

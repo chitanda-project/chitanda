@@ -315,6 +315,8 @@ type datagramBatchStream interface {
 }
 
 type udpTarget struct {
+	once       sync.Once
+	release    func()
 	lastActive atomic.Int64
 	address    string
 	conn       net.Conn
@@ -323,6 +325,8 @@ type udpTarget struct {
 }
 
 type icmpTarget struct {
+	once       sync.Once
+	release    func()
 	lastActive atomic.Int64
 	address    string
 	targetIP   net.IP
@@ -331,6 +335,31 @@ type icmpTarget struct {
 }
 
 const udpRelayBatchSize = 64
+
+func (t *udpTarget) close() {
+	t.once.Do(func() {
+		_ = t.conn.Close()
+		if t.release != nil {
+			t.release()
+		}
+	})
+}
+func (t *icmpTarget) close() {
+	t.once.Do(func() {
+		_ = t.conn.Close()
+		if t.release != nil {
+			t.release()
+		}
+	})
+}
+
+type targetOpening struct {
+	done    chan struct{}
+	udp     *udpTarget
+	icmp    *icmpTarget
+	err     error
+	release func()
+}
 
 type udpRelay struct {
 	ctx              context.Context
@@ -349,6 +378,8 @@ type udpRelay struct {
 	dialICMP         func(context.Context, string) (net.PacketConn, error)
 	allowPrivateICMP bool
 	closed           bool
+	identity         string
+	opening          map[string]*targetOpening
 }
 
 func newUDPRelay(ctx context.Context, stream datagramStream, targetBuffers ...int) *udpRelay {
@@ -357,7 +388,13 @@ func newUDPRelay(ctx context.Context, stream datagramStream, targetBuffers ...in
 		targetBuffer = targetBuffers[0]
 	}
 	ctx, cancel := context.WithCancel(ctx)
+	identity := "anonymous"
+	if user, ok := UserFromContext(ctx); ok {
+		identity = UDPResourceIdentity(user.PSK)
+	}
 	return &udpRelay{
+		identity:     identity,
+		opening:      make(map[string]*targetOpening),
 		ctx:          ctx,
 		cancel:       cancel,
 		stream:       stream,
@@ -365,6 +402,72 @@ func newUDPRelay(ctx context.Context, stream datagramStream, targetBuffers ...in
 		targets:      make(map[string]*udpTarget),
 		icmpTargets:  make(map[string]*icmpTarget),
 	}
+}
+
+// Serialize only creation of the same target. DNS/caller code never holds mu.
+func (r *udpRelay) beginTarget(address string) (*targetOpening, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.ctx.Err() != nil {
+		return nil, false, net.ErrClosed
+	}
+	if pending := r.opening[address]; pending != nil {
+		return pending, false, nil
+	}
+	if udp, icmp := r.targets[address], r.icmpTargets[address]; udp != nil || icmp != nil {
+		p := &targetOpening{done: make(chan struct{}), udp: udp, icmp: icmp}
+		close(p.done)
+		return p, false, nil
+	}
+	if len(r.targets)+len(r.icmpTargets)+len(r.opening) >= 64 {
+		return nil, false, errors.New("too many UDP/ICMP targets")
+	}
+	release, ok := ReserveUDPTarget(r.identity)
+	if !ok {
+		return nil, false, errors.New("UDP target budget exhausted")
+	}
+	p := &targetOpening{done: make(chan struct{}), release: release}
+	if r.opening == nil {
+		r.opening = make(map[string]*targetOpening)
+	}
+	r.opening[address] = p
+	r.waitGroup.Add(1)
+	return p, true, nil
+}
+
+func (r *udpRelay) finishTarget(address string, p *targetOpening, udp *udpTarget, icmp *icmpTarget, err error) error {
+	r.mu.Lock()
+	if r.closed || r.ctx.Err() != nil {
+		err = net.ErrClosed
+	}
+	if err == nil {
+		if udp != nil {
+			r.targets[address] = udp
+			r.waitGroup.Add(1)
+			go r.receive(udp)
+		}
+		if icmp != nil {
+			r.icmpTargets[address] = icmp
+			r.waitGroup.Add(1)
+			go r.receiveICMP(icmp)
+		}
+		p.udp, p.icmp = udp, icmp
+	}
+	p.err = err
+	delete(r.opening, address)
+	close(p.done)
+	r.mu.Unlock()
+	if err != nil {
+		if udp != nil {
+			udp.close()
+		} else if icmp != nil {
+			icmp.close()
+		} else {
+			p.release()
+		}
+	}
+	r.waitGroup.Done()
+	return err
 }
 
 func (r *udpRelay) Forward(packet []byte) error {
@@ -444,45 +547,48 @@ func (r *udpRelay) target(address string) (*udpTarget, error) {
 	if targetConn != nil {
 		return targetConn, nil
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
-		return nil, net.ErrClosed
+	pending, create, err := r.beginTarget(address)
+	if err != nil {
+		return nil, err
 	}
-	targetConn = r.targets[address]
-	if targetConn == nil {
-		if len(r.targets) >= 64 {
-			return nil, errors.New("too many UDP targets")
+	if !create {
+		select {
+		case <-pending.done:
+			return pending.udp, pending.err
+		case <-r.ctx.Done():
+			return nil, net.ErrClosed
 		}
-		var connection net.Conn
-		var err error
-		if r.dialUDP != nil {
-			connection, err = r.dialUDP(r.ctx, address)
-		} else {
-			var resolved *net.UDPAddr
-			resolved, err = target.ResolveUDPAddr(r.ctx, address)
-			if err == nil {
-				connection, err = net.DialUDP("udp", nil, resolved)
+	}
+	var connection net.Conn
+	if r.dialUDP != nil {
+		connection, err = r.dialUDP(r.ctx, address)
+	} else {
+		var resolved *net.UDPAddr
+		resolved, err = target.ResolveUDPAddr(r.ctx, address)
+		if err == nil {
+			connection, err = net.DialUDP("udp", nil, resolved)
+		}
+	}
+	if err != nil {
+		if connection != nil {
+			_ = connection.Close()
+		}
+		return nil, r.finishTarget(address, pending, nil, nil, err)
+	}
+	targetConn = &udpTarget{address: address, conn: connection, release: pending.release}
+	targetConn.lastActive.Store(time.Now().UnixNano())
+	if uc, ok := connection.(*net.UDPConn); ok {
+		_ = uc.SetReadBuffer(r.targetBuffer)
+		_ = uc.SetWriteBuffer(r.targetBuffer)
+		if uc.RemoteAddr().(*net.UDPAddr).IP.To4() != nil {
+			targetConn.batch = ipv4.NewPacketConn(uc)
+			for i := range targetConn.messages {
+				targetConn.messages[i].Buffers = make([][]byte, 1)
 			}
 		}
-		if err != nil {
-			return nil, err
-		}
-		targetConn = &udpTarget{address: address, conn: connection}
-		targetConn.lastActive.Store(time.Now().UnixNano())
-		if uc, ok := connection.(*net.UDPConn); ok {
-			_ = uc.SetReadBuffer(r.targetBuffer)
-			_ = uc.SetWriteBuffer(r.targetBuffer)
-			if uc.RemoteAddr().(*net.UDPAddr).IP.To4() != nil {
-				targetConn.batch = ipv4.NewPacketConn(uc)
-				for i := range targetConn.messages {
-					targetConn.messages[i].Buffers = make([][]byte, 1)
-				}
-			}
-		}
-		r.targets[address] = targetConn
-		r.waitGroup.Add(1)
-		go r.receive(targetConn)
+	}
+	if err := r.finishTarget(address, pending, targetConn, nil, nil); err != nil {
+		return nil, err
 	}
 	return targetConn, nil
 }
@@ -661,7 +767,7 @@ func (r *udpRelay) removeTarget(targetConn *udpTarget) {
 		delete(r.targets, targetConn.address)
 	}
 	r.mu.Unlock()
-	_ = targetConn.conn.Close()
+	targetConn.close()
 }
 
 func (r *udpRelay) forwardICMP(address string, payload []byte) error {
@@ -679,11 +785,6 @@ func (r *udpRelay) forwardICMP(address string, payload []byte) error {
 }
 
 func (r *udpRelay) getOrCreateICMPTarget(address string) (*icmpTarget, error) {
-	targetStr := strings.TrimPrefix(address, "icmp:")
-	targetIP, err := target.ResolveICMPIP(r.ctx, targetStr, r.allowPrivateICMP)
-	if err != nil {
-		return nil, fmt.Errorf("invalid ICMP target address %q: %w", targetStr, err)
-	}
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -697,9 +798,23 @@ func (r *udpRelay) getOrCreateICMPTarget(address string) (*icmpTarget, error) {
 		r.mu.Unlock()
 		return targetConn, nil
 	}
-	if len(r.icmpTargets) >= 64 {
-		r.mu.Unlock()
-		return nil, errors.New("too many ICMP targets")
+	r.mu.Unlock()
+	pending, create, err := r.beginTarget(address)
+	if err != nil {
+		return nil, err
+	}
+	if !create {
+		select {
+		case <-pending.done:
+			return pending.icmp, pending.err
+		case <-r.ctx.Done():
+			return nil, net.ErrClosed
+		}
+	}
+	targetStr := strings.TrimPrefix(address, "icmp:")
+	targetIP, err := target.ResolveICMPIP(r.ctx, targetStr, r.allowPrivateICMP)
+	if err != nil {
+		return nil, r.finishTarget(address, pending, nil, nil, fmt.Errorf("invalid ICMP target address %q: %w", targetStr, err))
 	}
 
 	var conn net.PacketConn
@@ -715,20 +830,22 @@ func (r *udpRelay) getOrCreateICMPTarget(address string) (*icmpTarget, error) {
 		conn, err = net.ListenPacket(network, listenAddr)
 	}
 	if err != nil {
-		r.mu.Unlock()
-		return nil, err
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return nil, r.finishTarget(address, pending, nil, nil, err)
 	}
 
 	targetConn = &icmpTarget{
+		release:  pending.release,
 		address:  address,
 		targetIP: targetIP,
 		conn:     conn,
 	}
 	targetConn.lastActive.Store(time.Now().UnixNano())
-	r.icmpTargets[address] = targetConn
-	r.waitGroup.Add(1)
-	go r.receiveICMP(targetConn)
-	r.mu.Unlock()
+	if err := r.finishTarget(address, pending, nil, targetConn, nil); err != nil {
+		return nil, err
+	}
 
 	return targetConn, nil
 }
@@ -777,7 +894,7 @@ func (r *udpRelay) removeICMPTarget(targetConn *icmpTarget) {
 		delete(r.icmpTargets, targetConn.address)
 	}
 	r.mu.Unlock()
-	_ = targetConn.conn.Close()
+	targetConn.close()
 }
 
 func (r *udpRelay) Close() {
@@ -792,10 +909,10 @@ func (r *udpRelay) Close() {
 	r.icmpTargets = make(map[string]*icmpTarget)
 	r.mu.Unlock()
 	for _, targetConn := range targets {
-		_ = targetConn.conn.Close()
+		targetConn.close()
 	}
 	for _, it := range icmpTargets {
-		_ = it.conn.Close()
+		it.close()
 	}
 	r.waitGroup.Wait()
 }

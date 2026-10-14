@@ -28,6 +28,10 @@ type h3Connection struct {
 
 type h3TransportManager struct {
 	mu            sync.Mutex
+	closed        bool
+	lifetime      context.Context
+	stop          context.CancelFunc
+	opening       map[**h3Connection]*h3Dial
 	server        string
 	serverName    string
 	rootURL       string
@@ -49,6 +53,23 @@ type h3TransportManager struct {
 
 	isDynamic bool
 	idleSince time.Time
+}
+
+type h3Dial struct {
+	done   chan struct{}
+	conn   *h3Connection
+	err    error
+	cancel context.CancelFunc
+}
+
+func (c *h3Connection) close() {
+	if c == nil {
+		return
+	}
+	_ = c.quic.CloseWithError(0, "shutdown")
+	if c.pconn != nil {
+		_ = c.pconn.Close()
+	}
 }
 
 func newH3TransportManager(
@@ -74,7 +95,11 @@ func newH3TransportManager(
 	if sessionCache != nil {
 		tlsConfig.ClientSessionCache = sessionCache
 	}
+	lifetime, stop := context.WithCancel(context.Background())
 	return &h3TransportManager{
+		lifetime:     lifetime,
+		stop:         stop,
+		opening:      make(map[**h3Connection]*h3Dial),
 		server:       server,
 		serverName:   serverName,
 		rootURL:      rootURL,
@@ -92,21 +117,70 @@ func newH3TransportManager(
 }
 
 func (m *h3TransportManager) ensureConnection(ctx context.Context, current **h3Connection) (*h3Connection, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if *current != nil && (*current).quic.Context().Err() == nil {
-		return *current, nil
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	if *current != nil {
-		oldConn := *current
-		_ = oldConn.quic.CloseWithError(0, "replaced")
-		if oldConn.pconn != nil {
-			_ = oldConn.pconn.Close()
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, net.ErrClosed
+	}
+	if *current != nil && (*current).quic.Context().Err() == nil {
+		conn := *current
+		m.mu.Unlock()
+		return conn, nil
+	}
+	if pending := m.opening[current]; pending != nil {
+		m.mu.Unlock()
+		select {
+		case <-pending.done:
+			return pending.conn, pending.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-m.lifetime.Done():
+			return nil, net.ErrClosed
 		}
-		*current = nil
+	}
+	old := *current
+	*current = nil
+	dialCtx, cancel := context.WithCancel(ctx)
+	pending := &h3Dial{done: make(chan struct{}), cancel: cancel}
+	m.opening[current] = pending
+	m.mu.Unlock()
+	old.close()
+	conn, err := m.dialConnection(dialCtx)
+	m.mu.Lock()
+	if m.closed {
+		err = net.ErrClosed
+	} else if dialCtx.Err() != nil {
+		err = dialCtx.Err()
+	}
+	if err == nil {
+		conn.h3 = m.transport.NewClientConn(conn.quic)
+		*current = conn
+		pending.conn = conn
+	}
+	pending.err = err
+	delete(m.opening, current)
+	close(pending.done)
+	m.mu.Unlock()
+	cancel()
+	if err != nil {
+		conn.close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+func (m *h3TransportManager) dialConnection(ctx context.Context) (*h3Connection, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	udpAddr, err := resolveUDP(ctx, m.server, m.resolveUDP)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	var pconn net.PacketConn
@@ -130,8 +204,7 @@ func (m *h3TransportManager) ensureConnection(ctx context.Context, current **h3C
 		_ = pconn.Close()
 		return nil, err
 	}
-	*current = &h3Connection{quic: quicConn, h3: m.transport.NewClientConn(quicConn), pconn: pconn}
-	return *current, nil
+	return &h3Connection{quic: quicConn, pconn: pconn}, nil
 }
 
 func (m *h3TransportManager) ensureTCP(ctx context.Context) (*h3Connection, error) {
@@ -386,21 +459,20 @@ func (m *h3TransportManager) createPacketConnOnce(ctx context.Context) (net.Pack
 
 func (m *h3TransportManager) close() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.currentTCP != nil {
-		_ = m.currentTCP.quic.CloseWithError(0, "shutdown")
-		if m.currentTCP.pconn != nil {
-			_ = m.currentTCP.pconn.Close()
-		}
-		m.currentTCP = nil
+	if m.closed {
+		m.mu.Unlock()
+		return
 	}
-	if m.currentUDP != nil {
-		_ = m.currentUDP.quic.CloseWithError(0, "shutdown")
-		if m.currentUDP.pconn != nil {
-			_ = m.currentUDP.pconn.Close()
-		}
-		m.currentUDP = nil
+	m.closed = true
+	m.stop()
+	for _, pending := range m.opening {
+		pending.cancel()
 	}
+	tcp, udp := m.currentTCP, m.currentUDP
+	m.currentTCP, m.currentUDP = nil, nil
+	m.mu.Unlock()
+	tcp.close()
+	udp.close()
 	_ = m.transport.Close()
 }
 

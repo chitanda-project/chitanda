@@ -202,8 +202,9 @@ func (c *Client) dialPlainH1(ctx context.Context, target string) (net.Conn, erro
 }
 
 type chunkedWriter struct {
-	w  io.Writer
-	mu sync.Mutex
+	w   io.Writer
+	mu  sync.Mutex
+	buf []byte
 }
 
 func newChunkedWriter(w io.Writer) *chunkedWriter {
@@ -217,15 +218,16 @@ func (cw *chunkedWriter) Write(p []byte) (int, error) {
 	cw.mu.Lock()
 	defer cw.mu.Unlock()
 
-	hdr := fmt.Sprintf("%x\r\n", len(p))
-	if _, err := cw.w.Write([]byte(hdr)); err != nil {
+	cw.buf = strconv.AppendUint(cw.buf[:0], uint64(len(p)), 16)
+	cw.buf = append(cw.buf, '\r', '\n')
+	cw.buf = append(cw.buf, p...)
+	cw.buf = append(cw.buf, '\r', '\n')
+	n, err := cw.w.Write(cw.buf)
+	if err != nil {
 		return 0, err
 	}
-	if _, err := cw.w.Write(p); err != nil {
-		return 0, err
-	}
-	if _, err := cw.w.Write([]byte("\r\n")); err != nil {
-		return 0, err
+	if n != len(cw.buf) {
+		return 0, io.ErrShortWrite
 	}
 	return len(p), nil
 }

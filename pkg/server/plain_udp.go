@@ -48,33 +48,48 @@ type plainUDPSessionKey struct {
 }
 
 type PlainUDPServer struct {
-	codec            *plainudp.Codec
-	codecs           []*plainudp.Codec
-	conn             *net.UDPConn
-	sessions         sync.Map // plainUDPSessionKey -> *plainUDPSession
-	sessionCount     atomic.Int64
-	maxSessions      int64
-	workers          []chan udpTask
-	workerWg         sync.WaitGroup
-	upstreamWg       sync.WaitGroup
-	lifecycleMu      sync.Mutex
-	started          bool
-	done             chan struct{}
-	ctx              context.Context
-	cancel           context.CancelFunc
-	resolveMu        sync.RWMutex
-	resolveUDP       func(ctx context.Context, address string) (*net.UDPAddr, error)
-	dialICMPMu       sync.RWMutex
-	dialICMP         func(ctx context.Context, address string) (net.PacketConn, error)
-	allowPrivateICMP bool
-	closed           atomic.Bool
-	inFlightMem      atomic.Int64
-	maxMemBudget     int64
-	replays          *auth.ReplayCache
-	namespaces       []string
+	codec              *plainudp.Codec
+	codecs             []*plainudp.Codec
+	conn               *net.UDPConn
+	sessions           sync.Map // plainUDPSessionKey -> *plainUDPSession
+	sessionCount       atomic.Int64
+	maxSessions        int64
+	workers            []chan udpTask
+	workerWg           sync.WaitGroup
+	upstreamWg         sync.WaitGroup
+	lifecycleMu        sync.Mutex
+	started            bool
+	done               chan struct{}
+	ctx                context.Context
+	cancel             context.CancelFunc
+	resolveMu          sync.RWMutex
+	resolveUDP         func(ctx context.Context, address string) (*net.UDPAddr, error)
+	dialICMPMu         sync.RWMutex
+	dialICMP           func(ctx context.Context, address string) (net.PacketConn, error)
+	allowPrivateICMP   bool
+	closed             atomic.Bool
+	inFlightMem        atomic.Int64
+	maxMemBudget       int64
+	replays            *auth.ReplayCache
+	namespaces         []string
+	resourceIdentities []string
+}
+
+type plainUDPTarget struct {
+	*net.UDPConn
+	once    sync.Once
+	release func()
+}
+
+func (t *plainUDPTarget) Close() error {
+	var err error
+	t.once.Do(func() { err = t.UDPConn.Close(); t.release() })
+	return err
 }
 
 type plainICMPTarget struct {
+	once       sync.Once
+	release    func()
 	address    string
 	targetIP   net.IP
 	packetConn net.PacketConn
@@ -82,22 +97,31 @@ type plainICMPTarget struct {
 }
 
 func (t *plainICMPTarget) Close() error {
-	if t.packetConn != nil {
-		return t.packetConn.Close()
-	}
-	return nil
+	var err error
+	t.once.Do(func() {
+		if t.packetConn != nil {
+			err = t.packetConn.Close()
+		}
+		if t.release != nil {
+			t.release()
+		}
+	})
+	return err
 }
 
 type plainUDPSession struct {
-	sessionID   uint64
-	codec       *plainudp.Codec
-	clientAddr  atomic.Pointer[net.UDPAddr]
-	targets     sync.Map // string(targetAddr) -> *net.UDPConn or *plainICMPTarget
-	targetCount atomic.Int64
-	lastActive  atomic.Int64
-	replayMu    sync.Mutex
-	replay      frame.ReplayWindow
-	guard       *UDPReplayWindow
+	sessionID        uint64
+	codec            *plainudp.Codec
+	clientAddr       atomic.Pointer[net.UDPAddr]
+	targets          sync.Map // string(targetAddr) -> *net.UDPConn or *plainICMPTarget
+	targetCount      atomic.Int64
+	lastActive       atomic.Int64
+	replayMu         sync.Mutex
+	replay           frame.ReplayWindow
+	guard            *UDPReplayWindow
+	resourceIdentity string
+	targetMu         sync.Mutex
+	closed           bool
 }
 
 // PlainUDPOptions binds native UDP to the same identity and durable replay
@@ -129,12 +153,14 @@ func NewPlainUDPServerWithUsers(conn *net.UDPConn, users []UserKey, options ...P
 		return nil, err
 	}
 	codecs := make([]*plainudp.Codec, 0, len(users))
+	identities := make([]string, 0, len(users))
 	for _, user := range users {
 		codec, err := plainudp.NewCodec(user.PSK, option.ServerID)
 		if err != nil {
 			return nil, err
 		}
 		codecs = append(codecs, codec)
+		identities = append(identities, UDPResourceIdentity(user.PSK))
 	}
 	_ = conn.SetReadBuffer(8 << 20)
 	_ = conn.SetWriteBuffer(8 << 20)
@@ -151,15 +177,16 @@ func NewPlainUDPServerWithUsers(conn *net.UDPConn, users []UserKey, options ...P
 	ctx, cancel := context.WithCancel(context.Background())
 	return &PlainUDPServer{
 		ctx: ctx, cancel: cancel, done: make(chan struct{}),
-		codec:        codecs[0],
-		codecs:       codecs,
-		conn:         conn,
-		workers:      workers,
-		maxMemBudget: DefaultUDPMemoryBudget,
-		maxSessions:  10000,
-		replays:      option.Replays,
-		namespaces:   udpReplayNamespaces(users, option.ServerID),
-		resolveUDP:   target.ResolveUDPAddr,
+		codec:              codecs[0],
+		codecs:             codecs,
+		conn:               conn,
+		workers:            workers,
+		maxMemBudget:       DefaultUDPMemoryBudget,
+		maxSessions:        10000,
+		replays:            option.Replays,
+		namespaces:         udpReplayNamespaces(users, option.ServerID),
+		resourceIdentities: identities,
+		resolveUDP:         target.ResolveUDPAddr,
 	}, nil
 }
 
@@ -330,6 +357,9 @@ func (s *PlainUDPServer) processTask(ctx context.Context, task udpTask) {
 			return // Session limit reached, drop task
 		}
 		newSession := &plainUDPSession{sessionID: task.sessionID, codec: s.codecs[task.userIndex], guard: NewPersistentUDPReplayWindow(s.replays, s.namespaces[task.userIndex], task.sessionID)}
+		if task.userIndex < len(s.resourceIdentities) {
+			newSession.resourceIdentity = s.resourceIdentities[task.userIndex]
+		}
 		actual, loadedActual := s.sessions.LoadOrStore(key, newSession)
 		if !loadedActual {
 			s.sessionCount.Add(1)
@@ -337,6 +367,11 @@ func (s *PlainUDPServer) processTask(ctx context.Context, task udpTask) {
 		val = actual
 	}
 	session := val.(*plainUDPSession)
+	session.targetMu.Lock()
+	defer session.targetMu.Unlock()
+	if session.closed || ctx.Err() != nil {
+		return
+	}
 
 	// Anti-Replay verification MUST succeed BEFORE updating clientAddr
 	accepted := session.guard.AcceptAuthenticated(task.seq, task.timestamp, time.Now())
@@ -353,10 +388,14 @@ func (s *PlainUDPServer) processTask(ctx context.Context, task udpTask) {
 	}
 
 	targetConnVal, ok := session.targets.Load(task.targetAddr)
-	var upstreamConn *net.UDPConn
+	var upstreamConn *plainUDPTarget
 	if !ok {
 		if session.targetCount.Load() >= 32 {
 			return // Max targets reached for this session
+		}
+		release, ok := ReserveUDPTarget(session.resourceIdentity)
+		if !ok {
+			return
 		}
 		// Snapshot the callback under lock, but never hold it during DNS or
 		// caller code. Cached targets do not enter this path.
@@ -365,28 +404,31 @@ func (s *PlainUDPServer) processTask(ctx context.Context, task udpTask) {
 		s.resolveMu.RUnlock()
 		resolved, err := resolve(ctx, task.targetAddr)
 		if err != nil || ctx.Err() != nil {
+			release()
 			return
 		}
 
 		upConn, err := net.DialUDP("udp", nil, resolved)
 		if err != nil {
+			release()
 			return
 		}
 		_ = upConn.SetReadBuffer(8 << 20)
 		_ = upConn.SetWriteBuffer(8 << 20)
 
-		actual, loaded := session.targets.LoadOrStore(task.targetAddr, upConn)
+		leased := &plainUDPTarget{UDPConn: upConn, release: release}
+		actual, loaded := session.targets.LoadOrStore(task.targetAddr, leased)
 		if loaded {
-			_ = upConn.Close()
-			upstreamConn = actual.(*net.UDPConn)
+			_ = leased.Close()
+			upstreamConn = actual.(*plainUDPTarget)
 		} else {
 			session.targetCount.Add(1)
-			upstreamConn = upConn
+			upstreamConn = leased
 			s.upstreamWg.Add(1)
 			go s.listenUpstream(ctx, session, task.targetAddr, upstreamConn)
 		}
 	} else {
-		upstreamConn = targetConnVal.(*net.UDPConn)
+		upstreamConn = targetConnVal.(*plainUDPTarget)
 	}
 
 	_, _ = upstreamConn.Write(task.payload)
@@ -408,6 +450,10 @@ func (s *PlainUDPServer) processICMPTask(ctx context.Context, session *plainUDPS
 		if session.targetCount.Load() >= 32 {
 			return // Max targets reached for this session
 		}
+		release, ok := ReserveUDPTarget(session.resourceIdentity)
+		if !ok {
+			return
+		}
 		dialICMP := s.getDialICMP()
 		var pconn net.PacketConn
 		if dialICMP != nil {
@@ -422,6 +468,7 @@ func (s *PlainUDPServer) processICMPTask(ctx context.Context, session *plainUDPS
 			pconn, err = net.ListenPacket(network, listenAddr)
 		}
 		if err != nil || ctx.Err() != nil {
+			release()
 			if pconn != nil {
 				_ = pconn.Close()
 			}
@@ -429,13 +476,14 @@ func (s *PlainUDPServer) processICMPTask(ctx context.Context, session *plainUDPS
 		}
 
 		target := &plainICMPTarget{
+			release:    release,
 			address:    task.targetAddr,
 			targetIP:   targetIP,
 			packetConn: pconn,
 		}
 		actual, loaded := session.targets.LoadOrStore(task.targetAddr, target)
 		if loaded {
-			_ = pconn.Close()
+			_ = target.Close()
 			icmpTarget = actual.(*plainICMPTarget)
 		} else {
 			session.targetCount.Add(1)
@@ -498,7 +546,7 @@ func (s *PlainUDPServer) listenICMPUpstream(ctx context.Context, session *plainU
 	}
 }
 
-func (s *PlainUDPServer) listenUpstream(ctx context.Context, session *plainUDPSession, targetAddr string, upstreamConn *net.UDPConn) {
+func (s *PlainUDPServer) listenUpstream(ctx context.Context, session *plainUDPSession, targetAddr string, upstreamConn *plainUDPTarget) {
 	defer s.upstreamWg.Done()
 	defer upstreamConn.Close()
 	buf := make([]byte, 64<<10)
@@ -541,6 +589,14 @@ func (s *PlainUDPServer) cleaner(ctx context.Context) {
 			s.sessions.Range(func(key, value any) bool {
 				session := value.(*plainUDPSession)
 				if now-session.lastActive.Load() > 60 {
+					if !session.targetMu.TryLock() {
+						return true
+					}
+					if now-session.lastActive.Load() <= 60 {
+						session.targetMu.Unlock()
+						return true
+					}
+					session.closed = true
 					session.targets.Range(func(tKey, tVal any) bool {
 						if closer, ok := tVal.(io.Closer); ok {
 							_ = closer.Close()
@@ -550,6 +606,7 @@ func (s *PlainUDPServer) cleaner(ctx context.Context) {
 					})
 					s.sessions.Delete(key)
 					s.sessionCount.Add(-1)
+					session.targetMu.Unlock()
 				}
 				return true
 			})
@@ -592,8 +649,9 @@ func (s *PlainUDPServer) closeSessions() {
 
 // PlainUDPCodec wraps plainudp.Codec for external integrators (e.g. Xray).
 type PlainUDPCodec struct {
-	codec     *plainudp.Codec
-	namespace string
+	codec            *plainudp.Codec
+	namespace        string
+	resourceIdentity string
 }
 
 func NewPlainUDPCodec(psk []byte, serverIDs ...string) (*PlainUDPCodec, error) {
@@ -605,10 +663,11 @@ func NewPlainUDPCodec(psk []byte, serverIDs ...string) (*PlainUDPCodec, error) {
 	if len(serverIDs) > 0 {
 		serverID = serverIDs[0]
 	}
-	return &PlainUDPCodec{codec: c, namespace: UDPReplayNamespace(psk, serverID)}, nil
+	return &PlainUDPCodec{codec: c, namespace: UDPReplayNamespace(psk, serverID), resourceIdentity: UDPResourceIdentity(psk)}, nil
 }
 
-func (c *PlainUDPCodec) ReplayNamespace() string { return c.namespace }
+func (c *PlainUDPCodec) ReplayNamespace() string  { return c.namespace }
+func (c *PlainUDPCodec) ResourceIdentity() string { return c.resourceIdentity }
 
 func (c *PlainUDPCodec) DecodeClientPacket(packet []byte, now time.Time) (sessionID uint64, targetAddr string, payload []byte, timestamp uint64, seq uint64, err error) {
 	return c.codec.DecodePacket(packet, plainudp.DirClientToServer, now)
