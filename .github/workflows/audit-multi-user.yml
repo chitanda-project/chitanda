@@ -22,7 +22,7 @@ jobs:
       - run: go test -mod=mod -race ./internal/... ./pkg/... -count=1 -timeout=180s
       - run: go test -tags http2legacy -mod=mod -race ./internal/... ./pkg/... -count=1 -timeout=180s
       - name: Repeat H3 packet lifecycle against stock quic-go
-        run: go test -mod=mod -race ./pkg/client -run 'H3PacketLifecycle|RegressionOctober15ClientCloseWakesH3UDPRead' -count=30 -timeout=120s
+        run: go test -mod=mod -race ./pkg/client -run 'H3CarrierLifecycle|H3PacketLifecycle|RegressionOctober15ClientCloseWakesH3UDPRead' -count=30 -timeout=120s
 
   xray-race:
     runs-on: ubuntu-latest
@@ -57,7 +57,39 @@ jobs:
           go test -mod=vendor -race ./infra/conf -run Chitanda -count=1 -timeout=120s
           # Dependency tests are stripped by go mod vendor, not run by default.
           cp "$GITHUB_WORKSPACE"/pkg/client/*_test.go vendor/github.com/violetaini/chitanda/pkg/client/
-          go test -mod=vendor -race github.com/violetaini/chitanda/pkg/client -run 'H3PacketLifecycle|RegressionOctober15ClientCloseWakesH3UDPRead' -count=30 -timeout=120s
+          go test -mod=vendor -race github.com/violetaini/chitanda/pkg/client -run 'H3CarrierLifecycle|H3PacketLifecycle|RegressionOctober15ClientCloseWakesH3UDPRead' -count=30 -timeout=120s
+          go test -mod=vendor -race ./proxy/chitanda -run ProxyChainAllTransports -count=10 -timeout=180s
       - name: Build injected Xray
         working-directory: upstream_src
         run: go build -mod=vendor -o /tmp/chitanda-xray ./main
+
+  mihomo-race:
+    runs-on: ubuntu-latest
+    env:
+      GOFLAGS: -tags=http2legacy
+      CHITANDA_REQUIRE_H2_PADDING: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Inject into latest released Mihomo
+        run: |
+          tag=$(curl -fsSL --retry 3 --retry-all-errors https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -er '.tag_name')
+          test -n "$tag"
+          git clone --depth 1 --branch "$tag" https://github.com/MetaCubeX/mihomo.git upstream_mihomo
+          python3 scripts/inject-mihomo.py upstream_mihomo "$GITHUB_WORKSPACE"
+          cd upstream_mihomo
+          go mod tidy
+          python3 "$GITHUB_WORKSPACE/scripts/prepare-mihomo-quic.py" "$PWD" "$GITHUB_WORKSPACE"
+      - name: Mihomo adapter and lifecycle race regressions
+        working-directory: upstream_mihomo
+        run: |
+          go test -mod=mod -race ./config ./adapter/outbound ./listener/sing_tun ./listener/socks ./tunnel -run 'Chitanda|RegressionMihomo' -count=1 -timeout=180s
+          go test -mod=mod -race ./adapter/outbound -run 'ChitandaClosedAdapter|ChitandaPacketDestination' -count=30 -timeout=120s
+      - name: Build injected Mihomo
+        working-directory: upstream_mihomo
+        run: go build -mod=mod -tags with_gvisor,http2legacy -o /tmp/chitanda-mihomo .

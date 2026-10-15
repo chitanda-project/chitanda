@@ -21,9 +21,11 @@ import (
 )
 
 type h3Connection struct {
-	quic  *quic.Conn
-	h3    *http3.ClientConn
-	pconn net.PacketConn
+	quic      *quic.Conn
+	h3        *http3.ClientConn
+	pconn     net.PacketConn
+	cleanup   func()
+	closeOnce sync.Once
 }
 
 type h3TransportManager struct {
@@ -66,10 +68,30 @@ func (c *h3Connection) close() {
 	if c == nil {
 		return
 	}
-	_ = c.quic.CloseWithError(0, "shutdown")
-	if c.pconn != nil {
-		_ = c.pconn.Close()
+	c.closeOnce.Do(func() {
+		if c.cleanup != nil {
+			c.cleanup()
+		} else if c.pconn != nil {
+			_ = c.pconn.Close()
+		}
+		_ = c.quic.CloseWithError(0, "shutdown")
+	})
+}
+
+// Retain an embedding core's dial context until the physical carrier closes.
+// The QUIC callback captures only immutable locals: it can run immediately if
+// the peer has already closed, without racing publication of c.cleanup.
+func (c *h3Connection) retainDial(cancel context.CancelFunc) {
+	var once sync.Once
+	pconn := c.pconn
+	release := func() {
+		once.Do(func() {
+			cancel()
+			_ = pconn.Close()
+		})
 	}
+	stop := context.AfterFunc(c.quic.Context(), release)
+	c.cleanup = func() { stop(); release() }
 }
 
 func newH3TransportManager(
@@ -143,17 +165,23 @@ func (m *h3TransportManager) ensureConnection(ctx context.Context, current **h3C
 	}
 	old := *current
 	*current = nil
-	dialCtx, cancel := context.WithCancel(ctx)
-	pending := &h3Dial{done: make(chan struct{}), cancel: cancel}
+	opening := newH3DialLifetime(ctx, m.lifetime)
+	pending := &h3Dial{done: make(chan struct{}), cancel: opening.close}
 	m.opening[current] = pending
 	m.mu.Unlock()
 	old.close()
-	conn, err := m.dialConnection(dialCtx)
+	conn, err := m.dialConnection(opening.ctx)
+	if conn != nil {
+		conn.retainDial(opening.close)
+	}
+	if err == nil {
+		err = opening.establish()
+	}
 	m.mu.Lock()
 	if m.closed {
 		err = net.ErrClosed
-	} else if dialCtx.Err() != nil {
-		err = dialCtx.Err()
+	} else if opening.ctx.Err() != nil {
+		err = opening.ctx.Err()
 	}
 	if err == nil {
 		conn.h3 = m.transport.NewClientConn(conn.quic)
@@ -164,8 +192,8 @@ func (m *h3TransportManager) ensureConnection(ctx context.Context, current **h3C
 	delete(m.opening, current)
 	close(pending.done)
 	m.mu.Unlock()
-	cancel()
 	if err != nil {
+		opening.close()
 		conn.close()
 		return nil, err
 	}
@@ -192,6 +220,13 @@ func (m *h3TransportManager) dialConnection(ctx context.Context) (*h3Connection,
 		pconn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	}
 	if err != nil {
+		if pconn != nil {
+			_ = pconn.Close()
+		}
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = pconn.Close()
 		return nil, err
 	}
 	if uc, ok := pconn.(*net.UDPConn); ok {
@@ -237,20 +272,18 @@ func (m *h3TransportManager) prewarm(ctx context.Context) error {
 
 func (m *h3TransportManager) invalidate(c *h3Connection) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	matched := false
 	if m.currentTCP == c {
 		m.currentTCP = nil
-		_ = c.quic.CloseWithError(0, "reconnect")
-		if c.pconn != nil {
-			_ = c.pconn.Close()
-		}
+		matched = true
 	}
 	if m.currentUDP == c {
 		m.currentUDP = nil
-		_ = c.quic.CloseWithError(0, "reconnect")
-		if c.pconn != nil {
-			_ = c.pconn.Close()
-		}
+		matched = true
+	}
+	m.mu.Unlock()
+	if matched {
+		c.close()
 	}
 }
 

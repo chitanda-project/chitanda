@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"strconv"
 	"sync"
 	"time"
@@ -43,6 +44,7 @@ type Chitanda struct {
 	option *ChitandaOption
 	client *client.Client
 	initMu sync.Mutex
+	closed bool
 }
 
 func (c *Chitanda) ProxyInfo() C.ProxyInfo {
@@ -106,6 +108,9 @@ func (c *Chitanda) getClient() (*client.Client, error) {
 	c.initMu.Lock()
 	defer c.initMu.Unlock()
 
+	if c.closed {
+		return nil, net.ErrClosed
+	}
 	if c.client != nil {
 		return c.client, nil
 	}
@@ -206,15 +211,14 @@ func (c *Chitanda) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 		return nil, errors.New("chitanda: udp is disabled for this node")
 	}
 
+	cli, err := c.getClient()
+	if err != nil {
+		return nil, err
+	}
 	if metadata != nil {
 		if err := c.ResolveUDP(ctx, metadata); err != nil {
 			return nil, err
 		}
-	}
-
-	cli, err := c.getClient()
-	if err != nil {
-		return nil, err
 	}
 
 	pconn, err := cli.ListenPacket(ctx)
@@ -244,10 +248,18 @@ func (c *chitandaICMPPacketConn) ChitandaBatchWrite(payloads [][]byte, addrs []n
 	if len(payloads) == 0 {
 		return 0, nil
 	}
-	for _, addr := range addrs {
-		if target, ok := addr.(*net.UDPAddr); ok && target.Port == 0 {
-			return c.writeBatchIndividually(payloads, addrs)
+	individual := false
+	// Validate the whole batch before admitting any prefix to the transport.
+	for i, addr := range addrs {
+		if err := validateChitandaPacketDestination(payloads[i], addr); err != nil {
+			return 0, err
 		}
+		if target, ok := addr.(*net.UDPAddr); ok && target.Port == 0 {
+			individual = true
+		}
+	}
+	if individual {
+		return c.writeBatchIndividually(payloads, addrs)
 	}
 	if bw, ok := c.PacketConn.(interface {
 		WriteBatch([][]byte, []net.Addr) error
@@ -282,16 +294,45 @@ func (c *chitandaICMPPacketConn) WriteBatch(payloads [][]byte, addrs []net.Addr)
 }
 
 func (c *chitandaICMPPacketConn) WriteTo(packet []byte, addr net.Addr) (int, error) {
+	if err := validateChitandaPacketDestination(packet, addr); err != nil {
+		return 0, err
+	}
 	if target, ok := addr.(*net.UDPAddr); ok && target.Port == 0 {
-		if target.IP == nil {
-			return 0, errors.New("chitanda: ICMP target IP is required")
-		}
-		if err := client.ValidateICMPEchoRequest(packet, target.IP.To4() == nil); err != nil {
-			return 0, err
-		}
 		return c.PacketConn.WriteTo(packet, &client.ICMPAddr{IP: target.IP})
 	}
 	return c.PacketConn.WriteTo(packet, addr)
+}
+
+func validateChitandaPacketDestination(packet []byte, addr net.Addr) error {
+	switch target := addr.(type) {
+	case nil:
+		return net.InvalidAddrError("nil datagram destination")
+	case *net.UDPAddr:
+		if target == nil {
+			return net.InvalidAddrError("nil UDP destination")
+		}
+		if target.Port == 0 {
+			if target.IP == nil {
+				return net.InvalidAddrError("ICMP target IP is required")
+			}
+			return client.ValidateICMPEchoRequest(packet, target.IP.To4() == nil)
+		}
+	case *client.ICMPAddr:
+		if target == nil || target.IP == nil {
+			return net.InvalidAddrError("nil ICMP destination")
+		}
+	default:
+		// Preserve embedding cores' domain address types without calling a
+		// method on a typed-nil pointer/slice. Common UDP avoids reflection.
+		value := reflect.ValueOf(addr)
+		switch value.Kind() {
+		case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func, reflect.Interface:
+			if value.IsNil() {
+				return net.InvalidAddrError("nil datagram destination")
+			}
+		}
+	}
+	return nil
 }
 
 func (c *chitandaICMPPacketConn) ReadFrom(packet []byte) (int, net.Addr, error) {
@@ -336,11 +377,16 @@ func (c *Chitanda) MarshalJSON() ([]byte, error) {
 
 func (c *Chitanda) Close() error {
 	c.initMu.Lock()
-	defer c.initMu.Unlock()
-
-	if c.client != nil {
-		c.client.Close()
-		c.client = nil
+	if c.closed {
+		c.initMu.Unlock()
+		return nil
+	}
+	c.closed = true
+	cli := c.client
+	c.client = nil
+	c.initMu.Unlock()
+	if cli != nil {
+		cli.Close()
 	}
 	return nil
 }
