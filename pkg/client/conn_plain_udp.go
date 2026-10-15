@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -30,6 +29,10 @@ type plainUDPConn struct {
 	closed     atomic.Bool
 	replayMu   sync.Mutex
 	replay     plainudp.ResponseReplayWindow
+	owner      *Client
+	opening    *rawOpening
+	closeOnce  sync.Once
+	closeErr   error
 }
 
 func newPlainUDPConn(
@@ -41,9 +44,15 @@ func newPlainUDPConn(
 	resolveUDPFn func(ctx context.Context, network, addr string) (*net.UDPAddr, error),
 	dialPackets ...func(context.Context, *net.UDPAddr) (net.PacketConn, error),
 ) (*plainUDPConn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	srvAddr, err := resolveUDP(ctx, server, resolveUDPFn)
 	if err != nil {
 		return nil, fmt.Errorf("resolve server udp addr %q: %w", server, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	var conn net.PacketConn
@@ -64,6 +73,10 @@ func newPlainUDPConn(
 			return nil, fmt.Errorf("listen local udp: %w", err)
 		}
 		conn = c
+	}
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, err
 	}
 	if uc, ok := conn.(interface{ SetReadBuffer(int) error }); ok {
 		_ = uc.SetReadBuffer(8 << 20)
@@ -95,7 +108,7 @@ func newPlainUDPConn(
 
 func (c *plainUDPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	if c.closed.Load() {
-		return 0, nil, errors.New("conn closed")
+		return 0, nil, net.ErrClosed
 	}
 
 	bufPtr := udpReadPool.Get().(*[]byte)
@@ -141,7 +154,7 @@ func (c *plainUDPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 
 func (c *plainUDPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if c.closed.Load() {
-		return 0, errors.New("conn closed")
+		return 0, net.ErrClosed
 	}
 
 	address := formatDatagramAddress(addr)
@@ -157,12 +170,20 @@ func (c *plainUDPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 }
 
 func (c *plainUDPConn) Close() error {
-	c.closed.Store(true)
-	err := c.conn.Close()
-	c.replayMu.Lock()
-	c.replay = plainudp.ResponseReplayWindow{}
-	c.replayMu.Unlock()
-	return err
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		if c.opening != nil {
+			c.opening.close()
+		}
+		c.closeErr = c.conn.Close()
+		c.replayMu.Lock()
+		c.replay = plainudp.ResponseReplayWindow{}
+		c.replayMu.Unlock()
+		if c.owner != nil {
+			c.owner.releaseRaw(c)
+		}
+	})
+	return c.closeErr
 }
 
 func (c *plainUDPConn) LocalAddr() net.Addr {

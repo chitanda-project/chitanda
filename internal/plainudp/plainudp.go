@@ -156,8 +156,9 @@ func (c *Codec) EncodePacket(dst []byte, dir Direction, sessionID uint64, target
 
 // DecodePacket decrypts a plain-udp datagram, authenticates via AEAD, and extracts sessionID, target address and payload.
 func (c *Codec) DecodePacket(packet []byte, expectedDir Direction, now time.Time) (sessionID uint64, targetAddr string, payload []byte, timestamp uint64, seq uint64, err error) {
-	// Minimum length: 24B Nonce + (24B hdr + 1B type + 4B ipv4 + 2B port + 16B tag) = 71 bytes
-	if len(packet) < HeaderSize+24+1+4+2+16 {
+	// Check only the fixed fields plus ATYP before authenticating. A short
+	// domain address can be smaller than IPv4; validate its length by ATYP.
+	if len(packet) < HeaderSize+24+1+16 {
 		return 0, "", nil, 0, 0, ErrPacketTooShort
 	}
 
@@ -264,7 +265,7 @@ func appendTargetAddress(buf []byte, address string) ([]byte, error) {
 }
 
 func decodeTargetAddress(data []byte) (targetAddress string, payload []byte, err error) {
-	if len(data) < 7 {
+	if len(data) < 1 {
 		return "", nil, ErrInvalidAddress
 	}
 
@@ -286,7 +287,7 @@ func decodeTargetAddress(data []byte) (targetAddress string, payload []byte, err
 		}
 		domainLen := int(data[offset])
 		offset++
-		if len(data) < offset+domainLen+2 {
+		if domainLen == 0 || len(data) < offset+domainLen+2 {
 			return "", nil, ErrInvalidAddress
 		}
 		host = string(data[offset : offset+domainLen])

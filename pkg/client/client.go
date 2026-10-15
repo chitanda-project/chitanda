@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -92,6 +93,9 @@ type Client struct {
 	packetConnFn   func(ctx context.Context) (net.PacketConn, error)
 	mu             sync.Mutex
 	closed         bool
+	rawLifetime    context.Context
+	rawCancel      context.CancelFunc
+	rawConnections map[io.Closer]struct{}
 }
 
 // SetListenPacketForTest allows injecting a mock PacketConn for unit testing client methods like Ping.
@@ -102,11 +106,30 @@ func (c *Client) SetListenPacketForTest(fn func(ctx context.Context) (net.Packet
 }
 
 func (c *Client) dialRaw(ctx context.Context, network, addr string) (net.Conn, error) {
+	var conn net.Conn
+	var err error
 	if c.cfg.DialContext != nil {
-		return c.cfg.DialContext(ctx, network, addr)
+		conn, err = c.cfg.DialContext(ctx, network, addr)
+	} else {
+		var dialer net.Dialer
+		conn, err = dialer.DialContext(ctx, network, addr)
 	}
-	var dialer net.Dialer
-	return dialer.DialContext(ctx, network, addr)
+	if err != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return nil, err
+	}
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+	}
+	owned := &ownedRawConn{Conn: conn, owner: c}
+	owned.opening, _ = ctx.Value(rawOpeningKey{}).(*rawOpening)
+	if err := c.registerRaw(owned); err != nil {
+		_ = owned.Close()
+		return nil, err
+	}
+	return owned, nil
 }
 
 // New creates and initializes a new MyXray Client.
@@ -249,12 +272,35 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 	}
 	c.mu.Unlock()
 
-	if c.cfg.TCPTransport == TCPTransportStream {
-		return c.dialRawStream(ctx, address)
-	}
-
-	if c.cfg.TCPTransport == TCPTransportPlainH1 || c.cfg.TCPTransport == TCPTransportH1 {
-		return c.dialPlainH1(ctx, address)
+	if c.cfg.TCPTransport == TCPTransportStream || c.cfg.TCPTransport == TCPTransportPlainH1 || c.cfg.TCPTransport == TCPTransportH1 {
+		opening, err := c.beginRawOpen(ctx)
+		if err != nil {
+			return nil, err
+		}
+		established := false
+		defer func() {
+			if !established {
+				opening.close()
+			}
+		}()
+		var conn net.Conn
+		if c.cfg.TCPTransport == TCPTransportStream {
+			conn, err = c.dialRawStream(opening.ctx, address)
+		} else {
+			conn, err = c.dialPlainH1(opening.ctx, address)
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, err
+		}
+		if err := opening.establish(); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		established = true
+		return conn, nil
 	}
 
 	if c.cfg.TCPTransport == TCPTransportH2 || (c.cfg.TCPTransport == TCPTransportAuto && !c.prober.h2Degraded.Load()) {
@@ -396,10 +442,34 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 	}
 
 	if c.cfg.TCPTransport == TCPTransportPlainH1 || c.cfg.TCPTransport == TCPTransportH1 || c.cfg.TCPTransport == TCPTransportStream {
-		pconn, err := newPlainUDPConn(ctx, c.cfg.Server, c.cfg.PSK, c.cfg.ServerID, c.cfg.ListenPacket, c.cfg.ResolveUDP, c.cfg.DialPacket)
+		opening, err := c.beginRawOpen(ctx)
 		if err != nil {
 			return nil, err
 		}
+		established := false
+		defer func() {
+			if !established {
+				opening.close()
+			}
+		}()
+		pconn, err := newPlainUDPConn(opening.ctx, c.cfg.Server, c.cfg.PSK, c.cfg.ServerID, c.cfg.ListenPacket, c.cfg.ResolveUDP, c.cfg.DialPacket)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, err
+		}
+		pconn.owner = c
+		pconn.opening = opening
+		if err := c.registerRaw(pconn); err != nil {
+			_ = pconn.Close()
+			return nil, err
+		}
+		if err := opening.establish(); err != nil {
+			_ = pconn.Close()
+			return nil, err
+		}
+		established = true
 		return pconn, nil
 	}
 
@@ -445,7 +515,16 @@ func (c *Client) Close() {
 		return
 	}
 	c.closed = true
+	cancelRaw := c.rawCancel
+	rawConnections := c.rawConnections
+	c.rawConnections = nil
 	c.mu.Unlock()
+	if cancelRaw != nil {
+		cancelRaw()
+	}
+	for conn := range rawConnections {
+		_ = conn.Close()
+	}
 
 	if c.autoscaler != nil {
 		_ = c.autoscaler.Close()

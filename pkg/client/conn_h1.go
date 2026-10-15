@@ -45,7 +45,7 @@ func (c *Client) dialPlainH1(ctx context.Context, target string) (net.Conn, erro
 	}
 
 	// 1. Map context deadline to connection deadline to prevent indefinite hanging
-	if deadline, ok := ctx.Deadline(); ok {
+	if deadline, ok := rawHandshakeDeadline(ctx); ok {
 		_ = rawConn.SetDeadline(deadline)
 	} else {
 		_ = rawConn.SetDeadline(time.Now().Add(10 * time.Second))

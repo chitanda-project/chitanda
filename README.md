@@ -33,6 +33,13 @@ Chitanda は、セルフホスト（自前運用）サーバー環境向けに�
 - 📁 **[設定例ディレクトリ (Examples)](examples/)**
 - 📦 **[GitHub 自動ビルドバイナリ (Releases)](https://github.com/violetaini/chitanda/releases)**
 
+### 补充修复（2026-10-15 第二轮验收）
+
+- `stream` / `h1` / `plain-h1` 的客户端关闭现在会回收活动 TCP、原生 UDP，并取消待决解析、拨号和握手；晚返回的连接不再逃逸。保留 RawStream 批量写、认证半关闭和链式拨号上下文的正确交接。
+- Xray UDP 入站先处理并释放与 EOF/错误一起返回的末批数据，再处理错误；覆盖原生 UDP 和 h2/h3/auto 的 H3 外层接收。
+- Plain-UDP 按地址类型校验长度，修复短域名搭配空/小报文被误拒绝的问题，未放松认证、时间或重放检查。
+- 无线上格式或密钥派生变化，可分步升级客户端 SDK/Mihomo 与 Xray 服务端。具体证据及边界见 [第二轮修复验收](docs/REPAIR_ACCEPTANCE_2026-10-15_R2.md)；推送/打包不等于生产部署。
+
 ### 更新范围（2026-10-15 边界与接入修复）
 
 - 修复 H1 分块读取在 deadline 后丢失部分输入、认证前响应头缺少字节上限、Plain-UDP 响应在合法时钟回拨时误丢，以及 Xray UDP 批量写绕过 deadline/关闭入口。

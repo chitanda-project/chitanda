@@ -452,16 +452,10 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 
 		reader := newFullPacketReader(conn)
 		for {
-			mpayload, err := reader.ReadMultiBuffer()
-			if err != nil {
-				return err
-			}
-			for _, payload := range mpayload {
-				data := payload.Bytes()
-				if len(data) > 0 && isQUICPacket(data) {
-					h.vconn.feed(data, conn.RemoteAddr())
-				}
-				payload.Release()
+			packets, readErr := reader.ReadMultiBuffer()
+			h.feedH3Packets(packets, conn.RemoteAddr())
+			if readErr != nil {
+				return readErr
 			}
 		}
 	}
@@ -478,60 +472,68 @@ func (h *InboundHandler) handleUDP(ctx context.Context, conn stat.Connection, di
 
 	reader := newFullPacketReader(conn)
 	for {
-		mpayload, err := reader.ReadMultiBuffer()
+		packets, readErr := reader.ReadMultiBuffer()
+		h.forwardPlainUDPPackets(ctx, routes, packets)
+		if readErr != nil {
+			return readErr
+		}
+	}
+}
+
+// A Reader may return both data and an error. Consume/release the whole batch
+// before the caller handles that error, including EOF on the final packet.
+func (h *InboundHandler) feedH3Packets(packets buf.MultiBuffer, remote net.Addr) {
+	defer buf.ReleaseMulti(packets)
+	for _, packet := range packets {
+		if packet != nil && isQUICPacket(packet.Bytes()) {
+			h.vconn.feed(packet.Bytes(), remote)
+		}
+	}
+}
+
+func (h *InboundHandler) forwardPlainUDPPackets(ctx context.Context, routes *udpRoutes, packets buf.MultiBuffer) {
+	defer buf.ReleaseMulti(packets)
+	for i, packet := range packets {
+		if packet == nil {
+			continue
+		}
+		if packet.IsEmpty() {
+			packet.Release()
+			packets[i] = nil
+			continue
+		}
+		now := time.Now()
+		matchedIdx, sessionID, targetAddr, rawData, timestamp, seq, err := server.DecodeClientPacketMulti(h.userCodecs, packet.Bytes(), now)
+		// The decoder returns an owned plaintext copy. Release the outer
+		// ciphertext before any potentially blocking routing/target write.
+		packet.Release()
+		packets[i] = nil
+		if err != nil || matchedIdx < 0 || matchedIdx >= len(h.userReplays) || !h.userReplays[matchedIdx].accept(sessionID, seq, now, timestamp) {
+			continue
+		}
+
+		if strings.HasPrefix(targetAddr, "icmp:") {
+			_ = routes.WriteICMP(ctx, matchedIdx, sessionID, targetAddr, rawData)
+			continue
+		}
+
+		dest, err := xnet.ParseDestination("udp:" + targetAddr)
 		if err != nil {
-			return err
+			continue
 		}
 
-		for _, payload := range mpayload {
-			data := payload.Bytes()
-			if len(data) == 0 {
-				payload.Release()
-				continue
+		copyInbound := session.Inbound{Tag: "chitanda-inbound"}
+		if inbound := session.InboundFromContext(ctx); inbound != nil {
+			copyInbound = *inbound
+			if copyInbound.Tag == "" {
+				copyInbound.Tag = "chitanda-inbound"
 			}
-
-			now := time.Now()
-			matchedIdx, sessionID, targetAddr, rawData, timestamp, seq, err := server.DecodeClientPacketMulti(userCodecs, data, now)
-			if err == nil {
-				if matchedIdx < 0 || matchedIdx >= len(userReplays) || !userReplays[matchedIdx].accept(sessionID, seq, now, timestamp) {
-					payload.Release()
-					continue // drop replayed packet across any connection/association!
-				}
-
-				if strings.HasPrefix(targetAddr, "icmp:") {
-					payload.Release()
-					_ = routes.WriteICMP(ctx, matchedIdx, sessionID, targetAddr, rawData)
-					continue
-				}
-
-				dest, err := xnet.ParseDestination("udp:" + targetAddr)
-				if err != nil {
-					payload.Release()
-					continue
-				}
-
-				copyInbound := session.Inbound{Tag: "chitanda-inbound"}
-				if inbound := session.InboundFromContext(ctx); inbound != nil {
-					copyInbound = *inbound
-					if copyInbound.Tag == "" {
-						copyInbound.Tag = "chitanda-inbound"
-					}
-				}
-				if matchedIdx >= 0 && matchedIdx < len(h.users) && h.users[matchedIdx].Email != "" {
-					copyInbound.User = &protocol.MemoryUser{
-						Email: h.users[matchedIdx].Email,
-						Level: h.users[matchedIdx].Level,
-					}
-				}
-				packetCtx := session.ContextWithInbound(ctx, &copyInbound)
-
-				payload.Release()
-				_ = routes.Write(packetCtx, matchedIdx, sessionID, dest, rawData)
-				continue
-			}
-
-			payload.Release()
 		}
+		if matchedIdx < len(h.users) && h.users[matchedIdx].Email != "" {
+			copyInbound.User = &protocol.MemoryUser{Email: h.users[matchedIdx].Email, Level: h.users[matchedIdx].Level}
+		}
+		packetCtx := session.ContextWithInbound(ctx, &copyInbound)
+		_ = routes.Write(packetCtx, matchedIdx, sessionID, dest, rawData)
 	}
 }
 
