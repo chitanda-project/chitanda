@@ -115,6 +115,7 @@ jobs:
           go test -mod=vendor -race ./proxy/chitanda -count=1 -timeout 180s
           go test -mod=vendor -race ./infra/conf -run Chitanda -count=1 -timeout 120s
           go test -mod=vendor -race ./transport/internet/udp -run Chitanda -count=1 -timeout 120s
+          go test -mod=vendor -race github.com/violetaini/chitanda/pkg/client -run 'H3PacketLifecycle|RegressionOctober15ClientCloseWakesH3UDPRead' -count=30 -timeout=120s
 
       - name: Test Chitanda SDK regressions
         if: steps.upstream_check.outputs.should_build == 'true'

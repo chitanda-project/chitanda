@@ -447,7 +447,16 @@ func (m *h3TransportManager) createPacketConnOnce(ctx context.Context) (net.Pack
 		return nil, fmt.Errorf("server rejected UDP association: status=%d", response.StatusCode)
 	}
 
-	pconnCtx, pconnCancel := context.WithCancel(context.Background())
+	// Stock quic-go does not necessarily wake an HTTP Datagram receiver when
+	// its QUIC connection closes. Cancel it explicitly on either physical
+	// connection shutdown or manager shutdown, independently of the dial caller.
+	pconnCtx, pconnCancel := newH3PacketContext(h3Conn.quic.Context(), m.lifetime)
+	if err := pconnCtx.Err(); err != nil {
+		pconnCancel()
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+		return nil, err
+	}
 	return &quicPacketConn{
 		stream:      stream,
 		ctx:         pconnCtx,
@@ -455,6 +464,20 @@ func (m *h3TransportManager) createPacketConnOnce(ctx context.Context) (net.Pack
 		manager:     m,
 		readCancels: make([]readEntry, 0, 2),
 	}, nil
+}
+
+// A packet association owns its cancellation, but not either parent. Explicit
+// Close detaches the manager hook; no goroutine or hook is added per datagram.
+func newH3PacketContext(connection, manager context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(connection)
+	stop := context.AfterFunc(manager, cancel)
+	if manager.Err() != nil {
+		cancel()
+	}
+	return ctx, func() {
+		stop()
+		cancel()
+	}
 }
 
 func (m *h3TransportManager) close() {
@@ -758,7 +781,7 @@ func (c *quicPacketConn) sendDatagrams(ctx context.Context, packets [][]byte) er
 func (c *quicPacketConn) sendWithWriteDeadline(send func(context.Context) error) error {
 	for {
 		c.mu.Lock()
-		if c.closed {
+		if c.closed || c.ctx.Err() != nil {
 			c.mu.Unlock()
 			return net.ErrClosed
 		}

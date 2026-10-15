@@ -21,6 +21,8 @@ jobs:
           go-version: ${{ matrix.go }}
       - run: go test -mod=mod -race ./internal/... ./pkg/... -count=1 -timeout=180s
       - run: go test -tags http2legacy -mod=mod -race ./internal/... ./pkg/... -count=1 -timeout=180s
+      - name: Repeat H3 packet lifecycle against stock quic-go
+        run: go test -mod=mod -race ./pkg/client -run 'H3PacketLifecycle|RegressionOctober15ClientCloseWakesH3UDPRead' -count=30 -timeout=120s
 
   xray-race:
     runs-on: ubuntu-latest
@@ -53,6 +55,7 @@ jobs:
         run: |
           go test -mod=vendor -race ./proxy/chitanda -count=1 -timeout=180s
           go test -mod=vendor -race ./infra/conf -run Chitanda -count=1 -timeout=120s
+          go test -mod=vendor -race github.com/violetaini/chitanda/pkg/client -run 'H3PacketLifecycle|RegressionOctober15ClientCloseWakesH3UDPRead' -count=30 -timeout=120s
       - name: Build injected Xray
         working-directory: upstream_src
         run: go build -mod=vendor -o /tmp/chitanda-xray ./main
