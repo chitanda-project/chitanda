@@ -196,6 +196,7 @@ jobs:
             Automated release of **XTLS/Xray-core** `${{ steps.upstream_check.outputs.upstream_tag }}` with native **Chitanda Protocol** integrated.
 
             ### 更新范围（2026-10-15 边界与接入修复）
+            - **链式载体补修**：保留 H3 物理拨号上下文至载体关闭，修复 proxySettings 下的 H3 TCP 和 h2/h3/auto UDP；五模式真实链式/多流与生命周期回归。[第四轮验收](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/REPAIR_ACCEPTANCE_2026-10-15_R4.md)。
             - **H3 UDP 补修**：显式绑定关联与 QUIC/manager 关闭生命周期，修复原版依赖下关闭后读取不退出；原版与 patched race 分别验收。[补修记录](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/REPAIR_ACCEPTANCE_2026-10-15_R3.md)。
             - **第二轮补充**：关闭 stream/H1 活动 TCP/UDP 和待决建连；处理并释放 EOF/错误同次返回的末批 UDP；修复短域名小报文解析。[第二轮验收](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/REPAIR_ACCEPTANCE_2026-10-15_R2.md)。
             - Xray 修复 UDP 批量写 deadline/关闭入口与 TCP 读缓冲复用；内嵌 SDK 修复 H1 超时解析、响应头预算和 Plain-UDP 时钟回拨误丢。

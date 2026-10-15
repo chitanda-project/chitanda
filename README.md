@@ -33,6 +33,12 @@ Chitanda は、セルフホスト（自前運用）サーバー環境向けに�
 - 📁 **[設定例ディレクトリ (Examples)](examples/)**
 - 📦 **[GitHub 自動ビルドバイナリ (Releases)](https://github.com/violetaini/chitanda/releases)**
 
+### 链式转发与生命周期修复（2026-10-15 第四轮）
+
+- 修复 H3 物理载体成功建连后撤销嵌入拨号上下文，导致 Xray `proxySettings` 下 H3 TCP 及 h2/h3/auto UDP 不可用的问题；保留路由值，载体关闭时统一释放。
+- Mihomo 适配器关闭后不再复活客户端；UDP 单包/整批写入拒绝 nil、typed-nil 地址，并在整批接纳前完成验证。
+- 五模式真实链式转发、多逻辑流、扩池预热与关闭/非法输入回归见 [第四轮验收](docs/REPAIR_ACCEPTANCE_2026-10-15_R4.md)。无线上格式变化，本轮主要随客户端更新；不包含生产健康检查参数调整或 WAN 吞吐提升承诺。
+
 ### 补充修复（2026-10-15 第二轮验收）
 
 后续 H3 UDP 生命周期补修及验收更正：客户端/物理 QUIC 连接关闭后显式撤销待决 Datagram 读取；原版与 patched 依赖分开验收，见 [第三轮记录](docs/REPAIR_ACCEPTANCE_2026-10-15_R3.md)。第二轮 Xray 发布被回归门禁拦截，并非已完成发布。
