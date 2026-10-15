@@ -52,30 +52,19 @@ type packetLinkConn struct {
 	readErr      error
 	remote       net.Addr
 	packetReads  *connio.Reader
-	writes       *connio.Writer
+	writes       *pipeWriteQueue
 }
 
 func newPacketLinkConn(r buf.Reader, w buf.Writer, remote net.Addr) *packetLinkConn {
 	c := &packetLinkConn{packetReader: r, packetWriter: w, remote: remote}
 	c.packetReads = connio.NewReader(c.readPacketOwned, func() error { _ = common.Interrupt(r); return common.Close(r) })
-	c.writes = connio.NewWriter(func(b []byte, _ net.Addr) (int, error) {
-		if err := w.WriteMultiBuffer(buf.MultiBuffer{ownedDatagram(b)}); err != nil {
-			return 0, err
-		}
-		return len(b), nil
-	}, func() error { return common.Close(w) }, func() error { _ = common.Interrupt(w); return common.Close(w) })
+	c.writes = newPipeWriteQueue(w)
 	return c
 }
 
 func (c *packetLinkConn) WriteBatch(payloads [][]byte) error {
-	if len(payloads) == 0 {
-		return nil
-	}
-	mb := make(buf.MultiBuffer, 0, len(payloads))
-	for _, p := range payloads {
-		mb = append(mb, ownedDatagram(p))
-	}
-	return c.packetWriter.WriteMultiBuffer(mb)
+	_, err := c.writes.WriteDatagrams(payloads)
+	return err
 }
 
 func (c *packetLinkConn) Read(p []byte) (int, error) {
@@ -114,7 +103,7 @@ func (c *packetLinkConn) Write(p []byte) (int, error) {
 	if len(p) > 65535 {
 		return 0, io.ErrShortBuffer
 	}
-	return c.writes.WritePacket(p, nil)
+	return c.writes.WriteDatagrams([][]byte{p})
 }
 
 func (c *packetLinkConn) Close() error {

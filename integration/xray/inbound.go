@@ -563,6 +563,8 @@ type pipeConn struct {
 	writes     *pipeWriteQueue
 }
 
+var pipeReadPool = sync.Pool{New: func() any { b := make([]byte, 64<<10); return &b }}
+
 func newPipeConn(reader buf.Reader, writer buf.Writer) *pipeConn {
 	c := &pipeConn{
 		readCloser: reader,
@@ -570,10 +572,10 @@ func newPipeConn(reader buf.Reader, writer buf.Writer) *pipeConn {
 	}
 	if reader != nil {
 		c.reader = &buf.BufferedReader{Reader: reader}
-		c.reads = connio.NewReader(func() ([]byte, net.Addr, error) {
-			b := make([]byte, 64<<10)
-			n, err := c.reader.Read(b)
-			return b[:n], nil, err
+		c.reads = connio.NewOwnedReader(func() ([]byte, net.Addr, func(), error) {
+			b := pipeReadPool.Get().(*[]byte)
+			n, err := c.reader.Read(*b)
+			return (*b)[:n], nil, func() { pipeReadPool.Put(b) }, err
 		}, func() error { _ = common.Interrupt(reader); return common.Close(reader) })
 	}
 	return c

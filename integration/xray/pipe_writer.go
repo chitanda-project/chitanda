@@ -258,6 +258,44 @@ func (w *pipeWriteQueue) SetDeadline(at time.Time) error {
 	return nil
 }
 
+// WriteDatagrams shares the stream queue's lifecycle and deadline gate, but
+// preserves one Xray buffer per packet instead of splitting/merging UDP bytes.
+// At most one bounded batch is owned, including when its caller times out.
+func (w *pipeWriteQueue) WriteDatagrams(payloads [][]byte) (int, error) {
+	if len(payloads) == 0 {
+		return 0, nil
+	}
+	if len(payloads) > 64 {
+		return 0, io.ErrShortBuffer
+	}
+	total := 0
+	for _, p := range payloads {
+		if len(p) > 65535 {
+			return 0, io.ErrShortBuffer
+		}
+		total += len(p)
+	}
+	if err := w.acquire(); err != nil {
+		return 0, err
+	}
+	r := pipeWriteRequests.Get().(*pipeWriteRequest)
+	r.refs.Store(1)
+	r.mb = make(buf.MultiBuffer, 0, len(payloads))
+	for _, p := range payloads {
+		r.mb = append(r.mb, ownedDatagram(p))
+	}
+	defer r.release()
+	if err := w.submit(r); err != nil {
+		w.gate <- struct{}{}
+		return 0, err
+	}
+	err := w.await(r.result)
+	if err != nil && err != os.ErrDeadlineExceeded && err != net.ErrClosed {
+		return 0, err
+	}
+	return total, err
+}
+
 func (w *pipeWriteQueue) CloseWrite() error {
 	w.mu.Lock()
 	fin := w.fin

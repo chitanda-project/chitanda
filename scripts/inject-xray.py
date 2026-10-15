@@ -128,6 +128,14 @@ def inject_xray(xray_dir, chitanda_dir):
             dst = os.path.join(proxy_dir, fname)
             shutil.copy2(src, dst)
             print(f"  [+] Copied {fname} -> proxy/chitanda/")
+
+    wire_test = os.path.join(chitanda_dir, "pkg", "client", "h2_wire_contract_test.go")
+    with open(wire_test, encoding="utf-8") as f:
+        wire_source = f.read()
+    if wire_source.count("package client_test\n") != 1:
+        raise RuntimeError("unexpected H2 wire contract test package")
+    with open(os.path.join(proxy_dir, "h2_wire_contract_test.go"), "w", encoding="utf-8") as f:
+        f.write(wire_source.replace("package client_test\n", "package chitanda_test\n", 1))
         
     # 2. Copy chitanda.go -> infra/conf/chitanda.go
     src_conf_dir = os.path.join(chitanda_dir, "integration", "xray_conf")

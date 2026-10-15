@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 import os
 import sys
-import glob
 import stat
-import subprocess
+from pathlib import Path
 
 PATCH_COMMON_TARGET = "\tCountError func(errType string)\n\n\t// Internal state, differs between wrapped and non-wrapped implementations."
 PATCH_COMMON_REPLACE = "\tCountError func(errType string)\n\n\t// MaxDataPadding, if positive, enables pseudo-random padding on HTTP/2 DATA frames (RFC 7540).\n\t// Bounded in range [0, 255].\n\tMaxDataPadding int\n\n\t// Internal state, differs between wrapped and non-wrapped implementations."
@@ -80,19 +79,18 @@ PATCH_TRANSPORT_REPLACE = """			targetPad := 0
 
 def make_writable(filepath):
     mode = os.stat(filepath).st_mode
-    os.chmod(filepath, mode | stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+    os.chmod(filepath, mode | stat.S_IWUSR)
 
 def patch_file(filepath, old, new):
     if not os.path.exists(filepath):
-        return False
-    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        raise RuntimeError(f"missing H2 source: {filepath}")
+    with open(filepath, "r", encoding="utf-8") as f:
         content = f.read()
-    if new in content:
+    if content.count(new) == 1 and old not in content:
         print(f"  [=] Already patched: {filepath}")
         return True
-    if old not in content:
-        print(f"  [-] Target chunk not found in: {filepath}")
-        return False
+    if content.count(old) != 1 or new in content:
+        raise RuntimeError(f"ambiguous or missing H2 patch anchor: {filepath}")
     make_writable(filepath)
     content = content.replace(old, new, 1)
     with open(filepath, "w", encoding="utf-8") as f:
@@ -100,23 +98,19 @@ def patch_file(filepath, old, new):
     print(f"  [+] Successfully patched: {filepath}")
     return True
 
-def patch_all():
-    p = subprocess.run(["go", "env", "GOMODCACHE"], capture_output=True, text=True)
-    cache = p.stdout.strip()
-    if not cache:
-        print("[!] GOMODCACHE not found")
-        return
-
-    pattern_common = os.path.join(cache, "golang.org", "x", "net@*", "http2", "transport_common.go")
-    pattern_transport = os.path.join(cache, "golang.org", "x", "net@*", "http2", "transport.go")
-
-    files_common = glob.glob(pattern_common)
-    files_transport = glob.glob(pattern_transport)
-    print(f"[*] Found {len(files_common)} transport_common.go and {len(files_transport)} transport.go in GOMODCACHE")
-    for f in files_common:
-        patch_file(f, PATCH_COMMON_TARGET, PATCH_COMMON_REPLACE)
-    for f in files_transport:
-        patch_file(f, PATCH_TRANSPORT_TARGET, PATCH_TRANSPORT_REPLACE)
+def patch_directory(directory):
+    # Only a deliberately staged snapshot may be modified. Never walk or
+    # patch GOMODCACHE: tests and builds must consume the same local module.
+    directory = Path(directory).resolve(strict=True)
+    if directory.name != ".chitanda-xnet":
+        raise RuntimeError("H2 patch target must be an isolated .chitanda-xnet snapshot")
+    if "module golang.org/x/net\n" not in (directory / "go.mod").read_text(encoding="utf-8"):
+        raise RuntimeError("unexpected x/net module")
+    patch_file(directory / "http2" / "transport_common.go", PATCH_COMMON_TARGET, PATCH_COMMON_REPLACE)
+    patch_file(directory / "http2" / "transport.go", PATCH_TRANSPORT_TARGET, PATCH_TRANSPORT_REPLACE)
+    patch_file(directory / "http2" / "transport.go", "transportDefaultStreamFlow = 4 << 20", "transportDefaultStreamFlow = 64 << 20")
 
 if __name__ == "__main__":
-    patch_all()
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: patch_xnet.py /path/to/.chitanda-xnet")
+    patch_directory(sys.argv[1])

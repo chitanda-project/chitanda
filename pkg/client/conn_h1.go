@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/http/httpguts"
+
 	"github.com/violetaini/chitanda/internal/h1session"
 )
 
@@ -112,37 +114,20 @@ func (c *Client) dialPlainH1(ctx context.Context, target string) (net.Conn, erro
 	}
 
 	reader := bufio.NewReader(rawConn)
-	statusLine, err := reader.ReadString('\n')
-	if err != nil {
+	if err := readH1ResponseHeaders(reader); err != nil {
 		_ = rawConn.Close()
-		return nil, fmt.Errorf("read response status: %w", err)
+		return nil, err
 	}
-	if !strings.Contains(statusLine, "200") {
-		_ = rawConn.Close()
-		return nil, fmt.Errorf("server rejected plain-h1: %s", strings.TrimSpace(statusLine))
-	}
-
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			_ = rawConn.Close()
-			return nil, fmt.Errorf("read response header: %w", err)
-		}
-		if line == "\r\n" || line == "\n" {
-			break
-		}
-	}
-
-	chunkLenLine, err := reader.ReadString('\n')
+	var lineState boundedH1Line
+	chunkLenLine, err := lineState.read(reader, maxH1ChunkLine)
 	if err != nil {
 		_ = rawConn.Close()
 		return nil, fmt.Errorf("read server hello chunk length: %w", err)
 	}
-	chunkLenHex := strings.TrimSpace(chunkLenLine)
-	chunkLen, err := strconv.ParseInt(chunkLenHex, 16, 64)
+	chunkLen, err := parseH1ChunkSize(chunkLenLine)
 	if err != nil || chunkLen < h1session.ServerHelloSize || chunkLen > h1session.ServerHelloSize+1024 {
 		_ = rawConn.Close()
-		return nil, fmt.Errorf("invalid server hello chunk length %q: %w", chunkLenHex, err)
+		return nil, fmt.Errorf("invalid server hello chunk length: %v", err)
 	}
 
 	var serverHello [h1session.ServerHelloSize]byte
@@ -168,6 +153,10 @@ func (c *Client) dialPlainH1(ctx context.Context, target string) (net.Conn, erro
 	if _, err := io.ReadFull(reader, crlf[:]); err != nil {
 		_ = rawConn.Close()
 		return nil, fmt.Errorf("read chunk crlf: %w", err)
+	}
+	if crlf != [2]byte{'\r', '\n'} {
+		_ = rawConn.Close()
+		return nil, fmt.Errorf("invalid server hello chunk terminator")
 	}
 
 	encStream, err := h1session.NewAEADStream(clientKey, h1session.DirClientToServer)
@@ -240,9 +229,17 @@ func (cw *chunkedWriter) Close() error {
 }
 
 type chunkedReader struct {
-	r          *bufio.Reader
-	chunkLeft  int64
-	chunkEnded bool
+	r            *bufio.Reader
+	chunkLeft    int64
+	chunkEnded   bool
+	line         boundedH1Line
+	needCRLF     bool
+	crlf         [2]byte
+	crlfRead     int
+	trailers     bool
+	trailerBytes int
+	trailerLines int
+	terminal     error
 }
 
 func newChunkedReader(r *bufio.Reader) *chunkedReader {
@@ -250,32 +247,55 @@ func newChunkedReader(r *bufio.Reader) *chunkedReader {
 }
 
 func (cr *chunkedReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if cr.terminal != nil {
+		return 0, cr.terminal
+	}
 	if cr.chunkEnded {
 		return 0, io.EOF
 	}
 
-	if cr.chunkLeft == 0 {
-		line, err := cr.r.ReadString('\n')
+	if cr.needCRLF {
+		n, err := io.ReadFull(cr.r, cr.crlf[cr.crlfRead:])
+		cr.crlfRead += n
 		if err != nil {
-			return 0, err
+			return 0, cr.readError(err)
 		}
-		line = strings.TrimSpace(line)
-		if line == "" {
-			line, err = cr.r.ReadString('\n')
+		if cr.crlf != [2]byte{'\r', '\n'} {
+			return 0, cr.readError(fmt.Errorf("invalid chunk terminator"))
+		}
+		cr.needCRLF, cr.crlfRead = false, 0
+	}
+	if cr.chunkLeft == 0 && !cr.trailers {
+		line, err := cr.line.read(cr.r, maxH1ChunkLine)
+		if err != nil {
+			return 0, cr.readError(err)
+		}
+		size, err := parseH1ChunkSize(line)
+		if err != nil || size > 65536 {
+			return 0, cr.readError(fmt.Errorf("invalid chunk length"))
+		}
+		cr.chunkLeft = size
+		cr.trailers = size == 0
+	}
+	if cr.trailers {
+		for {
+			line, err := cr.line.read(cr.r, min(maxH1HeaderLine, maxH1HeaderBytes-cr.trailerBytes))
 			if err != nil {
-				return 0, err
+				return 0, cr.readError(err)
 			}
-			line = strings.TrimSpace(line)
+			cr.trailerBytes += len(line) + 2
+			if line == "" {
+				cr.chunkEnded = true
+				return 0, io.EOF
+			}
+			cr.trailerLines++
+			if cr.trailerLines > maxH1HeaderLines || !validH1Header(line) {
+				return 0, cr.readError(fmt.Errorf("invalid chunk trailer"))
+			}
 		}
-		chunkLen, err := strconv.ParseInt(line, 16, 64)
-		if err != nil || chunkLen < 0 || chunkLen > 65536 {
-			return 0, fmt.Errorf("invalid chunk length %q: %w", line, err)
-		}
-		if chunkLen == 0 {
-			cr.chunkEnded = true
-			return 0, io.EOF
-		}
-		cr.chunkLeft = chunkLen
 	}
 
 	toRead := int64(len(p))
@@ -286,13 +306,116 @@ func (cr *chunkedReader) Read(p []byte) (int, error) {
 	n, err := cr.r.Read(p[:toRead])
 	cr.chunkLeft -= int64(n)
 
-	if cr.chunkLeft == 0 && err == nil {
-		var crlf [2]byte
-		if _, err := io.ReadFull(cr.r, crlf[:]); err != nil {
-			return n, err
-		}
+	if cr.chunkLeft == 0 {
+		cr.needCRLF = true
+	}
+	if err != nil {
+		err = cr.readError(err)
 	}
 	return n, err
+}
+
+func (cr *chunkedReader) readError(err error) error {
+	if e, ok := err.(net.Error); ok && e.Timeout() {
+		return err
+	}
+	if err == io.EOF {
+		err = io.ErrUnexpectedEOF
+	}
+	cr.terminal = err
+	return err
+}
+
+const (
+	maxH1HeaderBytes = 16 << 10
+	maxH1HeaderLine  = 4 << 10
+	maxH1HeaderLines = 64
+	maxH1ChunkLine   = 1024
+)
+
+// ReadSlice avoids unbounded ReadString allocations. Keep partial input on a
+// recoverable socket timeout; callers must not restart a line in the middle.
+type boundedH1Line struct{ partial []byte }
+
+func (s *boundedH1Line) read(r *bufio.Reader, limit int) (string, error) {
+	for {
+		part, err := r.ReadSlice('\n')
+		if len(part) > limit-len(s.partial) {
+			return "", fmt.Errorf("H1 line exceeds byte limit")
+		}
+		s.partial = append(s.partial, part...)
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		line := s.partial
+		if len(line) < 2 || line[len(line)-2] != '\r' {
+			return "", fmt.Errorf("H1 requires CRLF")
+		}
+		result := string(line[:len(line)-2])
+		s.partial = s.partial[:0]
+		return result, nil
+	}
+}
+
+func parseH1ChunkSize(line string) (int64, error) {
+	if len(line) == 0 || len(line) > 16 {
+		return 0, fmt.Errorf("invalid chunk size")
+	}
+	for _, c := range []byte(line) {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return 0, fmt.Errorf("invalid chunk size")
+		}
+	}
+	return strconv.ParseInt(line, 16, 64)
+}
+
+func validH1Header(line string) bool {
+	name, value, ok := strings.Cut(line, ":")
+	return ok && httpguts.ValidHeaderFieldName(name) && httpguts.ValidHeaderFieldValue(value)
+}
+
+func readH1ResponseHeaders(r *bufio.Reader) error {
+	var state boundedH1Line
+	line, err := state.read(r, maxH1HeaderLine)
+	if err != nil {
+		return fmt.Errorf("read H1 response status: %w", err)
+	}
+	parts := strings.SplitN(line, " ", 3)
+	if len(parts) < 2 || parts[0] != "HTTP/1.1" || parts[1] != "200" {
+		return fmt.Errorf("unexpected H1 response status")
+	}
+	used, count, chunked := len(line)+2, 0, false
+	for {
+		line, err = state.read(r, min(maxH1HeaderLine, maxH1HeaderBytes-used))
+		if err != nil {
+			return fmt.Errorf("read H1 response headers: %w", err)
+		}
+		used += len(line) + 2
+		if line == "" {
+			break
+		}
+		count++
+		if count > maxH1HeaderLines || !validH1Header(line) {
+			return fmt.Errorf("invalid H1 response headers")
+		}
+		name, value, _ := strings.Cut(line, ":")
+		if strings.EqualFold(name, "Content-Length") {
+			return fmt.Errorf("unexpected H1 content length")
+		}
+		if strings.EqualFold(name, "Transfer-Encoding") {
+			if chunked || !strings.EqualFold(strings.TrimSpace(value), "chunked") {
+				return fmt.Errorf("unsupported H1 transfer encoding")
+			}
+			chunked = true
+		}
+	}
+	if !chunked {
+		return fmt.Errorf("H1 response must use chunked transfer encoding")
+	}
+	return nil
 }
 
 func (c *plainH1Conn) Read(b []byte) (n int, err error) {

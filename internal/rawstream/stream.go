@@ -25,6 +25,7 @@ type FramedWriter struct {
 	stream     *AEADStream
 	mu         sync.Mutex
 	buf        []byte
+	plain      []byte
 	burstBytes int64
 	lastWrite  time.Time
 	closed     bool
@@ -64,45 +65,68 @@ func (fw *FramedWriter) WriteBatch(buffers [][]byte) (n int, err error) {
 	totalPlaintext := 0
 	unflushedPlaintext := 0
 
-	for _, p := range buffers {
-		for len(p) > 0 {
-			var maxChunk int
-			var flushThreshold int
+	for index, offset := 0, 0; index < len(buffers); {
+		p := buffers[index][offset:]
+		if len(p) == 0 {
+			index++
+			offset = 0
+			continue
+		}
+		var maxChunk int
+		var flushThreshold int
 
-			if fw.burstBytes < Phase1Threshold {
-				maxChunk = MinRecordPayloadLen
-				flushThreshold = 0 // Immediate flush for sub-millisecond TTFB
-			} else if fw.burstBytes < Phase2Threshold {
-				maxChunk = MidRecordPayloadLen
-				flushThreshold = MidRecordPayloadLen
-			} else {
-				maxChunk = MaxChunkPayloadLen
-				flushThreshold = MaxBatchFlushLen
+		if fw.burstBytes < Phase1Threshold {
+			maxChunk = MinRecordPayloadLen
+			flushThreshold = 0 // Immediate flush for sub-millisecond TTFB
+		} else if fw.burstBytes < Phase2Threshold {
+			maxChunk = MidRecordPayloadLen
+			flushThreshold = MidRecordPayloadLen
+		} else {
+			maxChunk = MaxChunkPayloadLen
+			flushThreshold = MaxBatchFlushLen
+		}
+
+		var chunk []byte
+		if len(p) < maxChunk && index+1 < len(buffers) {
+			// Coalesce only slices already supplied by this caller. Never
+			// delay a future write, or mutate the caller's slice headers.
+			if cap(fw.plain) < maxChunk {
+				fw.plain = make([]byte, 0, MaxChunkPayloadLen)
 			}
-
-			chunkSize := len(p)
-			if chunkSize > maxChunk {
-				chunkSize = maxChunk
+			fw.plain = fw.plain[:0]
+			for len(fw.plain) < maxChunk && index < len(buffers) {
+				part := buffers[index][offset:]
+				n := min(len(part), maxChunk-len(fw.plain))
+				fw.plain = append(fw.plain, part[:n]...)
+				offset += n
+				if offset == len(buffers[index]) {
+					index++
+					offset = 0
+				}
 			}
-			chunk := p[:chunkSize]
-			p = p[chunkSize:]
+			chunk = fw.plain
+		} else {
+			n := min(len(p), maxChunk)
+			chunk = p[:n]
+			offset += n
+		}
+		chunkSize := len(chunk)
 
-			fw.buf, err = fw.stream.EncryptChunk(fw.buf, chunk)
-			if err != nil {
+		fw.buf, err = fw.stream.EncryptChunk(fw.buf, chunk)
+		if err != nil {
+			return totalPlaintext, err
+		}
+		unflushedPlaintext += chunkSize
+		fw.burstBytes += int64(chunkSize)
+
+		// Flush batch if accumulated buffer reaches flushThreshold (or immediate in Phase 1)
+		if flushThreshold == 0 || len(fw.buf) >= flushThreshold {
+			if err := fw.flush(); err != nil {
 				return totalPlaintext, err
 			}
-			unflushedPlaintext += chunkSize
-			fw.burstBytes += int64(chunkSize)
-
-			// Flush batch if accumulated buffer reaches flushThreshold (or immediate in Phase 1)
-			if flushThreshold == 0 || len(fw.buf) >= flushThreshold {
-				if err := fw.flush(); err != nil {
-					return totalPlaintext, err
-				}
-				totalPlaintext += unflushedPlaintext
-				unflushedPlaintext = 0
-				fw.buf = fw.buf[:0]
-			}
+			totalPlaintext += unflushedPlaintext
+			unflushedPlaintext = 0
+			fw.buf = fw.buf[:0]
 		}
 	}
 

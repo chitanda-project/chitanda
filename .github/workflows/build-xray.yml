@@ -12,6 +12,7 @@ on:
       - 'scripts/patch-vendor.go'
       - 'scripts/patch-receive.go'
       - 'scripts/vendor-performance.patch'
+      - 'scripts/release-provenance.py'
       - 'scripts/vendor-tests/**'
       - 'pkg/**'
       - 'internal/**'
@@ -37,6 +38,9 @@ permissions:
 jobs:
   check-and-build:
     runs-on: ubuntu-latest
+    env:
+      GOFLAGS: -tags=http2legacy
+      CHITANDA_REQUIRE_H2_PADDING: "1"
     steps:
       - name: Checkout Chitanda Core Repository
         uses: actions/checkout@v4
@@ -114,7 +118,13 @@ jobs:
 
       - name: Test Chitanda SDK regressions
         if: steps.upstream_check.outputs.should_build == 'true'
-        run: go test -mod=mod -race ./internal/... ./pkg/... -count=1 -timeout 180s
+        env:
+          # This SDK module test uses stock module dependencies. The adapter
+          # wire test above enforces padding in the actual release vendor.
+          CHITANDA_REQUIRE_H2_PADDING: "0"
+        run: |
+          GOFLAGS= go test -mod=mod -race ./internal/... ./pkg/... -count=1 -timeout 180s
+          go test -mod=mod -race ./internal/... ./pkg/... -count=1 -timeout 180s
 
       - name: Build Multi-Architecture Binaries
         if: steps.upstream_check.outputs.should_build == 'true'
@@ -169,6 +179,7 @@ jobs:
           done
           
           cd ../dist
+          python3 "$GITHUB_WORKSPACE/scripts/release-provenance.py" "$PWD" "$GITHUB_SHA"
           sha256sum * > sha256sums.txt
 
       - name: Publish GitHub Release
@@ -180,11 +191,11 @@ jobs:
           body: |
             Automated release of **XTLS/Xray-core** `${{ steps.upstream_check.outputs.upstream_tag }}` with native **Chitanda Protocol** integrated.
 
-            ### 更新范围（2026-10-13 断线修复）
-            - **整体范围：双端，Xray 服务端 + Mihomo 客户端。** 本 Xray 包修复服务端入站关闭时重复释放共享重放缓存的问题；Xray 客户端出站没有本次代码改动。
-            - 客户端 UDP 超时重试问题需更新 Mihomo 内核，或包含新内核的 CMFA / Verge / OpenClash。
-            - 相对 `157f4d4` 无协议格式变化，可分步更新双端；从更早版本升级且使用非空 `server-id` 的 stream/h1 原生 UDP 时，仍须双端共同升级并保持 ID 一致。
-            - [完整修复及验证说明](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/DISCONNECTION_AUDIT_2026-10-13.md)。实际节点需要自行安装新内核。
+            ### 更新范围（2026-10-15 边界与接入修复）
+            - Xray 修复 UDP 批量写 deadline/关闭入口与 TCP 读缓冲复用；内嵌 SDK 修复 H1 超时解析、响应头预算和 Plain-UDP 时钟回拨误丢。
+            - Go 1.27 H2 显式设置 64MiB 接收窗口；发布选择经线级 SETTINGS/DATA padding 验证的 patched `http2legacy` 路径。
+            - 相对 2026-10-14 版本无协议格式或密钥派生变化，可分步更新客户端/服务端；只更新一端不包含另一端修复。`build-info.json` 提供源码提交及归档/原始内核 SHA256。
+            - [验收与限制](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/REPAIR_ACCEPTANCE_2026-10-15.md)。自动发布不等于生产部署，也不是公网吞吐或零丢包保证。
             
             ### Package Standard:
             - **Strict Ecosystem Alignment**: Identical naming rules to official upstream releases.

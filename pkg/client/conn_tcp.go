@@ -85,6 +85,12 @@ func newH2TransportClient(server, serverName, rootURL, requestURL, path string, 
 		IdleConnTimeout:     3 * time.Minute,
 		TLSClientConfig:     tlsCfg,
 		DialTLSContext:      dialTLS,
+		// Go 1.27's x/net wrapper no longer compiles the patched legacy
+		// default constant. Configure the supported net/http implementation.
+		HTTP2: &http.HTTP2Config{
+			MaxReceiveBufferPerStream:     64 << 20,
+			MaxReceiveBufferPerConnection: 64 << 20,
+		},
 	}
 
 	h2Transport, err := http2.ConfigureTransports(transport)
@@ -99,8 +105,10 @@ func newH2TransportClient(server, serverName, rootURL, requestURL, path string, 
 		return dialTLS(ctx, network, addr)
 	}
 
-	// Enable RFC 7540 dynamic padding to defeat website fingerprinting (WFP) traffic analysis
-	if f := reflect.ValueOf(h2Transport).Elem().FieldByName("MaxDataPadding"); f.IsValid() && f.CanSet() {
+	// Official builds use the verified legacy snapshot. Go 1.27's default
+	// stdlib wrapper does not support this custom field: do not silently set
+	// an ignored option or claim padding eliminates traffic fingerprinting.
+	if f := reflect.ValueOf(h2Transport).Elem().FieldByName("MaxDataPadding"); legacyH2Padding && f.IsValid() && f.CanSet() {
 		f.SetInt(64)
 	}
 

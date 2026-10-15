@@ -181,6 +181,13 @@ def inject_mihomo(mihomo_dir, chitanda_dir):
     dst_adapter = os.path.join(adapter_dir, "chitanda.go")
     shutil.copy2(src_adapter, dst_adapter)
     print(f"  [+] Copied {src_adapter} -> {dst_adapter}")
+    wire_test = os.path.join(chitanda_dir, "pkg", "client", "h2_wire_contract_test.go")
+    with open(wire_test, encoding="utf-8") as f:
+        wire_source = f.read()
+    if wire_source.count("package client_test\n") != 1:
+        raise RuntimeError("unexpected H2 wire contract test package")
+    with open(os.path.join(adapter_dir, "chitanda_h2_wire_contract_test.go"), "w", encoding="utf-8") as f:
+        f.write(wire_source.replace("package client_test\n", "package outbound_test\n", 1))
     for fname in sorted(os.listdir(os.path.dirname(src_adapter))):
         if fname.endswith(".go") and fname != "chitanda.go":
             shutil.copy2(os.path.join(os.path.dirname(src_adapter), fname), os.path.join(adapter_dir, fname))

@@ -11,9 +11,12 @@ on:
       - 'scripts/inject-mihomo.py'
       - 'scripts/test_inject_mihomo.py'
       - 'scripts/prepare-mihomo-quic.py'
+      - 'scripts/patch_xnet.py'
+      - 'scripts/release-provenance.py'
       - 'scripts/test_*.py'
       - 'scripts/vendor-tests/**'
       - 'vendor/github.com/quic-go/quic-go/**'
+      - 'vendor/golang.org/x/net/**'
       - 'releases/mihomo/**'
       - 'pkg/**'
       - 'internal/**'
@@ -39,6 +42,9 @@ permissions:
 jobs:
   check-and-build:
     runs-on: ubuntu-latest
+    env:
+      GOFLAGS: -tags=http2legacy
+      CHITANDA_REQUIRE_H2_PADDING: "1"
     steps:
       - name: Checkout Chitanda Core Repository
         uses: actions/checkout@v4
@@ -112,7 +118,6 @@ jobs:
         run: |
           cd upstream_src
           go mod tidy || true
-          python3 "$GITHUB_WORKSPACE/scripts/patch_xnet.py"
           mkdir -p ../dist
           
           TAG="${{ steps.upstream_check.outputs.upstream_tag }}"
@@ -139,7 +144,7 @@ jobs:
             BIN_NAME="mihomo${EXT}"
             echo "Building $BIN_NAME for $GOOS/$GOARCH..."
             
-            BUILD_FLAGS="-tags with_gvisor"
+            BUILD_FLAGS="-tags with_gvisor,http2legacy"
             LDFLAGS="-s -w -buildid= -X github.com/metacubex/mihomo/constant.Version=${TAG}"
             
             CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM_VALUE go build $BUILD_FLAGS -trimpath -ldflags="$LDFLAGS" -o "../dist/$BIN_NAME" .
@@ -187,10 +192,18 @@ jobs:
             IFS='|' read -r OPENCLASH_ARCH GOARCH_VALUE GOARM_VALUE GOMIPS_VALUE <<< "$TARGET"
             echo "Building OpenClash core for $OPENCLASH_ARCH..."
             CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH_VALUE GOARM=$GOARM_VALUE GOMIPS=$GOMIPS_VALUE \
-              go build -tags with_gvisor -trimpath -ldflags="$LDFLAGS" -o ../dist/clash .
+              go build -tags with_gvisor,http2legacy -trimpath -ldflags="$LDFLAGS" -o ../dist/clash .
             mkdir -p ../dist/openclash-stage
             mv ../dist/clash ../dist/openclash-stage/clash
             tar -C ../dist/openclash-stage -czf "../dist/clash-${OPENCLASH_ARCH}.tar.gz" clash
+            if [ "$GOARCH_VALUE" = "amd64" ]; then
+              smoke_dir=$(mktemp -d)
+              tar -C "$smoke_dir" -xzf "../dist/clash-${OPENCLASH_ARCH}.tar.gz" clash
+              "$smoke_dir/clash" -v
+              SAFE_PATHS="$GITHUB_WORKSPACE/examples/mihomo" "$smoke_dir/clash" -t -f "$GITHUB_WORKSPACE/examples/mihomo/config.yaml"
+              rm -f "$smoke_dir/clash"
+              rmdir "$smoke_dir"
+            fi
             rm -f ../dist/openclash-stage/clash
           done
           rmdir ../dist/openclash-stage
@@ -239,6 +252,7 @@ jobs:
               encoding="utf-8",
           )
           PY
+          python3 "$GITHUB_WORKSPACE/scripts/release-provenance.py" "$PWD" "$GITHUB_SHA"
           sha256sum * > sha256sums.txt
 
       - name: Publish GitHub Release
@@ -250,15 +264,15 @@ jobs:
           body: |
             Automated release of **MetaCubeX/mihomo** `${{ steps.upstream_check.outputs.upstream_tag }}` (Stable) with native **Chitanda Protocol** integrated.
 
-            ### 更新范围（2026-10-13 断线修复）
-            - **整体范围：双端，Mihomo 客户端 + Xray 服务端。** 本 Mihomo 包修复 QUIC 连接超时后 UDP 持续重试失效关联的问题；CMFA / Verge / OpenClash 等需更新其实际内核或包含新内核的应用。
-            - 服务端共享重放缓存误关闭问题需另外更新 Xray 服务端内核；Xray 客户端出站没有本次代码改动。
-            - 相对 `157f4d4` 无协议格式变化，可分步更新双端；从更早版本升级且使用非空 `server-id` 的 stream/h1 原生 UDP 时，仍须双端共同升级并保持 ID 一致。
-            - [完整修复及验证说明](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/DISCONNECTION_AUDIT_2026-10-13.md)。自动发布不等于实际节点已安装更新。
+            ### 更新范围（2026-10-15 边界与接入修复）
+            - 客户端修复 H1 分块超时恢复/认证前响应限制、Plain-UDP 响应时钟回拨误丢，以及 Go 1.27 H2 窗口与 padding 的构建路径。
+            - Xray 另含 UDP 批量写 deadline/关闭与 TCP 读缓冲修复。相对 2026-10-14 版本无协议格式或密钥派生变化，可分步更新；只更新一端不包含另一端修复。
+            - CMFA / Verge / OpenClash 需更新实际内核或包含新内核的应用；`build-info.json` 记录源码提交及归档/原始内核 SHA256。
+            - [验收与限制](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/REPAIR_ACCEPTANCE_2026-10-15.md)。自动发布不等于生产部署，也不是公网吞吐或零丢包保证。
             
             ### Package Standard:
             - **Strict Ecosystem Alignment**: Identical naming rules to official upstream releases.
-            - **gVisor TUN Support**: Compiled with `-tags with_gvisor` for full Clash Verge / Mihomo Party TUN compatibility.
+            - **gVisor TUN Support**: Compiled with `-tags with_gvisor,http2legacy`; patched H2 DATA padding is wire-tested before packaging.
             - **OpenClash Bundle**: Complete multi-architecture OpenClash tarball assets.
             - **Checksum Sidecars**: `manifest.json` and `sha256sums.txt` included.
             - **Commit**: `${{ github.sha }}`

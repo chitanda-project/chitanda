@@ -33,6 +33,14 @@ Chitanda は、セルフホスト（自前運用）サーバー環境向けに�
 - 📁 **[設定例ディレクトリ (Examples)](examples/)**
 - 📦 **[GitHub 自動ビルドバイナリ (Releases)](https://github.com/violetaini/chitanda/releases)**
 
+### 更新范围（2026-10-15 边界与接入修复）
+
+- 修复 H1 分块读取在 deadline 后丢失部分输入、认证前响应头缺少字节上限、Plain-UDP 响应在合法时钟回拨时误丢，以及 Xray UDP 批量写绕过 deadline/关闭入口。
+- H2 显式设置 64MiB 接收窗口；官方打包使用经实际 SETTINGS / DATA padding 验证的 patched `http2legacy` 路径。Go 1.27 默认源码构建也保留大窗口，但不宣称具备自定义 padding；只加 build tag 而不使用 patched 依赖同样不够。
+- RawStream 合并同一次调用内的碎片，Xray TCP 读取使用有生命周期约束的缓冲租约；不新增单流条带化，不以微基准替代公网速率。
+- SDK 两种 H2 构建的 Linux race、Xray/Mihomo 接入回归与 amd64/arm64 交叉编译通过。发布新增原始内核哈希和 OpenClash tar 解包 smoke 门禁；验收范围及未完成项见 [2026-10-15 修复记录](docs/REPAIR_ACCEPTANCE_2026-10-15.md)。
+- 相对 2026-10-14 版本不改变线上格式或密钥派生。客户端、Xray 服务端应分别更新对应修复；本轮不部署生产节点，也不修改路由器、Realm 或生产凭据。
+
 ### 更新范围（2026-10-14 UDP 响应与生命周期修复）
 
 - 客户端：修复原生 UDP 跨关联序号导致的合法乱序误丢包；H3 关闭/缩容后禁止拨号并主动撤销建连；H2 关闭管理的活动流，安全复用读取缓冲；H1 合并 chunk 写入。

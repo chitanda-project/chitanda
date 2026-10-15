@@ -11,15 +11,22 @@ permissions:
 jobs:
   sdk-race:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go: ['1.26.x', '1.27.x']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.go }}
       - run: go test -mod=mod -race ./internal/... ./pkg/... -count=1 -timeout=180s
+      - run: go test -tags http2legacy -mod=mod -race ./internal/... ./pkg/... -count=1 -timeout=180s
 
   xray-race:
     runs-on: ubuntu-latest
+    env:
+      GOFLAGS: -tags=http2legacy
+      CHITANDA_REQUIRE_H2_PADDING: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
