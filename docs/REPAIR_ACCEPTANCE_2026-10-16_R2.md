@@ -58,7 +58,20 @@ TCP 底层使用 io.Discard，UDP 使用有真实 Buffer 分配/释放和 reader
 
 ## 6. 本地验收与 Linux 门禁
 
-SDK stock/default、patched/http2legacy 两套 internal/pkg 全量测试及 vet，Xray Chitanda/UDP Hub/配置回归及 vet，Mihomo config/outbound/sing_tun/SOCKS/tunnel 回归及 vet 已通过。新关闭/预算、帧格式/并发、Xray 读取租约用例分别重复验证；最终 Linux race、交叉编译结果在合并前补录。
+SDK stock/default、patched/http2legacy 两套 internal/pkg 全量测试及 vet，Xray Chitanda/UDP Hub/配置回归及 vet，Mihomo config/outbound/sing_tun/SOCKS/tunnel 回归及 vet 已通过。新关闭/预算、帧格式/并发、Xray 读取租约用例分别重复验证，patched Xray vendor 中的新 SDK 用例各 30 轮通过。
+
+Xray 与带 with_gvisor,http2legacy 的 Mihomo，Linux amd64/arm64 四个交叉编译均通过。本地旧 fixture 使用 buildvcs=false 避免无关的 VCS 目录所有者 stamping 错误；正式 runner 的正常 VCS 构建单独通过。未声称在 ARM 目标机执行了性能压测。Python 27 项、四个工作流 YAML/shell 块语法与 diff 空白检查通过。
+
+受验源码与门禁提交：`263e0c002265a1501a99ec5136e84c0932625cbe`。[Linux 最终验收](https://github.com/chitanda-project/chitanda/actions/runs/38846499581) 四组全部成功：
+
+| 对象 | 通过内容 |
+| --- | --- |
+| stock SDK / Go 1.26.9 | default/http2legacy 全套 internal/pkg race；新关闭/内存预算与帧复用分别 30 轮 race；既有生命周期回归 |
+| stock SDK / Go 1.27.2 | 同上，独立 Go 1.27 路径 |
+| 注入 Xray / patched 依赖 | Chitanda/配置 race；新 SDK server/frame 各 30 轮、Xray PacketReadLease 30 轮 race；五模式真实链式 10 轮及既有关闭回归；Linux 构建 |
+| 干净注入 Mihomo | config/outbound/sing_tun/SOCKS/tunnel race；关闭/输入及 writer 30 轮 race；with_gvisor,http2legacy Linux 构建 |
+
+最后提交仅补充验收记录和 release 展示文字，不改已受验的实现、测试或执行命令。推送 main 启动正式多架构发布；其完成状态与本轮合并前验收、实际设备安装是不同事项。
 
 发布与审计门禁恢复 vendor 内被 go mod vendor 省略的 server/frame 测试，再执行 30 轮 race；另对真实 Xray PacketReadLease 做 30 轮 race。静态工作流合同检查这些用例确实恢复且执行，不用“无测试文件”冒充通过。
 

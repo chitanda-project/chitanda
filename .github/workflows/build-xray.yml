@@ -207,6 +207,10 @@ jobs:
           body: |
             Automated release of **XTLS/Xray-core** `${{ steps.upstream_check.outputs.upstream_tag }}` with native **Chitanda Protocol** integrated.
 
+            ### 缓冲与性能复查（2026-10-16 第二轮）
+            - 独立 Plain-UDP 修复取消期间晚入队及 scratch 持有；Xray UDP 读取使用可归还租约；H2/H3/auto TCP 帧分级复用缓冲。
+            - [本机串行/并行基准、Linux race 及适用路径](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/REPAIR_ACCEPTANCE_2026-10-16_R2.md)。无线上格式变化，不代表已部署或保证 WAN 提速，RawStream TCP 策略未变。
+
             ### 本轮补修（2026-10-16）
             - 回收超时后遇到底层错误/关闭的排队写缓冲；RawStream 并发接纳改为原子配额预留。修复上游元数据查询的匿名 API 403 脆弱点。
             - 无线上格式变化，可分步升级；不包含生产部署或健康检查配置变更。[复现、Linux race 与验收边界](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/REPAIR_ACCEPTANCE_2026-10-16.md)。

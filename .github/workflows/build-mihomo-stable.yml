@@ -267,6 +267,10 @@ jobs:
           body: |
             Automated release of **MetaCubeX/mihomo** `${{ steps.upstream_check.outputs.upstream_tag }}` (Stable) with native **Chitanda Protocol** integrated.
 
+            ### 缓冲与性能复查（2026-10-16 第二轮）
+            - H2/H3/auto TCP DATA 帧复用分级缓冲；Xray 的 UDP 租约优化需另更新服务端，RawStream TCP 策略未变。
+            - [串行/并行局部基准及验收边界](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/REPAIR_ACCEPTANCE_2026-10-16_R2.md)。无线上格式变化，不宣称已修复 HKT 探测超时或已提升公网速率。
+
             ### 本轮补修（2026-10-16）
             - H2 SDK 在超时后遇到底层错误/关闭时归还排队缓冲；原子接纳配额修复在 Xray stream 服务端取得。
             - 无线上格式变化，可分步升级；不声称已定位 HKT 探测超时或提升 WAN 速率。[本轮验收](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/REPAIR_ACCEPTANCE_2026-10-16.md)。
