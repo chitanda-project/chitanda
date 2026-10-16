@@ -21,6 +21,8 @@ import (
 const (
 	DefaultUDPWorkerQueueSize = 1024
 	DefaultUDPMemoryBudget    = 64 << 20 // 64 MB maximum in-flight datagram memory budget
+	// Covers retained task/address metadata, including expanded IP strings.
+	plainUDPTaskOverhead = 256
 )
 
 var udpTaskPool = sync.Pool{
@@ -36,10 +38,20 @@ type udpTask struct {
 	clientAddr *net.UDPAddr
 	targetAddr string
 	payload    []byte
-	rawBuf     *[]byte
-	rawLen     int
+	memoryCost int64
 	seq        uint64
 	timestamp  uint64
+}
+
+// Round the wire bound up to a power of two rather than charging only payload
+// length: the Go allocator may reserve a larger size class than make's cap.
+// The receiver's single scratch buffer is separate from this queue budget.
+func plainUDPTaskMemoryCost(wireLen int) int64 {
+	backing := int64(256)
+	for backing < int64(wireLen) {
+		backing <<= 1
+	}
+	return backing + plainUDPTaskOverhead
 }
 
 type plainUDPSessionKey struct {
@@ -246,6 +258,11 @@ func (s *PlainUDPServer) Serve(ctx context.Context) error {
 		s.closed.Store(true)
 		s.cancel()
 		_ = s.conn.Close()
+		// Only this read loop produces tasks. Closing after it has stopped
+		// lets workers drain even a packet decoded concurrently with cancel.
+		for _, tasks := range s.workers {
+			close(tasks)
+		}
 		// Workers can create upstream readers; join them before closing targets.
 		s.workerWg.Wait()
 		s.closeSessions()
@@ -258,27 +275,29 @@ func (s *PlainUDPServer) Serve(ctx context.Context) error {
 		s.workerWg.Add(1)
 		go s.workerLoop(ctx, i, ch)
 	}
+	// DecodePacket returns an owned payload, so the receive buffer never
+	// belongs to a queued task. Retain only one 64 KiB scratch per serve loop.
+	rawBufPtr := udpTaskPool.Get().(*[]byte)
+	defer udpTaskPool.Put(rawBufPtr)
 
 	for {
 		if s.closed.Load() || ctx.Err() != nil {
 			break
 		}
 
-		rawBufPtr := udpTaskPool.Get().(*[]byte)
 		n, clientAddr, err := s.conn.ReadFromUDP(*rawBufPtr)
 		if err != nil {
-			udpTaskPool.Put(rawBufPtr)
 			if s.closed.Load() || ctx.Err() != nil {
 				break
 			}
 			return err
 		}
 
-		// Enforce strict physical buffer capacity budget (64MB max = 1024 concurrent 64KB buffers)
-		bufCap := int64(cap(*rawBufPtr))
-		if s.inFlightMem.Add(bufCap) > s.maxMemBudget {
-			s.inFlightMem.Add(-bufCap)
-			udpTaskPool.Put(rawBufPtr)
+		// Reserve before authentication/copying, including conservative backing
+		// allocation and metadata costs rather than a retained 64 KiB scratch.
+		cost := plainUDPTaskMemoryCost(n)
+		if s.inFlightMem.Add(cost) > s.maxMemBudget {
+			s.inFlightMem.Add(-cost)
 			continue // Drop under physical memory pressure
 		}
 
@@ -293,8 +312,7 @@ func (s *PlainUDPServer) Serve(ctx context.Context) error {
 			userIndex, sessionID, targetAddr, payload, timestamp, seq, err = plainudp.DecodePacketMulti(s.codecs, (*rawBufPtr)[:n], plainudp.DirClientToServer, now)
 		}
 		if err != nil {
-			s.inFlightMem.Add(-bufCap)
-			udpTaskPool.Put(rawBufPtr)
+			s.inFlightMem.Add(-cost)
 			continue // Drop invalid / tampered / expired / wrong direction packets
 		}
 
@@ -305,8 +323,7 @@ func (s *PlainUDPServer) Serve(ctx context.Context) error {
 			clientAddr: clientAddr,
 			targetAddr: targetAddr,
 			payload:    payload,
-			rawBuf:     rawBufPtr,
-			rawLen:     n,
+			memoryCost: cost,
 			seq:        seq,
 			timestamp:  timestamp,
 		}
@@ -314,9 +331,8 @@ func (s *PlainUDPServer) Serve(ctx context.Context) error {
 		select {
 		case s.workers[workerIdx] <- task:
 		default:
-			// Under extreme burst load, drop packet, decrement physical memory budget, and recycle buffer
-			s.inFlightMem.Add(-bufCap)
-			udpTaskPool.Put(rawBufPtr)
+			// Drop under burst pressure without retaining the decoded payload.
+			s.inFlightMem.Add(-cost)
 		}
 	}
 
@@ -325,24 +341,11 @@ func (s *PlainUDPServer) Serve(ctx context.Context) error {
 
 func (s *PlainUDPServer) workerLoop(ctx context.Context, workerID int, tasks <-chan udpTask) {
 	defer s.workerWg.Done()
-	for {
-		select {
-		case <-ctx.Done():
-			// Drain remaining tasks on shutdown
-			for {
-				select {
-				case task := <-tasks:
-					s.inFlightMem.Add(-int64(cap(*task.rawBuf)))
-					udpTaskPool.Put(task.rawBuf)
-				default:
-					return
-				}
-			}
-		case task := <-tasks:
+	for task := range tasks {
+		if ctx.Err() == nil {
 			s.processTask(ctx, task)
-			s.inFlightMem.Add(-int64(cap(*task.rawBuf)))
-			udpTaskPool.Put(task.rawBuf)
 		}
+		s.inFlightMem.Add(-task.memoryCost)
 	}
 }
 
