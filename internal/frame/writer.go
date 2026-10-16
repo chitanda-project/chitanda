@@ -13,6 +13,36 @@ type StreamWriter struct {
 }
 
 func NewStreamWriter(w io.Writer) *StreamWriter { return &StreamWriter{w: w} }
+
+// Borrow per call, not per connection: idle SSH flows must not each retain a
+// bulk-transfer buffer. Size classes bound small writes without allocating a
+// fresh header+payload slice for every DATA frame.
+var (
+	streamWriteSmall  = newStreamWritePool(256)
+	streamWriteMedium = newStreamWritePool(4 << 10)
+	streamWriteLarge  = newStreamWritePool(32 << 10)
+)
+
+func newStreamWritePool(payload int) *sync.Pool {
+	return &sync.Pool{New: func() any {
+		b := make([]byte, HeaderSize+payload)
+		return &b
+	}}
+}
+
+func streamWritePool(payload int) *sync.Pool {
+	switch {
+	case payload <= 256:
+		return streamWriteSmall
+	case payload <= 4<<10:
+		return streamWriteMedium
+	case payload <= 32<<10:
+		return streamWriteLarge
+	default:
+		return &dataChunkBufPool
+	}
+}
+
 func (w *StreamWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -22,10 +52,19 @@ func (w *StreamWriter) Write(p []byte) (int, error) {
 	if w.closed {
 		return 0, io.ErrClosedPipe
 	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	pool := streamWritePool(min(len(p), DataChunkSize))
+	buf := pool.Get().(*[]byte)
+	defer pool.Put(buf)
 	n := 0
 	for len(p) > 0 {
 		size := min(len(p), DataChunkSize)
-		if err := WriteFrame(w.w, TypeData, 0, p[:size]); err != nil {
+		wire := (*buf)[:HeaderSize+size]
+		encodeHeader(wire[:HeaderSize], TypeData, 0, uint32(size))
+		copy(wire[HeaderSize:], p[:size])
+		if err := writeFull(w.w, wire); err != nil {
 			w.failed = err
 			return n, err
 		}
