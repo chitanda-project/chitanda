@@ -41,8 +41,10 @@ jobs:
       - run: python3 -m unittest discover -s scripts -p test_inject_xray.py
       - name: Resolve latest released Xray tag
         id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          tag=$(curl -fsSL --retry 3 --retry-all-errors https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -er '.tag_name')
+          tag=$(curl -fsSL --retry 3 --retry-all-errors -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -er '.tag_name')
           test -n "$tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - name: Inject into latest released Xray
@@ -85,8 +87,10 @@ jobs:
         with:
           python-version: '3.11'
       - name: Inject into latest released Mihomo
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          tag=$(curl -fsSL --retry 3 --retry-all-errors https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -er '.tag_name')
+          tag=$(curl -fsSL --retry 3 --retry-all-errors -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -er '.tag_name')
           test -n "$tag"
           git clone --depth 1 --branch "$tag" https://github.com/MetaCubeX/mihomo.git upstream_mihomo
           python3 scripts/inject-mihomo.py upstream_mihomo "$GITHUB_WORKSPACE"

@@ -32,7 +32,13 @@
 - connio 全量 30 轮、新增 WriterShutdown 30 轮通过；并发提交回归不使用固定 sleep 排序。
 - 本机 1400 字节 WriterWritePacket 微基准首轮约 2.86–2.94 us/op。后续旧版 overlay 五次约 2.97–3.21 us/op，新版五次约 3.06–3.37 us/op；均 0 B/op、0 allocs/op。存在并行编译/调度干扰，不据此宣称速度提升或统计上无退化；它也不是网络吞吐测试。
 
-注入 Xray/Mihomo 接入验收、交叉编译及 Linux race 结果在最终合并前补录。审计工作流分别覆盖真实 stock 与 patched 依赖，恢复 vendor 中被 go mod vendor 删除的 connio 测试，避免“无测试文件”假通过。
+注入 Xray/Mihomo 接入验收、交叉编译及 Linux race 结果在最终合并前补录。审计工作流分别覆盖真实 stock 与 patched 依赖，恢复 vendor 中被 go mod vendor 删除的 connio/server 测试，避免“无测试文件”假通过。
+
+## 验收中发现的 CI 稳定性问题
+
+第二轮审计 `38835536099` 的 Xray job 在执行源码测试之前，上游 releases/latest 的四次匿名 API 请求均返回 HTTP 403。日志没有响应体，不能断定具体是主限流还是其他 403 原因，也不能把该 job 计为代码验收通过。
+
+审计和三个发布工作流的固定 GitHub 上游元数据查询统一改用工作流自身的 github.token 认证，不使用或上传生产凭据，不放宽 audit 的 contents:read 权限。新增静态工作流合同回归，检查五处查询均传递认证，并确认 vendor 测试恢复先于实际执行。最终验收必须在修正后的工作流重新运行。
 
 ## 生产只读检查
 
@@ -41,7 +47,7 @@
 - 五台可达业务机的运行中 Xray 哈希与 main `904d3ab` 发布元数据一致；路由器磁盘内核与运行中内核哈希也与该次 Mihomo 稳定版一致。未把版本字符串相同当成代码相同。
 - 可读 journal/内核日志样本未发现 panic、OOM、文件句柄耗尽；有的节点没有可读 journal，不能等同于完整日志无异常。大量 `Access log is set to 'none'` 为面板告警，不是连接断开证据。
 - 五台业务机各 5 秒被动窗口的 UDP RcvbufErrors/SndbufErrors 增量及 Xray 所持 UDP socket drops 均为零，队列快照为空；当时负载较低，不是饱和压测，不能推导高负载零丢包。
-- HKT `42.3.69.88:30222` 直连、经 DMIT、经 IEPL SSH 转接均在 banner 握手阶段超时；本次无法读取其新日志，不推断它一定宕机或一定是协议故障。
+- HKT SSH 直连、经 DMIT、经 IEPL 转接均在 banner 握手阶段超时；本次无法读取其新日志，不推断它一定宕机或一定是协议故障。
 - 路由器仍见 HKT 的 HTTP HEAD 第二次响应超时。实际运行配置的 HK/TW fallback 使用 HTTP 探测、1 秒间隔、1000 ms 超时、失败 1 次切换，和原始配置文件不同。该证据不足以证明业务连接同样中断，也不能归因于上述队列缺陷。
 - IEPL Realm 可达、进程在运行；未修改它。低内存节点约 69 MiB 可用，仍不适合无预算扩大缓冲。
 

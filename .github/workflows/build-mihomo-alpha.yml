@@ -61,8 +61,11 @@ jobs:
 
       - name: Check Upstream Alpha Commit
         id: upstream_check
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           ALPHA_COMMIT=$(curl -fsSL --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/MetaCubeX/mihomo/commits/Alpha 2>/dev/null \
             | jq -r '.sha // empty' 2>/dev/null || true)
           test -n "$ALPHA_COMMIT"

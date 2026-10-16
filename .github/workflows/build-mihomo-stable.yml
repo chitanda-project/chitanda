@@ -62,8 +62,11 @@ jobs:
 
       - name: Check Latest Upstream Tag
         id: upstream_check
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           LATEST_TAG=$(curl -fsSL --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/MetaCubeX/mihomo/releases/latest 2>/dev/null \
             | jq -r 'if type == "object" then (.tag_name // empty) else empty end' 2>/dev/null \
             || true)
