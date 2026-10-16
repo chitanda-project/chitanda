@@ -165,7 +165,10 @@ func TestPacketLinkOwnedReadDoesNotAllocateMaximumUDPPacket(t *testing.T) {
 	if err := w.WriteMultiBuffer(buf.MultiBuffer{ownedDatagram(bytes.Repeat([]byte{7}, 1200))}); err != nil {
 		t.Fatal(err)
 	}
-	packet, _, err := conn.readPacketOwned()
+	packet, _, release, err := conn.readPacketOwned()
+	if release != nil {
+		defer release()
+	}
 	if err != nil || len(packet) != 1200 || cap(packet) >= 65535 {
 		t.Fatalf("owned UDP packet: length=%d capacity=%d err=%v", len(packet), cap(packet), err)
 	}

@@ -57,7 +57,7 @@ type packetLinkConn struct {
 
 func newPacketLinkConn(r buf.Reader, w buf.Writer, remote net.Addr) *packetLinkConn {
 	c := &packetLinkConn{packetReader: r, packetWriter: w, remote: remote}
-	c.packetReads = connio.NewReader(c.readPacketOwned, func() error { _ = common.Interrupt(r); return common.Close(r) })
+	c.packetReads = connio.NewOwnedReader(c.readPacketOwned, func() error { _ = common.Interrupt(r); return common.Close(r) })
 	c.writes = newPipeWriteQueue(w)
 	return c
 }
@@ -76,27 +76,30 @@ func (c *packetLinkConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	return c.packetReads.ReadPacket(p)
 }
 
-func (c *packetLinkConn) readPacketOwned() ([]byte, net.Addr, error) {
+func (c *packetLinkConn) readPacketOwned() ([]byte, net.Addr, func(), error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 	for len(c.pending) == 0 {
 		if c.readErr != nil {
-			return nil, nil, c.readErr
+			return nil, nil, nil, c.readErr
 		}
 		c.pending, c.readErr = c.packetReader.ReadMultiBuffer()
 	}
 	b := c.pending[0]
 	c.pending[0] = nil
 	c.pending = c.pending[1:]
-	defer b.Release()
 	if b.Len() > 65535 {
-		return nil, nil, io.ErrShortBuffer
+		b.Release()
+		return nil, nil, nil, io.ErrShortBuffer
 	}
 	addr := c.remote
 	if b.UDP != nil && b.UDP.IsValid() {
 		addr = packetAddress(b.UDP.NetAddr())
 	}
-	return append([]byte(nil), b.Bytes()...), addr, nil
+	// buf.Reader transfers ownership. Keep its Buffer leased until connio has
+	// copied this datagram (or discards it on short read/close), not a second
+	// payload-sized allocation while the original buffer is already owned.
+	return b.Bytes(), addr, b.Release, nil
 }
 
 func (c *packetLinkConn) Write(p []byte) (int, error) {
