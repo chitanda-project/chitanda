@@ -27,12 +27,30 @@
 
 ## 本地验收
 
-- stock/default SDK internal/pkg 全量测试通过。
+- stock/default SDK internal/pkg 全量测试及 vet 通过。
 - patched/http2legacy SDK internal/pkg 全量测试及 vet 通过。
 - connio 全量 30 轮、新增 WriterShutdown 30 轮通过；并发提交回归不使用固定 sleep 排序。
+- 最终 WriterShutdown / StreamAdmission 定向各 100 轮通过。注入 Xray 的 Chitanda/UDP Hub 全套、配置回归及 vet，Mihomo config/outbound/sing_tun/SOCKS/tunnel 定向回归及 vet 均通过。
+- Xray 和带 with_gvisor,http2legacy 的 Mihomo，Linux amd64/arm64 共四个交叉编译通过。旧本地 fixture 的 VCS 安全目录检查阻止自动 stamping，使用 buildvcs=false 只构建本地验收产物；不是正式发布构建失败。ARM 未执行目标机运行压测。
+- Python 26 项回归、四个工作流 YAML 和全部 shell 块语法、git diff 空白检查通过。
 - 本机 1400 字节 WriterWritePacket 微基准首轮约 2.86–2.94 us/op。后续旧版 overlay 五次约 2.97–3.21 us/op，新版五次约 3.06–3.37 us/op；均 0 B/op、0 allocs/op。存在并行编译/调度干扰，不据此宣称速度提升或统计上无退化；它也不是网络吞吐测试。
 
-注入 Xray/Mihomo 接入验收、交叉编译及 Linux race 结果在最终合并前补录。审计工作流分别覆盖真实 stock 与 patched 依赖，恢复 vendor 中被 go mod vendor 删除的 connio/server 测试，避免“无测试文件”假通过。
+另将 Writer 微基准限制 GOMAXPROCS=1 重复五次：旧版约 1.95–2.33 us/op，新版约 1.94–1.99 us/op，仍均零分配。结果区间重叠，不把该局部基准换算成公网单/多流速率提升。
+
+## Linux 最终验收
+
+受验实现/测试/工作流提交：`54a7eda39204606d5686334b5e28a49aecaa7b5e`。修复代码分别在 `8ba55f3`、`ee27a3b`；最终提交仅补充文档及 release 展示文字，不改受验实现和执行命令。
+
+[最终 Linux CI](https://github.com/chitanda-project/chitanda/actions/runs/38835896183) 四组全部成功：
+
+| 对象 | 通过内容 |
+| --- | --- |
+| stock SDK / Go 1.26.9 | default/http2legacy 两套 internal/pkg 全量 race；写队列、并发接纳、H3 生命周期分别 30 轮 race |
+| stock SDK / Go 1.27.2 | 同上，独立 Go 1.27 路径 |
+| 注入 Xray / patched 依赖 | Chitanda/配置 race；写队列与并发接纳各 30 轮 race；H3 生命周期 30 轮、五模式真实链式 10 轮 race；Linux 构建 |
+| 干净注入 Mihomo | config/outbound/sing_tun/SOCKS/tunnel 接入 race；关闭/输入验证及写队列各 30 轮 race；with_gvisor,http2legacy Linux 构建 |
+
+审计工作流分别覆盖真实 stock 与 patched 依赖，恢复 vendor 中被 go mod vendor 删除的 connio/server 测试，避免“无测试文件”假通过。已核对 Xray vendor 中 connio/server 均实际执行并输出 ok，不是只恢复文件名或跳过失败。
 
 ## 验收中发现的 CI 稳定性问题
 
