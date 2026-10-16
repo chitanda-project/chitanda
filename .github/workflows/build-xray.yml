@@ -118,6 +118,8 @@ jobs:
           # go mod vendor omits dependency tests. Restore SDK tests explicitly
           # so this gate cannot silently succeed with "[no test files]".
           cp "$GITHUB_WORKSPACE"/pkg/client/*_test.go vendor/github.com/violetaini/chitanda/pkg/client/
+          cp "$GITHUB_WORKSPACE"/pkg/connio/*_test.go vendor/github.com/violetaini/chitanda/pkg/connio/
+          go test -mod=vendor -race github.com/violetaini/chitanda/pkg/connio -run WriterShutdown -count=30 -timeout=120s
           go test -mod=vendor -race github.com/violetaini/chitanda/pkg/client -run 'H3CarrierLifecycle|H3PacketLifecycle|RegressionOctober15ClientCloseWakesH3UDPRead' -count=30 -timeout=120s
 
       - name: Test Chitanda SDK regressions

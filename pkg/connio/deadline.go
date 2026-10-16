@@ -277,6 +277,7 @@ type Writer struct {
 	once      sync.Once
 	closeOnce sync.Once
 	done      chan struct{}
+	stopping  chan struct{}
 	exited    chan struct{}
 	queue     chan *writeRequest
 	dl        deadline
@@ -287,7 +288,7 @@ type Writer struct {
 }
 
 func NewWriter(write func([]byte, net.Addr) (int, error), finish, abort func() error) *Writer {
-	w := &Writer{write: write, finish: finish, abort: abort, done: make(chan struct{}), exited: make(chan struct{}), queue: make(chan *writeRequest, 1), gate: make(chan struct{}, 1)}
+	w := &Writer{write: write, finish: finish, abort: abort, done: make(chan struct{}), stopping: make(chan struct{}), exited: make(chan struct{}), queue: make(chan *writeRequest, 1), gate: make(chan struct{}, 1)}
 	w.gate <- struct{}{}
 	return w
 }
@@ -295,6 +296,7 @@ func (w *Writer) start() {
 	w.once.Do(func() {
 		go func() {
 			defer close(w.exited)
+			defer w.drainOnExit()
 			for {
 				select {
 				case <-w.done:
@@ -305,6 +307,13 @@ func (w *Writer) start() {
 							w.setError(w.finish())
 						}
 						return
+					}
+					select {
+					case <-w.done:
+						req.resCh <- writeResult{0, net.ErrClosed}
+						req.release()
+						return
+					default:
 					}
 					n, err := w.write(req.data, req.addr)
 					if err == nil && n != len(req.data) {
@@ -322,6 +331,32 @@ func (w *Writer) start() {
 			}
 		}()
 	})
+}
+
+// Stop waiters before taking the submission gate: a caller may still be
+// awaiting an admitted request when the worker fails. Holding the gate while
+// draining also covers a send racing shutdown; no pooled lease can arrive
+// after cleanup. exited is closed only after all queued leases are released.
+func (w *Writer) drainOnExit() {
+	close(w.stopping)
+	<-w.gate
+	defer func() { w.gate <- struct{}{} }()
+	err := w.result()
+	if err == nil {
+		err = io.ErrClosedPipe
+	}
+	for {
+		select {
+		case req, ok := <-w.queue:
+			if !ok {
+				return
+			}
+			req.resCh <- writeResult{0, err}
+			req.release()
+		default:
+			return
+		}
+	}
 }
 func (w *Writer) setError(err error) {
 	w.mu.Lock()
@@ -343,7 +378,7 @@ func (w *Writer) acquire() error {
 		case <-w.done:
 			stopTimer(timer)
 			return net.ErrClosed
-		case <-w.exited:
+		case <-w.stopping:
 			stopTimer(timer)
 			if err := w.result(); err != nil {
 				return err
@@ -390,7 +425,7 @@ func (w *Writer) WritePacket(p []byte, addr net.Addr) (int, error) {
 			req.release()
 			req.release()
 			return 0, net.ErrClosed
-		case <-w.exited:
+		case <-w.stopping:
 			req.release()
 			req.release()
 			if err := w.result(); err != nil {
@@ -414,7 +449,7 @@ func (w *Writer) WritePacket(p []byte, addr net.Addr) (int, error) {
 			req.release()
 			req.release()
 			return 0, net.ErrClosed
-		case <-w.exited:
+		case <-w.stopping:
 			stopTimer(timer)
 			req.release()
 			req.release()
@@ -451,7 +486,7 @@ func (w *Writer) awaitWrite(req *writeRequest) (int, error) {
 		case <-w.done:
 			stopTimer(timer)
 			return len(req.data), net.ErrClosed
-		case <-w.exited:
+		case <-w.stopping:
 			stopTimer(timer)
 			select {
 			case result := <-req.resCh:

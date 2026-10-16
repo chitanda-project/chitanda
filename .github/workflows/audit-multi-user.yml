@@ -21,6 +21,8 @@ jobs:
           go-version: ${{ matrix.go }}
       - run: go test -mod=mod -race ./internal/... ./pkg/... -count=1 -timeout=180s
       - run: go test -tags http2legacy -mod=mod -race ./internal/... ./pkg/... -count=1 -timeout=180s
+      - name: Repeat writer shutdown and pooled-buffer ownership
+        run: go test -mod=mod -race ./pkg/connio -run WriterShutdown -count=30 -timeout=120s
       - name: Repeat H3 packet lifecycle against stock quic-go
         run: go test -mod=mod -race ./pkg/client -run 'H3CarrierLifecycle|H3PacketLifecycle|RegressionOctober15ClientCloseWakesH3UDPRead' -count=30 -timeout=120s
 
@@ -57,6 +59,8 @@ jobs:
           go test -mod=vendor -race ./infra/conf -run Chitanda -count=1 -timeout=120s
           # Dependency tests are stripped by go mod vendor, not run by default.
           cp "$GITHUB_WORKSPACE"/pkg/client/*_test.go vendor/github.com/violetaini/chitanda/pkg/client/
+          cp "$GITHUB_WORKSPACE"/pkg/connio/*_test.go vendor/github.com/violetaini/chitanda/pkg/connio/
+          go test -mod=vendor -race github.com/violetaini/chitanda/pkg/connio -run WriterShutdown -count=30 -timeout=120s
           go test -mod=vendor -race github.com/violetaini/chitanda/pkg/client -run 'H3CarrierLifecycle|H3PacketLifecycle|RegressionOctober15ClientCloseWakesH3UDPRead' -count=30 -timeout=120s
           go test -mod=vendor -race ./proxy/chitanda -run ProxyChainAllTransports -count=10 -timeout=180s
       - name: Build injected Xray
@@ -90,6 +94,7 @@ jobs:
         run: |
           go test -mod=mod -race ./config ./adapter/outbound ./listener/sing_tun ./listener/socks ./tunnel -run 'Chitanda|RegressionMihomo' -count=1 -timeout=180s
           go test -mod=mod -race ./adapter/outbound -run 'ChitandaClosedAdapter|ChitandaPacketDestination' -count=30 -timeout=120s
+          go test -mod=mod -race github.com/violetaini/chitanda/pkg/connio -run WriterShutdown -count=30 -timeout=120s
       - name: Build injected Mihomo
         working-directory: upstream_mihomo
         run: go build -mod=mod -tags with_gvisor,http2legacy -o /tmp/chitanda-mihomo .
