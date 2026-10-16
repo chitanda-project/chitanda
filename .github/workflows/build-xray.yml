@@ -211,6 +211,10 @@ jobs:
           body: |
             Automated release of **XTLS/Xray-core** `${{ steps.upstream_check.outputs.upstream_tag }}` with native **Chitanda Protocol** integrated.
 
+            ### RawStream 生命周期与内存（2026-10-16 第三轮）
+            - 统一监听器与嵌入式连接的接纳、取消和关闭等待；RawStream 记录缓冲按需分配，不改密文和 flush 策略。
+            - [复现、构造分配基准、race 与部署边界](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/REPAIR_ACCEPTANCE_2026-10-16_R3.md)。不代表已部署、已解决 HKT 探测超时或提升 WAN 吞吐。
+
             ### 缓冲与性能复查（2026-10-16 第二轮）
             - 独立 Plain-UDP 修复取消期间晚入队及 scratch 持有；Xray UDP 读取使用可归还租约；H2/H3/auto TCP 帧分级复用缓冲。
             - [本机串行/并行基准、Linux race 及适用路径](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/REPAIR_ACCEPTANCE_2026-10-16_R2.md)。无线上格式变化，不代表已部署或保证 WAN 提速，RawStream TCP 策略未变。

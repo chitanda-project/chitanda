@@ -6,12 +6,14 @@
 
 旧 Serve 在 reserveConnection/握手配额之后才 Add WaitGroup，且已 Accept 的握手没有 context 取消关闭钩子。Close 与 Add 之间没有共同的封闭锁；取消时可能等握手 deadline（2 秒），在不支持 deadline 的嵌入连接上还可能更久。HandleConnContext 虽有取消关闭钩子，却完全未登记 WaitGroup，Close 可以先于 handler/配额清理返回。
 
-两个公开入口回归在旧实现均失败：
+两个公开入口回归用 main 旧源码 overlay 各重复 3 次，均失败：
 
 - `TestStreamShutdownInterruptsAcceptedHandshake`：真实 loopback TCP，确认 handler 已进入 Read，再 Close；旧版 1 秒内未退出，必须测试端关闭 peer 才退出。
 - `TestStreamShutdownJoinsEmbeddedHandler`：net.Pipe，确认取消已关闭 socket，但用 barrier 保持 handler 尚未退出；旧版 Close 直接返回，未等待 handler 归还配额。
 
 现在两个入口共用受 listenersMu 保护的接纳与 WaitGroup 登记，Close 在相同锁下封闭接纳。所有已接纳连接均挂取消关闭钩子；等待 handler 清理后才关闭 replay cache。连接/握手限制保持原值，不在每包热路径增加锁。补充并发接纳与关闭回归，检查配额及 semaphore 回零。
+
+Add/Wait 是静态确认的并发窗口，本轮未复现其 panic；上述两种关闭行为错误则都有旧版失败、新版通过的直接证据。
 
 此修复涉及 SDK StreamServer，包括 Xray 对其嵌入使用的关闭语义；不是已证明的 HKT 探测超时根因。
 
@@ -44,7 +46,20 @@ HKT SSH 经 DMIT 仍在 banner 阶段超时；路由器 11:40:34 记录 HKT HTTP
 
 ## 4. 验收状态
 
-本地 stock/default 与 patched/http2legacy SDK internal/pkg 全量测试及 vet 已通过；Mihomo config/outbound/sing_tun/SOCKS/tunnel 回归及 vet 已通过。Xray 接入、重复回归与 Linux race/构建待本轮最终门禁，结果确认后再合入 main。
+本地 stock/default 与 patched/http2legacy SDK internal/pkg 全量测试及 vet，Xray Chitanda/UDP Hub/配置与 vet，Mihomo config/outbound/sing_tun/SOCKS/tunnel 回归及 vet 全部通过。新 server/rawstream 用例在 stock 和 patched Xray 依赖下分别 30 轮通过；Xray 的 UDP 批处理边界、短缓冲/读取租约、deadline 及 data+EOF/error 末批回归额外 30 轮通过。
+
+Xray、Mihomo（with_gvisor,http2legacy）的 Linux amd64/arm64 四个本地交叉编译通过。旧本地 fixture 使用 buildvcs=false 处理无关的目录所有者 stamping 限制，正式 Linux runner 的正常 VCS 构建另行通过。Python 27 项、四份工作流 YAML 与所有 shell 块语法、diff 空白检查均通过。
+
+受验提交 `e7ffee21d786cdc69a44af8d54d3b675f279407a`，[Linux 验收 38848416505](https://github.com/chitanda-project/chitanda/actions/runs/38848416505) 四组全部成功，已读取日志核对新测试确有执行：
+
+| 对象 | 通过内容 |
+| --- | --- |
+| stock SDK / Go 1.26.9 | default/http2legacy 全量 internal/pkg race；StreamShutdown、RawBufferLazy 各 30 轮 race；既有回归 |
+| stock SDK / Go 1.27.2 | 同上，独立 Go 1.27 实现路径 |
+| 注入 Xray / Go 1.26.9 / patched 依赖 | Chitanda/配置 race；新 server/rawstream 各 30 轮 race；五模式真实链式 TCP/UDP 10 轮及既有回归；Linux 构建 |
+| 干净注入 Mihomo / Go 1.27.2 | config/outbound/sing_tun/SOCKS/tunnel race；关闭/输入、writer 30 轮 race；with_gvisor,http2legacy Linux 构建 |
+
+最终追加仅为验收记录和 Release 展示文字，不更改已受验实现、测试或工作流执行命令。合入 main 后自动开始三项正式发布；未等待发布打包结束，也未部署生产。
 
 审计/发布工作流显式恢复 vendor 内新 server/rawstream 测试并分别重复 30 次，静态合同检查恢复动作早于执行，避免依赖包“无测试文件”误判。文档中旧 250ms 强制截断、裸零长度 EOF 与现实现不符的描述一并纠正。
 

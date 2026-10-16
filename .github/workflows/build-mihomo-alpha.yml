@@ -238,6 +238,10 @@ jobs:
           body: |
             Automated build of **MetaCubeX/mihomo** `Alpha` branch with native **Chitanda Protocol** integrated.
 
+            ### RawStream 按需缓冲（2026-10-16 第三轮）
+            - 小流量 RawStream 连接不再预占 bulk 记录缓冲；服务端关闭修复需另更新 Xray/SDK。协议和分块/flush 策略不变，可分步升级。
+            - [构造分配基准及验收边界](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/REPAIR_ACCEPTANCE_2026-10-16_R3.md)。不宣称已修复 HKT 探测超时或提升公网速率。
+
             ### 缓冲与性能复查（2026-10-16 第二轮）
             - H2/H3/auto TCP DATA 帧复用分级缓冲；Xray 的 UDP 租约优化需另更新服务端，RawStream TCP 策略未变。
             - [串行/并行局部基准及验收边界](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/REPAIR_ACCEPTANCE_2026-10-16_R2.md)。无线上格式变化，不宣称已修复 HKT 探测超时或已提升公网速率。
