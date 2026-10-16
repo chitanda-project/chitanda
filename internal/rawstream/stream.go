@@ -33,10 +33,11 @@ type FramedWriter struct {
 
 // NewFramedWriter wraps an io.Writer with an AEAD encryption stream.
 func NewFramedWriter(w io.Writer, stream *AEADStream) *FramedWriter {
+	// EncryptChunk allocates the first record on demand. Idle / interactive
+	// streams must not each reserve a full bulk-flush buffer in advance.
 	return &FramedWriter{
 		w:      w,
 		stream: stream,
-		buf:    make([]byte, 0, MaxBatchFlushLen+MaxChunkWireLen+2),
 	}
 }
 
@@ -198,8 +199,6 @@ func NewFramedReader(r io.Reader, stream *AEADStream) *FramedReader {
 		r:      br,
 		br:     br,
 		stream: stream,
-		rawBuf: make([]byte, MaxChunkWireLen),
-		decBuf: make([]byte, 0, MaxChunkPayloadLen),
 	}
 }
 

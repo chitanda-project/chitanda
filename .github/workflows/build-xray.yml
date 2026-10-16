@@ -123,10 +123,14 @@ jobs:
           cp "$GITHUB_WORKSPACE"/pkg/client/*_test.go vendor/github.com/violetaini/chitanda/pkg/client/
           cp "$GITHUB_WORKSPACE"/pkg/connio/*_test.go vendor/github.com/violetaini/chitanda/pkg/connio/
           cp "$GITHUB_WORKSPACE"/pkg/server/stream_admission_test.go vendor/github.com/violetaini/chitanda/pkg/server/
+          cp "$GITHUB_WORKSPACE"/pkg/server/stream_shutdown_test.go vendor/github.com/violetaini/chitanda/pkg/server/
+          cp "$GITHUB_WORKSPACE"/internal/rawstream/buffer_allocation_test.go vendor/github.com/violetaini/chitanda/internal/rawstream/
           cp "$GITHUB_WORKSPACE"/pkg/server/plain_udp_shutdown_test.go vendor/github.com/violetaini/chitanda/pkg/server/
           cp "$GITHUB_WORKSPACE"/internal/frame/stream_writer_test.go vendor/github.com/violetaini/chitanda/internal/frame/
           go test -mod=vendor -race github.com/violetaini/chitanda/pkg/connio -run WriterShutdown -count=30 -timeout=120s
           go test -mod=vendor -race github.com/violetaini/chitanda/pkg/server -run StreamAdmission -count=30 -timeout=120s
+          go test -mod=vendor -race github.com/violetaini/chitanda/pkg/server -run StreamShutdown -count=30 -timeout=120s
+          go test -mod=vendor -race github.com/violetaini/chitanda/internal/rawstream -run RawBufferLazy -count=30 -timeout=120s
           go test -mod=vendor -race github.com/violetaini/chitanda/pkg/server -run '^TestPlainUDP(ShutdownDrains|QueueMemory|TaskMemory)' -count=30 -timeout=120s
           go test -mod=vendor -race github.com/violetaini/chitanda/internal/frame -run StreamWriterPooled -count=30 -timeout=120s
           go test -mod=vendor -race ./proxy/chitanda -run PacketReadLease -count=30 -timeout=120s

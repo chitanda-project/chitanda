@@ -132,6 +132,24 @@ func (s *StreamServer) reserveConnection() bool {
 	}
 }
 
+// Register accepted work under the same lock that seals admission in Close.
+// A positive WaitGroup.Add must not race a Wait starting at zero.
+func (s *StreamServer) admitConnection() bool {
+	s.listenersMu.Lock()
+	defer s.listenersMu.Unlock()
+	if !s.reserveConnection() {
+		return false
+	}
+	select {
+	case s.handshakeSem <- struct{}{}:
+	default:
+		s.activeConns.Add(-1)
+		return false
+	}
+	s.wg.Add(1)
+	return true
+}
+
 // SetHandshakeLimit sets the maximum number of concurrent pending handshakes.
 func (s *StreamServer) SetHandshakeLimit(n int) {
 	s.handshakeSem = make(chan struct{}, n)
@@ -217,27 +235,11 @@ func (s *StreamServer) Serve(listeners ...net.Listener) error {
 					return
 				}
 
-				if !s.reserveConnection() {
+				if !s.admitConnection() {
 					_ = conn.Close()
 					continue
 				}
-
-				// Enforce bounded concurrent handshakes
-				select {
-				case s.handshakeSem <- struct{}{}:
-				default:
-					// Handshake pool full, shed load immediately
-					s.activeConns.Add(-1)
-					_ = conn.Close()
-					continue
-				}
-
-				s.wg.Add(1)
-				go func(c net.Conn) {
-					defer s.wg.Done()
-					defer s.activeConns.Add(-1)
-					s.handleConn(s.ctx, c)
-				}(conn)
+				go s.runConnection(s.ctx, conn)
 			}
 		}(l)
 	}
@@ -263,25 +265,22 @@ func (s *StreamServer) HandleConn(conn net.Conn) {
 // HandleConnContext processes an incoming raw TCP connection with the provided context.
 // It enforces connection limits and bounded concurrent handshakes before processing.
 func (s *StreamServer) HandleConnContext(ctx context.Context, conn net.Conn) {
+	if !s.admitConnection() {
+		_ = conn.Close()
+		return
+	}
+	s.runConnection(ctx, conn)
+}
+
+func (s *StreamServer) runConnection(ctx context.Context, conn net.Conn) {
+	defer s.wg.Done()
+	defer s.activeConns.Add(-1)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stop := context.AfterFunc(s.ctx, cancel)
 	defer stop()
 	stopConn := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopConn()
-	if !s.reserveConnection() {
-		_ = conn.Close()
-		return
-	}
-	defer s.activeConns.Add(-1)
-
-	select {
-	case s.handshakeSem <- struct{}{}:
-	default:
-		_ = conn.Close()
-		return
-	}
-
 	s.handleConn(ctx, conn)
 }
 
@@ -520,28 +519,29 @@ func relayBidirectional(ctx context.Context, client, target net.Conn) {
 
 // Close gracefully closes the listener, replay cache, and active PlainUDP server.
 func (s *StreamServer) Close() error {
+	s.listenersMu.Lock()
 	s.closed.Store(true)
+	listeners := s.listeners
+	s.listeners = nil
+	udpServer := s.udpServer
+	s.listenersMu.Unlock()
 	if s.cancel != nil {
 		s.cancel()
 	}
 	var firstErr error
-	s.listenersMu.Lock()
-	for _, ln := range s.listeners {
+	for _, ln := range listeners {
 		if ln != nil {
 			if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) && firstErr == nil {
 				firstErr = err
 			}
 		}
 	}
-	s.listeners = nil
-	udpServer := s.udpServer
-	s.listenersMu.Unlock()
 	if udpServer != nil {
 		udpServer.Close()
 	}
+	s.wg.Wait()
 	if s.replays != nil {
 		_ = s.replays.Close()
 	}
-	s.wg.Wait()
 	return firstErr
 }

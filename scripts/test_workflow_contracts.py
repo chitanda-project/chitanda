@@ -14,6 +14,8 @@ class WorkflowContractsTest(unittest.TestCase):
             for package, filename, test in (
                 ("pkg/server", "plain_udp_shutdown_test.go", "'^TestPlainUDP(ShutdownDrains|QueueMemory|TaskMemory)'"),
                 ("internal/frame", "stream_writer_test.go", "StreamWriterPooled"),
+                ("pkg/server", "stream_shutdown_test.go", "StreamShutdown"),
+                ("internal/rawstream", "buffer_allocation_test.go", "RawBufferLazy"),
             ):
                 restore = f'cp "$GITHUB_WORKSPACE"/{package}/{filename} vendor/github.com/violetaini/chitanda/{package}/'
                 run = f"go test -mod=vendor -race github.com/violetaini/chitanda/{package} -run {test} -count=30"
