@@ -8,6 +8,21 @@ WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
 
 
 class WorkflowContractsTest(unittest.TestCase):
+    def test_buffer_lifecycle_gates_restore_and_repeat_real_tests(self):
+        for name in ("audit-multi-user.yml", "build-xray.yml"):
+            source = (WORKFLOWS / name).read_text(encoding="utf-8")
+            for package, filename, test in (
+                ("pkg/server", "plain_udp_shutdown_test.go", "'^TestPlainUDP(ShutdownDrains|QueueMemory|TaskMemory)'"),
+                ("internal/frame", "stream_writer_test.go", "StreamWriterPooled"),
+            ):
+                restore = f'cp "$GITHUB_WORKSPACE"/{package}/{filename} vendor/github.com/violetaini/chitanda/{package}/'
+                run = f"go test -mod=vendor -race github.com/violetaini/chitanda/{package} -run {test} -count=30"
+                with self.subTest(workflow=name, package=package):
+                    self.assertIn(restore, source)
+                    self.assertIn(run, source)
+                    self.assertLess(source.index(restore), source.index(run))
+            self.assertIn("go test -mod=vendor -race ./proxy/chitanda -run PacketReadLease -count=30", source)
+
     def test_upstream_api_queries_use_workflow_token(self):
         queries = 0
         for name in ("audit-multi-user.yml", "build-xray.yml", "build-mihomo-stable.yml", "build-mihomo-alpha.yml"):
