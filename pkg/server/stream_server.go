@@ -32,7 +32,7 @@ type StreamServer struct {
 	replays      *auth.ReplayCache
 	closed       atomic.Bool
 	wg           sync.WaitGroup
-	maxConns     int
+	maxConns     atomic.Int64
 	activeConns  atomic.Int64
 	handshakeSem chan struct{}
 	ctx          context.Context
@@ -56,11 +56,11 @@ func NewStreamServer(psk []byte, serverID string, replays *auth.ReplayCache, dia
 		serverID:     serverID,
 		dialTarget:   dialTarget,
 		replays:      replays,
-		maxConns:     10000,
 		handshakeSem: make(chan struct{}, 512),
 		ctx:          ctx,
 		cancel:       cancel,
 	}
+	s.maxConns.Store(10000)
 	if len(psk) > 0 {
 		s.pskList = [][]byte{psk}
 		s.users = []UserKey{{PSK: psk}}
@@ -94,11 +94,11 @@ func NewStreamServerWithUsers(users []UserKey, serverID string, replays *auth.Re
 		serverID:     serverID,
 		dialTarget:   dialTarget,
 		replays:      replays,
-		maxConns:     10000,
 		handshakeSem: make(chan struct{}, 512),
 		ctx:          ctx,
 		cancel:       cancel,
 	}
+	s.maxConns.Store(10000)
 	if len(validUsers) == 1 {
 		s.psk = validUsers[0].PSK
 	}
@@ -107,7 +107,29 @@ func NewStreamServerWithUsers(users []UserKey, serverID string, replays *auth.Re
 
 // SetMaxConns sets the maximum number of concurrent connections (for testing or configuration).
 func (s *StreamServer) SetMaxConns(n int) {
-	s.maxConns = n
+	s.maxConns.Store(int64(n))
+}
+
+// Reserve before entering a handshake. Load/check followed by Add can admit
+// several callers past the same limit under concurrent HandleConn/Serve use.
+// Count sockets still entering the handshake, and roll back on every reject.
+func (s *StreamServer) reserveConnection() bool {
+	for {
+		if s.closed.Load() {
+			return false
+		}
+		active, limit := s.activeConns.Load(), s.maxConns.Load()
+		if limit > 0 && active >= limit {
+			return false
+		}
+		if s.activeConns.CompareAndSwap(active, active+1) {
+			if s.closed.Load() {
+				s.activeConns.Add(-1)
+				return false
+			}
+			return true
+		}
+	}
 }
 
 // SetHandshakeLimit sets the maximum number of concurrent pending handshakes.
@@ -195,7 +217,7 @@ func (s *StreamServer) Serve(listeners ...net.Listener) error {
 					return
 				}
 
-				if s.maxConns > 0 && s.activeConns.Load() >= int64(s.maxConns) {
+				if !s.reserveConnection() {
 					_ = conn.Close()
 					continue
 				}
@@ -205,11 +227,11 @@ func (s *StreamServer) Serve(listeners ...net.Listener) error {
 				case s.handshakeSem <- struct{}{}:
 				default:
 					// Handshake pool full, shed load immediately
+					s.activeConns.Add(-1)
 					_ = conn.Close()
 					continue
 				}
 
-				s.activeConns.Add(1)
 				s.wg.Add(1)
 				go func(c net.Conn) {
 					defer s.wg.Done()
@@ -247,10 +269,11 @@ func (s *StreamServer) HandleConnContext(ctx context.Context, conn net.Conn) {
 	defer stop()
 	stopConn := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopConn()
-	if s.maxConns > 0 && s.activeConns.Load() >= int64(s.maxConns) {
+	if !s.reserveConnection() {
 		_ = conn.Close()
 		return
 	}
+	defer s.activeConns.Add(-1)
 
 	select {
 	case s.handshakeSem <- struct{}{}:
@@ -258,9 +281,6 @@ func (s *StreamServer) HandleConnContext(ctx context.Context, conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
-
-	s.activeConns.Add(1)
-	defer s.activeConns.Add(-1)
 
 	s.handleConn(ctx, conn)
 }

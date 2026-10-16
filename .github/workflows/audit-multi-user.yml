@@ -23,6 +23,8 @@ jobs:
       - run: go test -tags http2legacy -mod=mod -race ./internal/... ./pkg/... -count=1 -timeout=180s
       - name: Repeat writer shutdown and pooled-buffer ownership
         run: go test -mod=mod -race ./pkg/connio -run WriterShutdown -count=30 -timeout=120s
+      - name: Repeat RawStream concurrent admission limits
+        run: go test -mod=mod -race ./pkg/server -run StreamAdmission -count=30 -timeout=120s
       - name: Repeat H3 packet lifecycle against stock quic-go
         run: go test -mod=mod -race ./pkg/client -run 'H3CarrierLifecycle|H3PacketLifecycle|RegressionOctober15ClientCloseWakesH3UDPRead' -count=30 -timeout=120s
 
@@ -60,7 +62,9 @@ jobs:
           # Dependency tests are stripped by go mod vendor, not run by default.
           cp "$GITHUB_WORKSPACE"/pkg/client/*_test.go vendor/github.com/violetaini/chitanda/pkg/client/
           cp "$GITHUB_WORKSPACE"/pkg/connio/*_test.go vendor/github.com/violetaini/chitanda/pkg/connio/
+          cp "$GITHUB_WORKSPACE"/pkg/server/stream_admission_test.go vendor/github.com/violetaini/chitanda/pkg/server/
           go test -mod=vendor -race github.com/violetaini/chitanda/pkg/connio -run WriterShutdown -count=30 -timeout=120s
+          go test -mod=vendor -race github.com/violetaini/chitanda/pkg/server -run StreamAdmission -count=30 -timeout=120s
           go test -mod=vendor -race github.com/violetaini/chitanda/pkg/client -run 'H3CarrierLifecycle|H3PacketLifecycle|RegressionOctober15ClientCloseWakesH3UDPRead' -count=30 -timeout=120s
           go test -mod=vendor -race ./proxy/chitanda -run ProxyChainAllTransports -count=10 -timeout=180s
       - name: Build injected Xray
