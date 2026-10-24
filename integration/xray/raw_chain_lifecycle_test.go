@@ -98,7 +98,7 @@ func TestChitandaProxyChainAllTransportsSurvivesDialHandoff(t *testing.T) {
 				"log":      map[string]any{"loglevel": "warning"},
 				"inbounds": []any{map[string]any{"listen": "127.0.0.1", "port": localPort, "protocol": "dokodemo-door", "settings": map[string]any{"address": "127.0.0.1", "port": echoPort, "network": "tcp,udp"}}},
 				"outbounds": []any{
-					map[string]any{"tag": "chitanda", "protocol": "chitanda", "settings": map[string]any{"server": net.JoinHostPort("127.0.0.1", strconv.Itoa(remotePort)), "server_name": "localhost", "allow_insecure": true, "pool_size": 1, "psk": string(psk), "transport": mode, "path": "/chain"}, "proxySettings": map[string]any{"tag": "chain-direct"}},
+					map[string]any{"tag": "chitanda", "protocol": "chitanda", "settings": map[string]any{"server": net.JoinHostPort("127.0.0.1", strconv.Itoa(remotePort)), "server_name": "localhost", "allow_insecure": true, "pool_size": 1, "psk": string(psk), "transport": mode, "path": "/chain"}, "streamSettings": map[string]any{"sockopt": map[string]any{"dialerProxy": "chain-direct"}}},
 					map[string]any{"tag": "chain-direct", "protocol": "freedom"},
 				},
 			})

@@ -16,10 +16,13 @@ test "$quic_version" = 'v0.61.0' || {
     echo "unsupported quic-go resolution: $quic_version" >&2
     exit 1
 }
-test "$net_version" = 'v0.56.0' || {
-    echo "unsupported x/net resolution: $net_version" >&2
-    exit 1
-}
+case "$net_version" in
+    v0.56.0|v0.59.0|v0.61.0) ;;
+    *)
+        echo "unsupported x/net resolution: $net_version" >&2
+        exit 1
+        ;;
+esac
 
 go mod vendor
 queue=vendor/github.com/quic-go/quic-go/datagram_queue.go
