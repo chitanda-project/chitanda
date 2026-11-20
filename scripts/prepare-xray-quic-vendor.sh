@@ -17,7 +17,7 @@ test "$quic_version" = 'v0.61.0' || {
     exit 1
 }
 case "$net_version" in
-    v0.56.0|v0.59.0|v0.61.0) ;;
+    v0.56.0|v0.59.0|v0.61.0|v0.62.0) ;;
     *)
         echo "unsupported x/net resolution: $net_version" >&2
         exit 1
